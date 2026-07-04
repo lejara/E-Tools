@@ -1,0 +1,23 @@
+{
+  "manifest_version": 3,
+  "name": "Elementor Preview Width Override",
+  "version": "1.0.0",
+  "description": "Forces Elementor's Mobile Portrait and Tablet Portrait preview widths to fixed values (370px and 786px).",
+  "browser_specific_settings": {
+    "gecko": {
+      "id": "elementor-preview-width@solomediagroup.local",
+      "strict_min_version": "115.0"
+    }
+  },
+  "content_scripts": [
+    {
+      "matches": [
+        "*://*/wp-admin/post.php*",
+        "*://*/wp-admin/post-new.php*"
+      ],
+      "js": ["content.js"],
+      "run_at": "document_idle",
+      "all_frames": false
+    }
+  ]
+}
