@@ -1,21 +1,30 @@
 {
   "manifest_version": 3,
-  "name": "Elementor Preview Width Override",
+  "name": "Elementor Tools",
   "version": "1.0.0",
-  "description": "Forces Elementor's Mobile Portrait and Tablet Portrait preview widths to fixed values (370px and 786px).",
+  "description": "Time is an Element",
   "browser_specific_settings": {
     "gecko": {
       "id": "elementor-preview-width@solomediagroup.local",
       "strict_min_version": "115.0"
     }
   },
+  "permissions": ["storage"],
+  "host_permissions": ["<all_urls>"],
+  "action": {
+    "default_title": "Elementor Tools"
+  },
+  "background": {
+    "scripts": ["background.js"]
+  },
   "content_scripts": [
     {
-      "matches": [
-        "*://*/wp-admin/post.php*",
-        "*://*/wp-admin/post-new.php*"
+      "matches": ["<all_urls>"],
+      "js": [
+        "Tools/preview-override.js",
+        "Tools/layer-root-finder.js",
+        "hotkeys.js"
       ],
-      "js": ["content.js"],
       "run_at": "document_idle",
       "all_frames": false
     }

@@ -1,0 +1,124 @@
+<!doctype html>
+<html>
+  <head>
+    <meta charset="utf-8" />
+    <title>Elementor Tools</title>
+    <style>
+      body {
+        font:
+          12px/1.4 system-ui,
+          sans-serif;
+        margin: 0;
+        padding: 12px;
+        background: #1e1e1e;
+        color: #eee;
+      }
+      h1 {
+        font-size: 11px;
+        margin: 0 0 8px;
+        font-weight: 600;
+        text-transform: uppercase;
+        letter-spacing: 0.5px;
+        color: #999;
+      }
+      .title {
+        font-size: 14px;
+        font-weight: 600;
+        word-break: break-word;
+      }
+      .empty {
+        color: #888;
+        font-style: italic;
+      }
+      .meta {
+        margin-top: 4px;
+        color: #999;
+        font-family: ui-monospace, monospace;
+        font-size: 11px;
+        word-break: break-all;
+      }
+      .actions {
+        margin-top: 10px;
+      }
+      button.clear {
+        background: #333;
+        color: #eee;
+        border: 1px solid #444;
+        border-radius: 4px;
+        padding: 4px 10px;
+        font: inherit;
+        font-size: 11px;
+        cursor: pointer;
+      }
+      button.clear:hover {
+        background: #3a3a3a;
+      }
+      button.clear:disabled {
+        opacity: 0.5;
+        cursor: default;
+      }
+      .logs-header {
+        margin-top: 14px;
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+      }
+      .logs {
+        margin-top: 6px;
+        max-height: 180px;
+        overflow-y: auto;
+        background: #151515;
+        border: 1px solid #2a2a2a;
+        border-radius: 4px;
+        padding: 6px 8px;
+        font-family: ui-monospace, monospace;
+        font-size: 11px;
+      }
+      .logs .empty {
+        color: #555;
+      }
+      .log {
+        display: flex;
+        gap: 6px;
+        padding: 2px 0;
+        border-bottom: 1px solid #232323;
+        word-break: break-word;
+      }
+      .log:last-child {
+        border-bottom: 0;
+      }
+      .log .time {
+        color: #666;
+        flex: 0 0 auto;
+      }
+      .log .msg {
+        flex: 1 1 auto;
+      }
+      .log.info .msg {
+        color: #d0d0d0;
+      }
+      .log.warn .msg {
+        color: #e0b060;
+      }
+      .log.error .msg {
+        color: #e07070;
+      }
+    </style>
+  </head>
+  <body>
+    <h1>Root Layer</h1>
+    <div id="title" class="title empty">No Root layer</div>
+    <div id="meta" class="meta"></div>
+    <div class="actions">
+      <button id="clear" class="clear" type="button" disabled>Clear</button>
+    </div>
+    <div class="logs-header">
+      <h1>Logs</h1>
+      <button id="clear-logs" class="clear" type="button" disabled>
+        Clear
+      </button>
+    </div>
+    <div id="logs" class="logs"><div class="empty">No activity yet</div></div>
+    <script src="panel.js"></script>
+  </body>
+</html>

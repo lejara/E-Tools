@@ -1,7 +1,7 @@
 (() => {
   if (!location.search.includes("action=elementor")) return;
 
-  const WIDTHS = { mobile: 390, tablet: 786 };
+  const WIDTHS = { mobile: 390, tablet: 768 };
 
   let wrapper = null;
   let selfWrite = false;
@@ -47,8 +47,7 @@
   const applyOverride = () => {
     if (!wrapper || !document.contains(wrapper)) wrapper = findWrapper();
     if (!wrapper) return;
-    const device = currentDevice();
-    const target = WIDTHS[device];
+    const target = WIDTHS[currentDevice()];
     if (target == null) {
       clearOverride();
       return;
