@@ -22,6 +22,7 @@
       "matches": ["<all_urls>"],
       "js": [
         "Tools/preview-override.js",
+        "Tools/core_utils.js",
         "Tools/layer-root-finder.js",
         "hotkeys.js"
       ],

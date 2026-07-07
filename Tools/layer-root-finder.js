@@ -4,7 +4,6 @@
   const ns = (window.__ElementorTools = window.__ElementorTools || {});
 
   const NAV_ELEMENT = ".elementor-navigator__element[data-id]";
-  const LOG_LIMIT = 50;
 
   const findSelected = () => {
     const editing = document.querySelector(
@@ -13,14 +12,7 @@
     return editing ? editing.closest(NAV_ELEMENT) : null;
   };
 
-  const log = async (level, message) => {
-    const entry = { level, message, time: Date.now() };
-    try {
-      const { logs = [] } = await browser.storage.local.get("logs");
-      const next = [entry, ...logs].slice(0, LOG_LIMIT);
-      await browser.storage.local.set({ logs: next });
-    } catch (_) {}
-  };
+  const log = (level, message) => ns.log?.(level, message);
 
   const findLayerRoot = () => {
     const el = findSelected();
