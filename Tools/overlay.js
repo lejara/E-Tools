@@ -1,20 +1,52 @@
 (() => {
-  if (!location.search.includes("action=elementor")) return;
-
   const OVERLAY_ID = "elementor-tools-overlay";
   const STYLE_ID = "elementor-tools-overlay-style";
+  const IS_EDITOR = location.search.includes("action=elementor");
 
   let overlay = null;
   let titleEl = null;
   let logsEl = null;
   let clearLogsBtn = null;
+  let editBtn = null;
 
   const state = {
     enabled: false,
     selectedLayer: null,
     logs: [],
     position: null,
+    workingDomain: "",
+    wpPostId: readWpPostId(),
   };
+
+  function readWpPostId() {
+    const body = document.body;
+    if (!body) return null;
+    const m = body.className.match(/(?:^|\s)(?:page-id|postid)-(\d+)(?:\s|$)/);
+    return m ? m[1] : null;
+  }
+
+  const parseWorkingDomain = (raw) => {
+    if (!raw) return null;
+    const trimmed = String(raw).trim();
+    if (!trimmed) return null;
+    try {
+      const withProto = /^https?:\/\//i.test(trimmed)
+        ? trimmed
+        : `https://${trimmed}`;
+      const u = new URL(withProto);
+      return { hostname: u.hostname, origin: u.origin };
+    } catch {
+      return null;
+    }
+  };
+
+  const domainMatches = () => {
+    const parsed = parseWorkingDomain(state.workingDomain);
+    return !!parsed && parsed.hostname === location.hostname;
+  };
+
+  const shouldShow = () =>
+    state.enabled && (IS_EDITOR || domainMatches());
 
   const ensureStyle = () => {
     if (document.getElementById(STYLE_ID)) return;
@@ -103,6 +135,22 @@
       #${OVERLAY_ID} .et-ov-log.info .m { color: #d0d0d0; }
       #${OVERLAY_ID} .et-ov-log.warn .m { color: #e0b060; }
       #${OVERLAY_ID} .et-ov-log.error .m { color: #e07070; }
+      #${OVERLAY_ID} .et-ov-actions {
+        padding: 6px 8px;
+        border-bottom: 1px solid #2a2a2a;
+      }
+      #${OVERLAY_ID} .et-ov-edit {
+        width: 100%;
+        font: inherit;
+        font-size: 11px;
+        background: #2b3a66;
+        color: #eaeaea;
+        border: 1px solid #3a4d80;
+        border-radius: 3px;
+        padding: 5px 8px;
+        cursor: pointer;
+      }
+      #${OVERLAY_ID} .et-ov-edit:hover { background: #34467a; }
     `;
     (document.head || document.documentElement).appendChild(style);
   };
@@ -141,6 +189,42 @@
     titleEl.textContent = layer.title || "(untitled)";
     titleEl.classList.remove("empty");
     titleEl.title = `id: ${layer.id || "?"} · cid: ${layer.modelCid || "?"}`;
+  };
+
+  const renderEditButton = () => {
+    if (!overlay) return;
+    const parsed = parseWorkingDomain(state.workingDomain);
+    const canEdit = !!(parsed && state.wpPostId);
+
+    if (!canEdit) {
+      if (editBtn) {
+        const row = editBtn.parentElement;
+        editBtn.remove();
+        editBtn = null;
+        if (row) row.remove();
+      }
+      return;
+    }
+
+    if (!editBtn) {
+      const row = document.createElement("div");
+      row.className = "et-ov-actions";
+      editBtn = document.createElement("button");
+      editBtn.type = "button";
+      editBtn.className = "et-ov-edit";
+      editBtn.addEventListener("click", (e) => {
+        e.stopPropagation();
+        const p = parseWorkingDomain(state.workingDomain);
+        if (!p || !state.wpPostId) return;
+        const url = `${p.origin}/wp-admin/post.php?post=${state.wpPostId}&action=elementor`;
+        window.open(url, "_blank", "noopener");
+      });
+      editBtn.addEventListener("mousedown", (e) => e.stopPropagation());
+      row.appendChild(editBtn);
+      // insert between header and logs
+      overlay.insertBefore(row, logsEl);
+    }
+    editBtn.textContent = `Edit in Elementor (#${state.wpPostId})`;
   };
 
   const renderLogs = () => {
@@ -246,6 +330,7 @@
 
     applyPosition();
     renderTitle();
+    renderEditButton();
     renderLogs();
   };
 
@@ -256,13 +341,15 @@
     titleEl = null;
     logsEl = null;
     clearLogsBtn = null;
+    editBtn = null;
   };
 
   const sync = () => {
-    if (state.enabled) {
+    if (shouldShow()) {
       createOverlay();
       applyPosition();
       renderTitle();
+      renderEditButton();
       renderLogs();
     } else {
       destroyOverlay();
@@ -270,22 +357,34 @@
   };
 
   browser.storage.local
-    .get(["overlayEnabled", "selectedLayer", "logs", "overlayPosition"])
+    .get([
+      "overlayEnabled",
+      "selectedLayer",
+      "logs",
+      "overlayPosition",
+      "workingDomain",
+    ])
     .then((s) => {
       state.enabled = !!s.overlayEnabled;
       state.selectedLayer = s.selectedLayer || null;
       state.logs = s.logs || [];
       state.position = s.overlayPosition || null;
+      state.workingDomain = s.workingDomain || "";
+      if (!state.wpPostId) state.wpPostId = readWpPostId();
       sync();
     })
     .catch(() => {});
 
   browser.storage.onChanged.addListener((changes, area) => {
     if (area !== "local") return;
-    let toggled = false;
+    let resync = false;
     if (changes.overlayEnabled) {
       state.enabled = !!changes.overlayEnabled.newValue;
-      toggled = true;
+      resync = true;
+    }
+    if (changes.workingDomain) {
+      state.workingDomain = changes.workingDomain.newValue || "";
+      resync = true;
     }
     if (changes.selectedLayer) {
       state.selectedLayer = changes.selectedLayer.newValue || null;
@@ -299,6 +398,6 @@
       state.position = changes.overlayPosition.newValue || null;
       if (overlay) applyPosition();
     }
-    if (toggled) sync();
+    if (resync) sync();
   });
 })();

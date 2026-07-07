@@ -71,6 +71,31 @@
         accent-color: #7a9cff;
         cursor: pointer;
       }
+      .field {
+        display: flex;
+        flex-direction: column;
+        gap: 4px;
+      }
+      .field-label {
+        font-size: 10px;
+        color: #888;
+        text-transform: uppercase;
+        letter-spacing: 0.4px;
+      }
+      .text-input {
+        background: #151515;
+        color: #eee;
+        border: 1px solid #2a2a2a;
+        border-radius: 4px;
+        padding: 5px 7px;
+        font: inherit;
+        font-family: ui-monospace, monospace;
+        font-size: 11px;
+        outline: none;
+      }
+      .text-input:focus {
+        border-color: #4a4a4a;
+      }
       .logs-header {
         margin-top: 14px;
         display: flex;
@@ -134,7 +159,8 @@
       .hotkey:last-child {
         border-bottom: 0;
       }
-      .hotkey kbd {
+      .hotkey kbd,
+      .hotkey-capture {
         flex: 0 0 auto;
         font-family: ui-monospace, monospace;
         font-size: 10px;
@@ -145,8 +171,49 @@
         color: #d0d0d0;
         white-space: nowrap;
       }
+      .hotkey-capture {
+        min-width: 92px;
+        text-align: center;
+        cursor: pointer;
+        font-weight: inherit;
+        padding: 2px 6px;
+      }
+      .hotkey-capture:hover {
+        background: #333;
+      }
+      .hotkey-capture.recording {
+        border-color: #7a9cff;
+        color: #7a9cff;
+      }
+      .hotkey-reset {
+        flex: 0 0 auto;
+        margin-left: auto;
+        background: transparent;
+        border: 1px solid #333;
+        border-radius: 3px;
+        color: #888;
+        padding: 1px 6px;
+        font: inherit;
+        font-size: 11px;
+        cursor: pointer;
+      }
+      .hotkey-reset:hover {
+        color: #d0d0d0;
+        border-color: #4a4a4a;
+      }
       .hotkey .desc {
         color: #d0d0d0;
+      }
+      .hotkey-footer {
+        display: flex;
+        align-items: center;
+        gap: 10px;
+        margin-top: 8px;
+      }
+      .hotkey-error {
+        color: #e07070;
+        font-size: 11px;
+        flex: 1 1 auto;
       }
     </style>
   </head>
@@ -166,6 +233,17 @@
       <input id="opt-overlay" type="checkbox" />
       <span>Show UI Overlay</span>
     </label>
+    <div class="field" style="margin-top: 10px">
+      <label for="opt-working-domain" class="field-label">Working Domain</label>
+      <input
+        id="opt-working-domain"
+        type="text"
+        class="text-input"
+        placeholder="https://google.com"
+        spellcheck="false"
+        autocomplete="off"
+      />
+    </div>
     <div class="logs-header">
       <h1>Logs</h1>
       <button id="clear-logs" class="clear" type="button" disabled>
@@ -174,32 +252,20 @@
     </div>
     <div id="logs" class="logs"><div class="empty">No activity yet</div></div>
     <h1 style="margin-top: 14px">Hotkeys</h1>
-    <div class="hotkeys">
-      <div class="hotkey">
-        <kbd>Ctrl+Shift+1</kbd>
-        <span class="desc">Capture root layer</span>
-      </div>
-      <div class="hotkey">
-        <kbd>Ctrl+Shift+2</kbd>
-        <span class="desc">Replace styles</span>
-      </div>
-      <div class="hotkey">
-        <kbd>Ctrl+Shift+3</kbd>
-        <span class="desc">Replace layer</span>
-      </div>
-      <div class="hotkey">
-        <kbd>Ctrl+Shift+4</kbd>
-        <span class="desc">Batch rename</span>
-      </div>
-      <div class="hotkey">
-        <kbd>Ctrl+Shift+5</kbd>
-        <span class="desc">Reselect stored root</span>
-      </div>
+    <div class="hotkeys" id="hotkeys"></div>
+    <div class="hotkey-footer">
+      <button id="reset-all-hotkeys" class="clear" type="button">
+        Reset all
+      </button>
+      <span id="hotkey-error" class="hotkey-error"></span>
+    </div>
+    <div class="hotkeys" style="margin-top: 6px">
       <div class="hotkey">
         <kbd>Shift+Click</kbd>
         <span class="desc">Multi-select layer in navigator</span>
       </div>
     </div>
+    <script src="../hotkey-defaults.js"></script>
     <script src="panel.js"></script>
   </body>
 </html>
