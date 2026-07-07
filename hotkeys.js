@@ -38,6 +38,17 @@
         !e.altKey &&
         e.shiftKey &&
         e.code === "Digit4",
+      run: () => {
+        window.__ElementorTools?.batchRename?.();
+        return true;
+      },
+    },
+    {
+      match: (e) =>
+        (e.ctrlKey || e.metaKey) &&
+        !e.altKey &&
+        e.shiftKey &&
+        e.code === "Digit5",
       run: async () => {
         const { selectedLayer } =
           await browser.storage.local.get("selectedLayer");

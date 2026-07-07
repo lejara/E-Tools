@@ -23,9 +23,11 @@
       "js": [
         "Tools/preview-override.js",
         "Tools/core_utils.js",
+        "Tools/multi-select.js",
         "Tools/layer-root-finder.js",
         "Tools/replace-styles.js",
         "Tools/replace-layer.js",
+        "Tools/batch-rename.js",
         "hotkeys.js"
       ],
       "run_at": "document_idle",
