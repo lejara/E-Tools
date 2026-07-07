@@ -26,6 +26,17 @@
         (e.ctrlKey || e.metaKey) &&
         !e.altKey &&
         e.shiftKey &&
+        e.code === "Digit3",
+      run: () => {
+        window.__ElementorTools?.replaceLayer?.();
+        return true;
+      },
+    },
+    {
+      match: (e) =>
+        (e.ctrlKey || e.metaKey) &&
+        !e.altKey &&
+        e.shiftKey &&
         e.code === "Digit4",
       run: async () => {
         const { selectedLayer } =

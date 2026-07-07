@@ -41,6 +41,34 @@
       });
       return {};
     },
+    paste: async ({ targetId }) => {
+      const result = await runCommand("document/elements/paste", {
+        containers: [getContainer(targetId)],
+      });
+      let created = null;
+      if (Array.isArray(result)) {
+        const flat = result.flat(Infinity);
+        created = flat.find((c) => c && c.id);
+      } else if (result && result.id) {
+        created = result;
+      }
+      if (!created?.id) throw new Error("paste returned no container id");
+      return { id: created.id };
+    },
+    move: async ({ id, targetId, at }) => {
+      await runCommand("document/elements/move", {
+        containers: [getContainer(id)],
+        target: getContainer(targetId),
+        options: typeof at === "number" ? { at } : {},
+      });
+      return {};
+    },
+    delete: async ({ id }) => {
+      await runCommand("document/elements/delete", {
+        containers: [getContainer(id)],
+      });
+      return {};
+    },
   };
 
   window.addEventListener("message", async (event) => {

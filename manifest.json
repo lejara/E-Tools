@@ -25,6 +25,7 @@
         "Tools/core_utils.js",
         "Tools/layer-root-finder.js",
         "Tools/replace-styles.js",
+        "Tools/replace-layer.js",
         "hotkeys.js"
       ],
       "run_at": "document_idle",

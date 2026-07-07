@@ -73,7 +73,7 @@
       .join("\n");
     const more = matches.length > 8 ? `\n… and ${matches.length - 8} more` : "";
     const ok = window.confirm(
-      `Replace styles on ${matches.length} layer(s) named "${sourceName}"?\n\n${preview}${more}`,
+      `REPLACE STYLES\n  ${matches.length} layer(s) named "${sourceName}"?\n\n${preview}${more}`,
     );
     if (!ok) {
       ns.log?.("info", "Replace styles: cancelled");
