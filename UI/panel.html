@@ -57,6 +57,20 @@
         opacity: 0.5;
         cursor: default;
       }
+      .options {
+        margin-top: 14px;
+      }
+      .option {
+        display: flex;
+        align-items: center;
+        gap: 8px;
+        cursor: pointer;
+        user-select: none;
+      }
+      .option input[type="checkbox"] {
+        accent-color: #7a9cff;
+        cursor: pointer;
+      }
       .logs-header {
         margin-top: 14px;
         display: flex;
@@ -103,6 +117,37 @@
       .log.error .msg {
         color: #e07070;
       }
+      .hotkeys {
+        margin-top: 6px;
+        background: #151515;
+        border: 1px solid #2a2a2a;
+        border-radius: 4px;
+        padding: 6px 8px;
+      }
+      .hotkey {
+        display: flex;
+        align-items: center;
+        gap: 8px;
+        padding: 3px 0;
+        border-bottom: 1px solid #232323;
+      }
+      .hotkey:last-child {
+        border-bottom: 0;
+      }
+      .hotkey kbd {
+        flex: 0 0 auto;
+        font-family: ui-monospace, monospace;
+        font-size: 10px;
+        background: #2a2a2a;
+        border: 1px solid #3a3a3a;
+        border-radius: 3px;
+        padding: 1px 5px;
+        color: #d0d0d0;
+        white-space: nowrap;
+      }
+      .hotkey .desc {
+        color: #d0d0d0;
+      }
     </style>
   </head>
   <body>
@@ -112,6 +157,11 @@
     <div class="actions">
       <button id="clear" class="clear" type="button" disabled>Clear</button>
     </div>
+    <h1 class="options">Options</h1>
+    <label class="option" for="opt-replace-children">
+      <input id="opt-replace-children" type="checkbox" />
+      <span>Replace Children Styles</span>
+    </label>
     <div class="logs-header">
       <h1>Logs</h1>
       <button id="clear-logs" class="clear" type="button" disabled>
@@ -119,6 +169,33 @@
       </button>
     </div>
     <div id="logs" class="logs"><div class="empty">No activity yet</div></div>
+    <h1 style="margin-top: 14px">Hotkeys</h1>
+    <div class="hotkeys">
+      <div class="hotkey">
+        <kbd>Ctrl+Shift+1</kbd>
+        <span class="desc">Capture root layer</span>
+      </div>
+      <div class="hotkey">
+        <kbd>Ctrl+Shift+2</kbd>
+        <span class="desc">Replace styles</span>
+      </div>
+      <div class="hotkey">
+        <kbd>Ctrl+Shift+3</kbd>
+        <span class="desc">Replace layer</span>
+      </div>
+      <div class="hotkey">
+        <kbd>Ctrl+Shift+4</kbd>
+        <span class="desc">Batch rename</span>
+      </div>
+      <div class="hotkey">
+        <kbd>Ctrl+Shift+5</kbd>
+        <span class="desc">Reselect stored root</span>
+      </div>
+      <div class="hotkey">
+        <kbd>Shift+Click</kbd>
+        <span class="desc">Multi-select layer in navigator</span>
+      </div>
+    </div>
     <script src="panel.js"></script>
   </body>
 </html>

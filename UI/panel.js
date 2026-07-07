@@ -4,6 +4,7 @@ const metaEl = document.getElementById("meta");
 const clearBtn = document.getElementById("clear");
 const logsEl = document.getElementById("logs");
 const clearLogsBtn = document.getElementById("clear-logs");
+const replaceChildrenEl = document.getElementById("opt-replace-children");
 
 const renderLayer = (layer) => {
   if (!layer) {
@@ -60,10 +61,17 @@ clearLogsBtn.addEventListener("click", () => {
   browser.storage.local.remove("logs");
 });
 
-browser.storage.local.get(["selectedLayer", "logs"]).then((state) => {
-  renderLayer(state.selectedLayer || null);
-  renderLogs(state.logs || []);
+replaceChildrenEl.addEventListener("change", () => {
+  browser.storage.local.set({ replaceChildrenStyles: replaceChildrenEl.checked });
 });
+
+browser.storage.local
+  .get(["selectedLayer", "logs", "replaceChildrenStyles"])
+  .then((state) => {
+    renderLayer(state.selectedLayer || null);
+    renderLogs(state.logs || []);
+    replaceChildrenEl.checked = !!state.replaceChildrenStyles;
+  });
 
 browser.storage.onChanged.addListener((changes, area) => {
   if (area !== "local") return;
@@ -72,5 +80,8 @@ browser.storage.onChanged.addListener((changes, area) => {
   }
   if (changes.logs) {
     renderLogs(changes.logs.newValue || []);
+  }
+  if (changes.replaceChildrenStyles) {
+    replaceChildrenEl.checked = !!changes.replaceChildrenStyles.newValue;
   }
 });
