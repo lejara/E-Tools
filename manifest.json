@@ -24,10 +24,17 @@
         "Tools/preview-override.js",
         "Tools/core_utils.js",
         "Tools/layer-root-finder.js",
+        "Tools/replace-styles.js",
         "hotkeys.js"
       ],
       "run_at": "document_idle",
       "all_frames": false
+    }
+  ],
+  "web_accessible_resources": [
+    {
+      "resources": ["Tools/page-bridge.js"],
+      "matches": ["<all_urls>"]
     }
   ]
 }

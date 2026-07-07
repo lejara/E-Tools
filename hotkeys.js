@@ -15,6 +15,17 @@
         (e.ctrlKey || e.metaKey) &&
         !e.altKey &&
         e.shiftKey &&
+        e.code === "Digit2",
+      run: () => {
+        window.__ElementorTools?.replaceStyles?.();
+        return true;
+      },
+    },
+    {
+      match: (e) =>
+        (e.ctrlKey || e.metaKey) &&
+        !e.altKey &&
+        e.shiftKey &&
         e.code === "Digit4",
       run: async () => {
         const { selectedLayer } =
@@ -38,5 +49,26 @@
     }
   };
 
-  document.addEventListener("keydown", handler, true);
+  const attached = new WeakSet();
+  const attach = (doc) => {
+    if (!doc || attached.has(doc)) return;
+    attached.add(doc);
+    doc.addEventListener("keydown", handler, true);
+  };
+
+  attach(document);
+
+  document.addEventListener(
+    "load",
+    (e) => {
+      const t = e.target;
+      if (t && t.id === "elementor-preview-iframe" && t.contentDocument) {
+        attach(t.contentDocument);
+      }
+    },
+    true,
+  );
+
+  const initialIframe = document.querySelector("#elementor-preview-iframe");
+  if (initialIframe?.contentDocument) attach(initialIframe.contentDocument);
 })();
