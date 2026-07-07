@@ -1,7 +1,7 @@
 {
   "_comment": "Typical flow each release: npm run bump → npm run sign → install the .xpi from about:addons.",
   "name": "elementor_tool",
-  "version": "1.0.0",
+  "version": "1.0.1",
   "private": true,
   "description": "Elementor editor tools - Firefox extension",
   "main": "background.js",
@@ -10,8 +10,7 @@
     "bump:minor": "node scripts/bump-version.js minor",
     "bump:major": "node scripts/bump-version.js major",
     "lint": "web-ext lint",
-    "sign": "web-ext sign --channel=unlisted",
-    "test": "echo \"Error: no test specified\" && exit 1"
+    "sign": "node scripts/sign.js"
   },
   "repository": {
     "type": "git",
