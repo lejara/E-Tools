@@ -28,6 +28,7 @@
         "Tools/replace-styles.js",
         "Tools/replace-layer.js",
         "Tools/batch-rename.js",
+        "Tools/overlay.js",
         "hotkeys.js"
       ],
       "run_at": "document_idle",

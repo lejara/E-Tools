@@ -5,6 +5,7 @@ const clearBtn = document.getElementById("clear");
 const logsEl = document.getElementById("logs");
 const clearLogsBtn = document.getElementById("clear-logs");
 const replaceChildrenEl = document.getElementById("opt-replace-children");
+const overlayEl = document.getElementById("opt-overlay");
 
 const renderLayer = (layer) => {
   if (!layer) {
@@ -65,12 +66,17 @@ replaceChildrenEl.addEventListener("change", () => {
   browser.storage.local.set({ replaceChildrenStyles: replaceChildrenEl.checked });
 });
 
+overlayEl.addEventListener("change", () => {
+  browser.storage.local.set({ overlayEnabled: overlayEl.checked });
+});
+
 browser.storage.local
-  .get(["selectedLayer", "logs", "replaceChildrenStyles"])
+  .get(["selectedLayer", "logs", "replaceChildrenStyles", "overlayEnabled"])
   .then((state) => {
     renderLayer(state.selectedLayer || null);
     renderLogs(state.logs || []);
     replaceChildrenEl.checked = !!state.replaceChildrenStyles;
+    overlayEl.checked = !!state.overlayEnabled;
   });
 
 browser.storage.onChanged.addListener((changes, area) => {
@@ -83,5 +89,8 @@ browser.storage.onChanged.addListener((changes, area) => {
   }
   if (changes.replaceChildrenStyles) {
     replaceChildrenEl.checked = !!changes.replaceChildrenStyles.newValue;
+  }
+  if (changes.overlayEnabled) {
+    overlayEl.checked = !!changes.overlayEnabled.newValue;
   }
 });
