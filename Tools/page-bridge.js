@@ -35,15 +35,16 @@
       });
       return {};
     },
-    "paste-style": async ({ id }) => {
+    "paste-style": async ({ ids }) => {
       await runCommand("document/elements/paste-style", {
-        containers: [getContainer(id)],
+        containers: ids.map(getContainer),
       });
       return {};
     },
-    paste: async ({ targetId }) => {
+    paste: async ({ targetId, at }) => {
       const result = await runCommand("document/elements/paste", {
         containers: [getContainer(targetId)],
+        options: typeof at === "number" ? { at } : {},
       });
       let created = null;
       if (Array.isArray(result)) {
@@ -55,17 +56,9 @@
       if (!created?.id) throw new Error("paste returned no container id");
       return { id: created.id };
     },
-    move: async ({ id, targetId, at }) => {
-      await runCommand("document/elements/move", {
-        containers: [getContainer(id)],
-        target: getContainer(targetId),
-        options: typeof at === "number" ? { at } : {},
-      });
-      return {};
-    },
-    delete: async ({ id }) => {
+    delete: async ({ ids }) => {
       await runCommand("document/elements/delete", {
-        containers: [getContainer(id)],
+        containers: ids.map(getContainer),
       });
       return {};
     },

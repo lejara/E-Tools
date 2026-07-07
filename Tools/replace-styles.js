@@ -7,8 +7,6 @@
   const TITLE_SELECTOR = ".elementor-navigator__element__title__text";
   const CHILDREN_CONTAINER = ".elementor-navigator__elements";
 
-  const wait = (ms) => new Promise((r) => setTimeout(r, ms));
-
   const getTitle = (el) =>
     el.querySelector(TITLE_SELECTOR)?.textContent?.trim() || "";
 
@@ -111,24 +109,17 @@
       return;
     }
 
-    let done = 0;
-    for (const m of matches) {
-      const res = await ns.callBridge?.("paste-style", { id: m.id });
-      if (!res || !res.ok) {
-        ns.log?.(
-          "warn",
-          `Replace styles: paste-style failed on ${m.id}: ${res?.error || "unknown"}`,
-        );
-        continue;
-      }
-      done++;
-      await wait(30);
+    const ids = matches.map((m) => m.id);
+    const res = await ns.callBridge?.("paste-style", { ids });
+    if (!res || !res.ok) {
+      ns.log?.(
+        "warn",
+        `Replace styles: paste-style failed: ${res?.error || "unknown"}`,
+      );
+      return;
     }
 
-    ns.log?.(
-      "info",
-      `Replace styles: applied to ${done}/${matches.length} layer(s)`,
-    );
+    ns.log?.("info", `Replace styles: applied to ${ids.length} layer(s)`);
   };
 
   const runDeepReplace = async (source, sourceId, sourceName, rootEl) => {
@@ -176,30 +167,33 @@
       return;
     }
 
-    let done = 0;
+    const srcToTargets = new Map();
     for (const m of passed) {
       for (const p of m.pairs) {
-        const copyRes = await ns.callBridge?.("copy", { id: p.sourceId });
-        if (!copyRes || !copyRes.ok) {
-          ns.log?.(
-            "warn",
-            `Replace styles: copy failed for ${p.sourceId}: ${copyRes?.error || "no bridge"}`,
-          );
-          continue;
-        }
-        const pasteRes = await ns.callBridge?.("paste-style", {
-          id: p.targetId,
-        });
-        if (!pasteRes || !pasteRes.ok) {
-          ns.log?.(
-            "warn",
-            `Replace styles: paste-style failed on ${p.targetId}: ${pasteRes?.error || "unknown"}`,
-          );
-          continue;
-        }
-        done++;
-        await wait(30);
+        if (!srcToTargets.has(p.sourceId)) srcToTargets.set(p.sourceId, []);
+        srcToTargets.get(p.sourceId).push(p.targetId);
       }
+    }
+
+    let done = 0;
+    for (const [srcId, targetIds] of srcToTargets) {
+      const copyRes = await ns.callBridge?.("copy", { id: srcId });
+      if (!copyRes || !copyRes.ok) {
+        ns.log?.(
+          "warn",
+          `Replace styles: copy failed for ${srcId}: ${copyRes?.error || "no bridge"}`,
+        );
+        continue;
+      }
+      const pasteRes = await ns.callBridge?.("paste-style", { ids: targetIds });
+      if (!pasteRes || !pasteRes.ok) {
+        ns.log?.(
+          "warn",
+          `Replace styles: paste-style failed for src ${srcId}: ${pasteRes?.error || "unknown"}`,
+        );
+        continue;
+      }
+      done += targetIds.length;
     }
 
     ns.log?.(

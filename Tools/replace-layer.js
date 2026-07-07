@@ -6,8 +6,6 @@
   const NAV_ELEMENT = ".elementor-navigator__element[data-id]";
   const TITLE_SELECTOR = ".elementor-navigator__element__title__text";
 
-  const wait = (ms) => new Promise((r) => setTimeout(r, ms));
-
   const getTitle = (el) =>
     el.querySelector(TITLE_SELECTOR)?.textContent?.trim() || "";
 
@@ -114,9 +112,14 @@
       `Replace layer: started — ${usable.length} target(s) for "${sourceName}"`,
     );
 
-    let done = 0;
+    const parentPasteCount = new Map();
+    const toDelete = [];
     for (const m of usable) {
-      const pasteRes = await ns.callBridge?.("paste", { targetId: m.parentId });
+      const prior = parentPasteCount.get(m.parentId) || 0;
+      const pasteRes = await ns.callBridge?.("paste", {
+        targetId: m.parentId,
+        at: m.index + prior,
+      });
       if (!pasteRes || !pasteRes.ok || !pasteRes.id) {
         ns.log?.(
           "warn",
@@ -124,32 +127,21 @@
         );
         continue;
       }
-      const newId = pasteRes.id;
+      parentPasteCount.set(m.parentId, prior + 1);
+      toDelete.push(m.id);
+    }
 
-      const moveRes = await ns.callBridge?.("move", {
-        id: newId,
-        targetId: m.parentId,
-        at: m.index,
-      });
-      if (!moveRes || !moveRes.ok) {
-        ns.log?.(
-          "warn",
-          `Replace layer: move failed for ${newId}: ${moveRes?.error || "unknown"}`,
-        );
-        continue;
-      }
-
-      const delRes = await ns.callBridge?.("delete", { id: m.id });
+    let done = 0;
+    if (toDelete.length) {
+      const delRes = await ns.callBridge?.("delete", { ids: toDelete });
       if (!delRes || !delRes.ok) {
         ns.log?.(
           "warn",
-          `Replace layer: delete failed for ${m.id}: ${delRes?.error || "unknown"}`,
+          `Replace layer: delete failed: ${delRes?.error || "unknown"}`,
         );
-        continue;
+      } else {
+        done = toDelete.length;
       }
-
-      done++;
-      await wait(30);
     }
 
     ns.log?.(
