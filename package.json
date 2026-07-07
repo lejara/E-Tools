@@ -1,0 +1,29 @@
+{
+  "_comment": "Typical flow each release: npm run bump → npm run sign → install the .xpi from about:addons.",
+  "name": "elementor_tool",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Elementor editor tools - Firefox extension",
+  "main": "background.js",
+  "scripts": {
+    "bump": "node scripts/bump-version.js patch",
+    "bump:minor": "node scripts/bump-version.js minor",
+    "bump:major": "node scripts/bump-version.js major",
+    "lint": "web-ext lint",
+    "sign": "web-ext sign --channel=unlisted",
+    "test": "echo \"Error: no test specified\" && exit 1"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/lejara/E-Tools.git"
+  },
+  "author": "",
+  "license": "ISC",
+  "bugs": {
+    "url": "https://github.com/lejara/E-Tools/issues"
+  },
+  "homepage": "https://github.com/lejara/E-Tools#readme",
+  "devDependencies": {
+    "web-ext": "^10.4.0"
+  }
+}

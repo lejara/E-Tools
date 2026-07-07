@@ -1,0 +1,21 @@
+module.exports = {
+  sourceDir: '.',
+  ignoreFiles: [
+    'package.json',
+    'package-lock.json',
+    'node_modules',
+    'node_modules/**',
+    'scripts',
+    'scripts/**',
+    'web-ext-artifacts',
+    'web-ext-artifacts/**',
+    'web-ext-config.cjs',
+    '.amo-upload-uuid',
+    '*.zip',
+    '.git',
+    '.git/**',
+    '.gitignore',
+    '.env',
+    'CLAUDE.md',
+  ],
+};
