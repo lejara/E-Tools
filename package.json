@@ -1,7 +1,7 @@
 {
   "_comment": "Typical flow each release: npm run bump → npm run sign → install the .xpi from about:addons.",
   "name": "elementor_tool",
-  "version": "1.0.1",
+  "version": "1.1.0",
   "private": true,
   "description": "Elementor editor tools - Firefox extension",
   "main": "background.js",
