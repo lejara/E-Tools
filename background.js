@@ -11,7 +11,7 @@ browser.action.onClicked.addListener(async () => {
   await browser.windows.create({
     url: PANEL_URL,
     type: "popup",
-    width: 320,
-    height: 220,
+    width: 500,
+    height: 820,
   });
 });

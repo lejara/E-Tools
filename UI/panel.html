@@ -13,6 +13,14 @@
         background: #1e1e1e;
         color: #eee;
       }
+      .header-gif {
+        display: block;
+        width: 100%;
+        max-height: 148px;
+        object-fit: contain;
+        margin: 0 0 12px;
+        border-radius: 4px;
+      }
       h1 {
         font-size: 11px;
         margin: 0 0 8px;
@@ -218,6 +226,7 @@
     </style>
   </head>
   <body>
+    <img src="../assets/Froggy.gif" alt="" class="header-gif" />
     <h1>Root Layer</h1>
     <div id="title" class="title empty">No Root layer</div>
     <div id="meta" class="meta"></div>
@@ -232,6 +241,10 @@
     <label class="option" for="opt-overlay" style="margin-top: 6px">
       <input id="opt-overlay" type="checkbox" />
       <span>Show UI Overlay</span>
+    </label>
+    <label class="option" for="opt-overlay-froggy" style="margin-top: 6px">
+      <input id="opt-overlay-froggy" type="checkbox" />
+      <span>Show Froggy on Overlay</span>
     </label>
     <div class="field" style="margin-top: 10px">
       <label for="opt-working-domain" class="field-label">Working Domain</label>

@@ -16,7 +16,19 @@
     "<all_urls>"
   ],
   "action": {
-    "default_title": "Elementor Tools"
+    "default_title": "Elementor Tools",
+    "default_icon": {
+      "16": "assets/Froggy1.png",
+      "32": "assets/Froggy1.png",
+      "48": "assets/Froggy1.png",
+      "128": "assets/Froggy1.png"
+    }
+  },
+  "icons": {
+    "16": "assets/Froggy1.png",
+    "32": "assets/Froggy1.png",
+    "48": "assets/Froggy1.png",
+    "128": "assets/Froggy1.png"
   },
   "background": {
     "scripts": [
@@ -47,7 +59,9 @@
   "web_accessible_resources": [
     {
       "resources": [
-        "Tools/page-bridge.js"
+        "Tools/page-bridge.js",
+        "assets/Froggy.gif",
+        "assets/Froggy1.png"
       ],
       "matches": [
         "<all_urls>"

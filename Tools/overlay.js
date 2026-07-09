@@ -8,9 +8,11 @@
   let logsEl = null;
   let clearLogsBtn = null;
   let editBtn = null;
+  let froggyEl = null;
 
   const state = {
     enabled: false,
+    froggy: false,
     selectedLayer: null,
     logs: [],
     position: null,
@@ -151,6 +153,15 @@
         cursor: pointer;
       }
       #${OVERLAY_ID} .et-ov-edit:hover { background: #34467a; }
+      #${OVERLAY_ID} .et-ov-froggy {
+        display: block;
+        height: 64px;
+        width: auto;
+        max-width: 100%;
+        margin: 6px auto;
+        object-fit: contain;
+        pointer-events: none;
+      }
     `;
     (document.head || document.documentElement).appendChild(style);
   };
@@ -225,6 +236,22 @@
       overlay.insertBefore(row, logsEl);
     }
     editBtn.textContent = `Edit in Elementor (#${state.wpPostId})`;
+  };
+
+  const renderFroggy = () => {
+    if (!overlay) return;
+    if (state.froggy) {
+      if (!froggyEl) {
+        froggyEl = document.createElement("img");
+        froggyEl.className = "et-ov-froggy";
+        froggyEl.alt = "";
+        froggyEl.src = browser.runtime.getURL("assets/Froggy.gif");
+        overlay.appendChild(froggyEl);
+      }
+    } else if (froggyEl) {
+      froggyEl.remove();
+      froggyEl = null;
+    }
   };
 
   const renderLogs = () => {
@@ -332,6 +359,7 @@
     renderTitle();
     renderEditButton();
     renderLogs();
+    renderFroggy();
   };
 
   const destroyOverlay = () => {
@@ -342,6 +370,7 @@
     logsEl = null;
     clearLogsBtn = null;
     editBtn = null;
+    froggyEl = null;
   };
 
   const sync = () => {
@@ -351,6 +380,7 @@
       renderTitle();
       renderEditButton();
       renderLogs();
+      renderFroggy();
     } else {
       destroyOverlay();
     }
@@ -359,6 +389,7 @@
   browser.storage.local
     .get([
       "overlayEnabled",
+      "overlayFroggy",
       "selectedLayer",
       "logs",
       "overlayPosition",
@@ -366,6 +397,7 @@
     ])
     .then((s) => {
       state.enabled = !!s.overlayEnabled;
+      state.froggy = !!s.overlayFroggy;
       state.selectedLayer = s.selectedLayer || null;
       state.logs = s.logs || [];
       state.position = s.overlayPosition || null;
@@ -381,6 +413,10 @@
     if (changes.overlayEnabled) {
       state.enabled = !!changes.overlayEnabled.newValue;
       resync = true;
+    }
+    if (changes.overlayFroggy) {
+      state.froggy = !!changes.overlayFroggy.newValue;
+      if (overlay) renderFroggy();
     }
     if (changes.workingDomain) {
       state.workingDomain = changes.workingDomain.newValue || "";

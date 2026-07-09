@@ -6,6 +6,7 @@ const logsEl = document.getElementById("logs");
 const clearLogsBtn = document.getElementById("clear-logs");
 const replaceChildrenEl = document.getElementById("opt-replace-children");
 const overlayEl = document.getElementById("opt-overlay");
+const overlayFroggyEl = document.getElementById("opt-overlay-froggy");
 const workingDomainEl = document.getElementById("opt-working-domain");
 const hotkeysEl = document.getElementById("hotkeys");
 const resetAllHotkeysBtn = document.getElementById("reset-all-hotkeys");
@@ -92,6 +93,10 @@ replaceChildrenEl.addEventListener("change", () => {
 
 overlayEl.addEventListener("change", () => {
   browser.storage.local.set({ overlayEnabled: overlayEl.checked });
+});
+
+overlayFroggyEl.addEventListener("change", () => {
+  browser.storage.local.set({ overlayFroggy: overlayFroggyEl.checked });
 });
 
 workingDomainEl.addEventListener("change", () => {
@@ -242,6 +247,7 @@ browser.storage.local
     "logs",
     "replaceChildrenStyles",
     "overlayEnabled",
+    "overlayFroggy",
     "workingDomain",
     "hotkeyBindings",
   ])
@@ -250,6 +256,7 @@ browser.storage.local
     renderLogs(state.logs || []);
     replaceChildrenEl.checked = !!state.replaceChildrenStyles;
     overlayEl.checked = !!state.overlayEnabled;
+    overlayFroggyEl.checked = !!state.overlayFroggy;
     workingDomainEl.value = state.workingDomain || "";
     hotkeyBindings = mergeWithDefaults(state.hotkeyBindings || null);
     renderHotkeys();
@@ -268,6 +275,9 @@ browser.storage.onChanged.addListener((changes, area) => {
   }
   if (changes.overlayEnabled) {
     overlayEl.checked = !!changes.overlayEnabled.newValue;
+  }
+  if (changes.overlayFroggy) {
+    overlayFroggyEl.checked = !!changes.overlayFroggy.newValue;
   }
   if (changes.workingDomain && document.activeElement !== workingDomainEl) {
     workingDomainEl.value = changes.workingDomain.newValue || "";
