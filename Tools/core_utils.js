@@ -237,6 +237,68 @@
     return result;
   };
 
+  // Point a fresh Elementor Pro Template widget at a template, rather than
+  // inserting a copy of the template's content. This is the cheap path and the
+  // linked one: the widget's whole identity is settings.template_id, so nothing
+  // is fetched, cloned or id-regenerated — one $e.run — and the block keeps
+  // tracking the template instead of becoming an independent copy. It is the
+  // exact inverse of template-decouple.js.
+  //
+  // Placement mirrors insertSiteTemplate: intoId appends inside that container,
+  // afterId lands directly after that element. Unlike an insert, one of the two
+  // is required — a widget cannot be a direct child of the document, and the
+  // bridge says so rather than creating a layer nothing can hold.
+  //
+  // The default timeout applies: there is no network round trip here, so the
+  // reasons insertSiteTemplate needs 15s do not.
+  const createTemplateWidget = async (
+    templateId,
+    { intoId, afterId, onWait } = {},
+  ) => {
+    if (!templateId) {
+      log("warn", "createTemplateWidget called without templateId");
+      return { ok: false, error: "templateId is required" };
+    }
+    const result = await callBridge(
+      "create-element",
+      {
+        elType: "widget",
+        widgetType: "template",
+        // The model holds it as a string and list-template-widgets normalises to
+        // one when reading, so write one — the two have to agree for a decouple
+        // run to find what an insert created.
+        settings: { template_id: String(templateId) },
+        intoId,
+        afterId,
+      },
+      { onWait },
+    );
+    log(
+      result.ok ? "info" : "warn",
+      result.ok
+        ? `Created template widget for ${templateId}`
+        : `Failed to create template widget for ${templateId}: ${result.error}`,
+    );
+    return result;
+  };
+
+  // A plain empty container. Its one caller needs somewhere to put widgets at
+  // the end of the page, which the document root cannot be.
+  const createContainer = async ({ intoId, afterId, onWait } = {}) => {
+    const result = await callBridge(
+      "create-element",
+      { elType: "container", intoId, afterId },
+      { onWait },
+    );
+    log(
+      result.ok ? "info" : "warn",
+      result.ok
+        ? `Created container ${result.id}`
+        : `Failed to create container: ${result.error}`,
+    );
+    return result;
+  };
+
   const listSiteTemplates = async ({ source = "local", onWait } = {}) => {
     const result = await callBridge(
       "list-templates",
@@ -892,6 +954,8 @@
   ns.MODAL_STATE_COLORS = STATE_COLORS;
   ns.callBridge = callBridge;
   ns.insertSiteTemplate = insertSiteTemplate;
+  ns.createTemplateWidget = createTemplateWidget;
+  ns.createContainer = createContainer;
   ns.listSiteTemplates = listSiteTemplates;
   ns.prefetchTemplates = prefetchTemplates;
   ns.PREFETCH_CONCURRENCY = PREFETCH_CONCURRENCY;

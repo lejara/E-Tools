@@ -408,6 +408,73 @@
       await Promise.all(Array.from({ length: lanes }, worker));
       return { loaded, failed };
     },
+    // Build one element from scratch — no template JSON, no import, no network.
+    // The Template widget's whole identity is settings.template_id (the same
+    // field list-template-widgets reads), so pointing a fresh one at a template
+    // is a create with that single setting: none of insert-template's fetch,
+    // clone and id-regeneration work applies, because nothing is being copied.
+    //
+    // Placement matches insert-template — intoId appends inside that container,
+    // afterId lands directly after that element, neither means the end of the
+    // page. create takes options.at directly, so unlike import there is no
+    // copy → paste → delete shuffle to reach a non-tail index.
+    //
+    // edit:false because a batch would otherwise open the panel once per element
+    // and leave the last one selected, which is not what a batch insert means.
+    "create-element": async ({ elType, widgetType, settings, intoId, afterId }) => {
+      if (!elType) throw new Error("elType is required");
+      if (elType === "widget") {
+        if (!widgetType) throw new Error("widgetType is required for a widget");
+        // An unregistered widget type still creates an element — it just renders
+        // as nothing. "template" ships with Elementor Pro, so a site without Pro
+        // would silently collect empty layers; say so instead. An absent cache is
+        // not evidence of anything, so it is only consulted when present.
+        const cache = window.elementor?.widgetsCache;
+        if (cache && !cache[widgetType]) {
+          throw new Error(
+            `Unknown widget type "${widgetType}" — is Elementor Pro active?`,
+          );
+        }
+      }
+
+      let container;
+      let at;
+      if (afterId) {
+        const anchor = getContainer(afterId);
+        container = anchor.parent;
+        if (!container) throw new Error("anchor element has no parent");
+        const index = indexInParent(anchor, container);
+        if (index < 0) {
+          throw new Error("anchor not found among its siblings");
+        }
+        at = index + 1;
+      } else {
+        container = intoId
+          ? getContainer(intoId)
+          : window.elementor.getPreviewContainer();
+      }
+      // Only the document root has no parent, and it takes containers only.
+      // Creating a widget there yields a layer nothing can hold, so refuse
+      // rather than leaving one behind for the caller to find later.
+      if (elType === "widget" && !container.parent) {
+        throw new Error(
+          "a widget cannot be a direct child of the document — pass intoId or afterId",
+        );
+      }
+
+      const model = { elType };
+      if (widgetType) model.widgetType = widgetType;
+      if (settings) model.settings = settings;
+
+      const result = await runCommand("document/elements/create", {
+        container,
+        model,
+        options: { edit: false, ...(typeof at === "number" ? { at } : {}) },
+      });
+      const [id] = createdIds(result);
+      if (!id) throw new Error("create returned no container id");
+      return { id };
+    },
     // Placement is optional and defaults to the end of the page, which is what
     // this op has always done. intoId appends inside that container; afterId
     // drops the template in directly after that element. The parent for the

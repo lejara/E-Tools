@@ -16,7 +16,7 @@ Browser extension (MV3, Firefox) that adds hotkey-driven tools to Elementor's Wo
 │   └── panel.js         # reads browser.storage.local, re-renders on change; site-template list
 └── Tools/               # one self-contained tool per file
     ├── preview-override.js   # forces fixed widths on mobile/tablet preview
-    ├── core_utils.js         # shared helpers on window.__ElementorTools (log, selectLayerById, callBridge, insertSiteTemplate, listSiteTemplates, pairTrees, normalizeName)
+    ├── core_utils.js         # shared helpers on window.__ElementorTools (log, selectLayerById, callBridge, insertSiteTemplate, createTemplateWidget, createContainer, listSiteTemplates, pairTrees, normalizeName)
     ├── page-bridge.js        # injected into page world; runs Elementor $e commands via postMessage
     ├── multi-select.js       # shared subsystem: shift+click in navigator toggles blue-tint selection
     ├── layer-root-finder.js  # captures the currently selected Elementor layer
@@ -66,7 +66,20 @@ Tick state is tracked as the set of *unticked* items keyed on identity, so an it
 
 `callBridge(op, payload, { timeout, waitLimit, onWait })` — default timeout is 3s. Ops that hit the network (`insert-template`, `list-templates`, `prefetch-templates`) pass 15s or more.
 
-Ops: `ping` · `copy` · `paste-style` · `apply-style-pairs` · `paste` · `delete` · `rename` · `insert-template` · `prefetch-templates` · `list-templates` · `describe-tree` · `describe-selection` · `list-containers` · `list-template-widgets` · `history-start` / `history-end`.
+Ops: `ping` · `copy` · `paste-style` · `apply-style-pairs` · `paste` · `delete` · `rename` · `create-element` · `insert-template` · `prefetch-templates` · `list-templates` · `describe-tree` · `describe-selection` · `list-containers` · `list-template-widgets` · `history-start` / `history-end`.
+
+### `create-element` is the cheap path, and the linked one
+
+`create-element` builds one element from nothing — `{ elType, widgetType, settings, intoId, afterId }` → `{ id }`. It exists because a **Template widget needs no template content at all**: its whole identity is `settings.template_id` (the field `list-template-widgets` reads), so pointing a fresh one at a template is a single `document/elements/create`. None of `insert-template`'s work applies — no library fetch, no clone, no `regenerateIds` — because nothing is being copied. `ns.createTemplateWidget(templateId, { intoId, afterId })` is the util; `ns.createContainer` is the same op with `elType: "container"`.
+
+That makes it the **inverse of `template-decouple.js`**: decoupling replaces the widget with a copy of the content, this replaces the content with a widget. A widget-mode insert therefore stays linked — later edits to the template follow — where a content insert produces an independent copy.
+
+- **Placement is `insert-template`'s, minus the shuffle.** `create` takes `options.at` directly, so reaching a non-tail index needs no copy → paste → delete.
+- **`edit: false`.** The default opens the panel for the created element; a batch would do that once per widget and leave the last one selected.
+- **A widget cannot be a direct child of the document.** The root takes containers only, so the op refuses rather than leaving behind a layer nothing can hold — which is why widget mode builds a wrapper (below) instead of appending to the page.
+- **An unregistered `widgetType` is refused** when `widgetsCache` is readable. Creating one succeeds and renders nothing, so a site without Elementor Pro would quietly accumulate empty layers instead of being told Pro is missing.
+- Not in `REPLAYABLE_OPS` — it mutates, so it is waited on, never re-sent. The default `waitLimit` is right: a lost answer orphans a created element.
+- It creates `elType: "container"`, not `section`. The whole codebase already assumes flexbox containers (`CHILD_BEARING`, template-sync's "top containers"); a section-only site gets Elementor's own error in the modal row.
 
 ### Style batches run page-side
 
@@ -178,7 +191,7 @@ Checklist labels are `"<template>" — inside "<parent>"`, which collides readil
 
 ## Template insert
 
-`Tools/template-insert.js` (`Ctrl+Shift+8`) is independent of name matching: it lists the whole library in a searchable modal with a checkbox per template, and inserts everything ticked at the end of the page — or at the current selection, see below. Insertion follows **tick order**, not list order, so the sequence is controllable. The whole batch is one undo step.
+`Tools/template-insert.js` (`Ctrl+Shift+8`) is independent of name matching: it lists the whole library in a searchable modal with a checkbox per template, and inserts everything ticked at the end of the page — or at the current selection, and as content or as Template widgets; both are checkboxes, see below. Insertion follows **tick order**, not list order, so the sequence is controllable. The whole batch is one undo step.
 
 Each row shows the title, then author and last-modified date beneath it, with the template type on the right. Elementor's field names for those vary by version, so `list-templates` tries several candidates (`human_modified_date` → `human_date` → `modified` → `date`) and prefers the server's own preformatted string, which is already in the site's locale and timezone. It also returns `fields` — the raw key list from the first template — so a missing column can be diagnosed without guessing.
 
@@ -197,6 +210,15 @@ A checkbox above the search box redirects the batch to whatever the editor has s
 - **Off by default.** Inserting at the end of the page is what this tool has always done, and the selection is only whatever happened to be clicked last — a silent redirect based on that would be a surprise.
 - The selection is read **once, before the picker opens**, in the same `Promise.all` as the library fetch. The picker is a full-screen overlay, so the selection cannot change underneath it. A failed read is non-fatal: the option is simply not offered, and the modal says nothing is selected rather than showing a dead checkbox.
 - **The anchor advances.** In the after-a-sibling case each insert re-anchors on the element it just created, so several templates keep their tick order instead of each one landing in front of the last. The inside-a-container case needs no such bookkeeping — appending is already in order.
+
+### Insert as Template widget
+
+A second checkbox switches the whole ticked batch from a copy of each template's content to **one Elementor Pro Template widget per template**, pointed at it via `create-element`. Same hotkey, same picker, same tick order, same undo step. **Off by default** — a copy is what this tool has always produced, and the two make very different documents: a widget stays linked, so template edits follow it, while a copy is independent from the moment it lands.
+
+- **The end of the page needs a wrapper.** A widget cannot be a direct child of the document, so widget mode builds **one** container at the end of the page (named `Template Widgets`, because an unnamed one reads as "Container") and puts the whole batch inside it. One wrapper, not one per widget — the batch is a batch. If the container cannot be created nothing is attempted, and every row says so rather than sitting on "waiting".
+- The **at-selection** cases need no wrapper: a selected container already holds widgets, and a selected non-container puts them after it inside its own parent. Both compose with this checkbox, and the status line's destination reflects whichever combination is set.
+- **No prefetch.** `prefetchTemplates` warms template *content*, and widget mode never reads any — it writes an id into a setting. Warming it would be work the run doesn't use, and a preload failure on those rows would describe something that never happens.
+- **Named with the title, no `#id` tag.** The tag exists because a copy keeps no other trace of its origin; a widget holds `settings.template_id`, an exact link a rename cannot break, so a tag would be a second answer to a settled question. `template-decouple.js` is what writes the tag — at the point where it destroys `template_id`.
 
 ### Progress modal
 

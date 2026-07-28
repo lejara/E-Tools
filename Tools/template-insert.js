@@ -114,6 +114,33 @@
     return ` · named ${names}`;
   };
 
+  // Title only, no #id tag. The tag exists because a *copy* of a template's
+  // content keeps no other trace of where it came from; a Template widget holds
+  // settings.template_id, an exact link that renaming cannot break, so a tag
+  // here would only be a second answer to a question already answered.
+  const nameWidget = async (id, template) => {
+    const title = String(template.title || "").trim();
+    if (!title) return "";
+    const res = await ns.callBridge("rename", { ids: [id], title });
+    if (!res?.ok) {
+      ns.log("warn", `Template insert: naming widget failed — ${res?.error}`);
+      return " · rename failed";
+    }
+    return ` · named "${title}"`;
+  };
+
+  // Where the batch lands, in the words the status line uses. Widget mode has
+  // its own end-of-page answer: the document root takes containers only, so the
+  // widgets need one built for them.
+  const destinationOf = (atSelection, asWidget, placement) => {
+    if (atSelection && placement) return placement.describe;
+    return asWidget ? "a new container at end of page" : "end of page";
+  };
+
+  // Name for the container built to hold an end-of-page widget batch. Something
+  // readable, because an unnamed one reads as "Container" in the navigator.
+  const WRAPPER_NAME = "Template Widgets";
+
   const makeBtn = (text, primary) => {
     const b = document.createElement("button");
     b.type = "button";
@@ -210,8 +237,12 @@
       // Placement option. Off by default: the end of the page is what this tool
       // has always done, and the selection is only whatever was clicked last.
       let atSelection = false;
+      // Content copy vs a Template widget pointing at the same template. Also
+      // off by default — inserting the content is what this tool has always
+      // done, and the two produce very different documents.
+      let asWidget = false;
 
-      if (placement) {
+      const optionRow = (labelText, hintText, onChange) => {
         const row = document.createElement("label");
         row.style.cssText = `
           display:flex; align-items:flex-start; gap:8px; padding:6px 7px;
@@ -222,22 +253,27 @@
         box.type = "checkbox";
         box.style.cssText =
           "accent-color:#3880ff;cursor:pointer;flex:0 0 auto;margin-top:2px;";
-        box.addEventListener("change", () => {
-          atSelection = box.checked;
-          renderStatus();
-        });
+        box.addEventListener("change", () => onChange(box.checked));
         const text = document.createElement("span");
         text.style.cssText =
           "flex:1 1 auto;min-width:0;display:flex;flex-direction:column;gap:1px;";
         const main = document.createElement("span");
-        main.textContent = placement.label;
+        main.textContent = labelText;
         main.style.color = "#eee";
         const hint = document.createElement("span");
-        hint.textContent = placement.hint;
+        hint.textContent = hintText;
         hint.style.cssText = "color:#777;font-size:11px;";
         text.append(main, hint);
         row.append(box, text);
         card.appendChild(row);
+        return row;
+      };
+
+      if (placement) {
+        optionRow(placement.label, placement.hint, (on) => {
+          atSelection = on;
+          renderStatus();
+        });
       } else {
         const note = document.createElement("div");
         note.textContent =
@@ -245,6 +281,15 @@
         note.style.cssText = "color:#777;font-size:11px;";
         card.appendChild(note);
       }
+
+      optionRow(
+        "Insert as Template widget",
+        "one Elementor Template widget per template instead of a copy of its content — the block stays linked, so template edits follow",
+        (on) => {
+          asWidget = on;
+          renderStatus();
+        },
+      );
 
       const smallBtn = (text) => {
         const b = document.createElement("button");
@@ -320,9 +365,8 @@
         bits.push(picked.length ? `${picked.length} selected` : "none selected");
         if (hiddenPicked) bits.push(`${hiddenPicked} hidden by search`);
         if (picked.length > 1) bits.push("insert order = tick order");
-        bits.push(
-          `→ ${atSelection && placement ? placement.describe : "end of page"}`,
-        );
+        if (asWidget) bits.push("as Template widgets");
+        bits.push(`→ ${destinationOf(atSelection, asWidget, placement)}`);
         status.textContent = bits.join(" · ");
 
         insertBtn.disabled = !picked.length;
@@ -428,7 +472,7 @@
       document.addEventListener("keydown", onKey, true);
       cancelBtn.addEventListener("click", () => finish(null));
       insertBtn.addEventListener("click", () =>
-        finish({ picked: picked.slice(), atSelection }),
+        finish({ picked: picked.slice(), atSelection, asWidget }),
       );
       wrap.addEventListener("click", (e) => {
         if (e.target === wrap) finish(null);
@@ -570,9 +614,9 @@
         ns.log("info", "Template insert: cancelled");
         return;
       }
-      const { picked } = choice;
+      const { picked, asWidget } = choice;
       const target = choice.atSelection ? placement : null;
-      const where = target ? target.describe : "at the end of the page";
+      const where = destinationOf(choice.atSelection, asWidget, placement);
 
       const modal = openProgress();
       for (let i = 0; i < picked.length; i++) {
@@ -582,7 +626,11 @@
       // Fetch every ticked template's content first, a few requests at a time, so
       // the serial insert loop below is only paying for the edits. Failures are
       // non-fatal: that template's own insert fetches it again.
-      if (picked.length > 1) {
+      //
+      // Widget mode never reads a template's content — it only writes an id into
+      // a setting — so there is nothing to warm, and a preload failure reported
+      // on those rows would be describing work the run does not do.
+      if (!asWidget && picked.length > 1) {
         modal.setStatus(
           `Loading ${picked.length} template(s), ${ns.PREFETCH_CONCURRENCY} at a time…`,
         );
@@ -601,7 +649,9 @@
       // undo step, with the hotkey locked meanwhile.
       const historyRes = await ns.callBridge(
         "history-start",
-        { title: "Insert site templates" },
+        {
+          title: asWidget ? "Insert template widgets" : "Insert site templates",
+        },
         { waitLimit: 1 },
       );
       const logId = historyRes?.ok ? historyRes.logId : null;
@@ -613,11 +663,61 @@
 
       let done = 0;
       let failed = 0;
+      // Set when nothing can be attempted at all, so the rows say why rather
+      // than sitting on "waiting" forever.
+      let fatal = null;
       try {
-        for (let i = 0; i < picked.length; i++) {
+        // A widget needs a parent that can hold one. A selected container is
+        // one, and a selected widget puts them after it inside its own parent —
+        // but the end of the page is the document root, which takes containers
+        // only. So build one, inside this run's undo step, and fill it.
+        if (asWidget && !target) {
+          modal.setStatus("Creating a container to hold the template widgets…");
+          const wrapper = await ns.createContainer({
+            onWait: waitStatus(modal),
+          });
+          if (!wrapper?.ok) {
+            fatal = `could not create a container — ${wrapper?.error}`;
+          } else {
+            args = { intoId: wrapper.id };
+            const named = await ns.callBridge("rename", {
+              ids: [wrapper.id],
+              title: WRAPPER_NAME,
+            });
+            if (!named?.ok) {
+              ns.log(
+                "warn",
+                `Template insert: naming wrapper failed — ${named?.error}`,
+              );
+            }
+          }
+        }
+
+        for (let i = 0; i < picked.length && !fatal; i++) {
           const t = picked[i];
+          if (asWidget) {
+            modal.setStatus(
+              `Creating Template widget for "${t.title}" → ${where} (${i + 1}/${picked.length})…`,
+            );
+            modal.setRow(i, "running", "creating widget");
+            const made = await ns.createTemplateWidget(t.templateId, {
+              ...args,
+              onWait: waitStatus(modal),
+            });
+            if (!made?.ok) {
+              failed++;
+              modal.setRow(i, "error", `failed — ${made?.error}`);
+              continue;
+            }
+            done++;
+            const named = await nameWidget(made.id, t);
+            modal.setRow(i, "ok", `Template widget created${named}`);
+            if (args.afterId) args = { afterId: made.id };
+            continue;
+          }
+
           modal.setStatus(
-            `Inserting "${t.title}" ${where} (${i + 1}/${picked.length})…`,
+            `Inserting "${t.title}" → ${where} (${i + 1}/${picked.length})…`,
           );
           modal.setRow(i, "running", "inserting");
           const ins = await ns.insertSiteTemplate(t.templateId, {
@@ -646,7 +746,17 @@
         }
       }
 
-      const summary = `${done} inserted, ${failed} failed · ${where}`;
+      if (fatal) {
+        for (let i = 0; i < picked.length; i++) {
+          modal.setRow(i, "error", `not attempted — ${fatal}`);
+        }
+        ns.log("warn", `Template insert: ${fatal}`);
+        modal.finish(`Nothing inserted — ${fatal}`, "error");
+        return;
+      }
+
+      const verb = asWidget ? "created" : "inserted";
+      const summary = `${done} ${verb}, ${failed} failed · ${where}`;
       ns.log(done ? "info" : "warn", `Template insert: ${summary}`);
       modal.finish(summary, failed ? "warn" : "ok");
     } catch (err) {
