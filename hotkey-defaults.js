@@ -25,6 +25,26 @@
       label: "Reselect stored root",
       default: { ctrl: true, shift: true, alt: false, code: "Digit5" },
     },
+    {
+      id: "syncTemplateStyles",
+      label: "Sync template styles",
+      default: { ctrl: true, shift: true, alt: false, code: "Digit6" },
+    },
+    {
+      id: "replaceWithTemplate",
+      label: "Replace with template",
+      default: { ctrl: true, shift: true, alt: false, code: "Digit7" },
+    },
+    {
+      id: "insertTemplates",
+      label: "Insert site templates",
+      default: { ctrl: true, shift: true, alt: false, code: "Digit8" },
+    },
+    {
+      id: "decoupleTemplates",
+      label: "Decouple templates",
+      default: { ctrl: true, shift: true, alt: false, code: "Digit9" },
+    },
   ];
 
   const formatKey = (code) => {

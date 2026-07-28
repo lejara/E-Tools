@@ -18,6 +18,22 @@
       window.__ElementorTools?.batchRename?.();
       return true;
     },
+    syncTemplateStyles: () => {
+      window.__ElementorTools?.syncTemplateStyles?.();
+      return true;
+    },
+    replaceWithTemplate: () => {
+      window.__ElementorTools?.replaceWithTemplate?.();
+      return true;
+    },
+    insertTemplates: () => {
+      window.__ElementorTools?.insertTemplates?.();
+      return true;
+    },
+    decoupleTemplates: () => {
+      window.__ElementorTools?.decoupleTemplates?.();
+      return true;
+    },
     reselectRoot: async () => {
       const { selectedLayer } =
         await browser.storage.local.get("selectedLayer");
@@ -29,6 +45,35 @@
       return true;
     },
   };
+
+  // The panel's per-hotkey Run buttons land here. They go through the same
+  // `runners` table as the keydown handler on purpose — a button and its key
+  // cannot drift apart if there is only one entry point per action.
+  browser.runtime.onMessage.addListener((msg) => {
+    if (!msg || msg.__elementorTools !== true) return undefined;
+    if (msg.type !== "run-action") return undefined;
+    const runner = runners[msg.action];
+    if (!runner) {
+      return Promise.resolve({
+        ok: false,
+        error: `unknown action "${msg.action}"`,
+      });
+    }
+    try {
+      // Tools own their own UI, so the reply only reports that the run
+      // started — awaiting the whole operation would hold the panel's
+      // sendMessage open for the length of a template sync.
+      Promise.resolve(runner()).catch((err) => {
+        window.__ElementorTools?.log?.(
+          "error",
+          `${msg.action} failed — ${err?.message || err}`,
+        );
+      });
+    } catch (err) {
+      return Promise.resolve({ ok: false, error: err?.message || String(err) });
+    }
+    return Promise.resolve({ ok: true });
+  });
 
   let bindings = mergeWithDefaults(null);
 

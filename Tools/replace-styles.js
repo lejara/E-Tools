@@ -62,21 +62,30 @@
   // Walk source and target trees in lockstep. If structurally identical
   // (same name + icon type, same child count and order at every level),
   // return the positional pairs [{sourceId, targetId}, ...]. Otherwise null.
-  const pairSubtrees = (src, tgt) => {
+  // A node carrying the skip word yields no pairs and exempts its subtree
+  // from comparison, so a deliberately-diverged branch does not fail the match.
+  const pairSubtrees = (src, tgt, isSkipped) => {
+    if (isSkipped(src.name) || isSkipped(tgt.name)) return [];
     if (src.name !== tgt.name) return null;
     if (src.type !== tgt.type) return null;
     if (src.children.length !== tgt.children.length) return null;
     const pairs = [{ sourceId: src.id, targetId: tgt.id }];
     for (let i = 0; i < src.children.length; i++) {
-      const sub = pairSubtrees(src.children[i], tgt.children[i]);
+      const sub = pairSubtrees(src.children[i], tgt.children[i], isSkipped);
       if (!sub) return null;
       pairs.push(...sub);
     }
     return pairs;
   };
 
-  const runSimpleReplace = async (source, sourceId, sourceName, rootEl) => {
-    const matches = findMatches(rootEl, sourceId, sourceName);
+  const runSimpleReplace = async (source, sourceId, sourceName, rootEl, isSkipped) => {
+    if (isSkipped(sourceName)) {
+      ns.log?.("warn", `Replace styles: source "${sourceName}" carries the skip word`);
+      return;
+    }
+    const matches = findMatches(rootEl, sourceId, sourceName).filter(
+      (m) => !isSkipped(m.title),
+    );
     if (!matches.length) {
       ns.log?.("warn", `Replace styles: no matches for "${sourceName}"`);
       return;
@@ -122,7 +131,11 @@
     ns.log?.("info", `Replace styles: applied to ${ids.length} layer(s)`);
   };
 
-  const runDeepReplace = async (source, sourceId, sourceName, rootEl) => {
+  const runDeepReplace = async (source, sourceId, sourceName, rootEl, isSkipped) => {
+    if (isSkipped(sourceName)) {
+      ns.log?.("warn", `Replace styles: source "${sourceName}" carries the skip word`);
+      return;
+    }
     const sourceType = getIconClass(source);
     const sourceTree = describeSubtree(source);
 
@@ -133,7 +146,7 @@
       if (!id || id === sourceId) continue;
       if (getTitle(el) !== sourceName) continue;
       if (getIconClass(el) !== sourceType) continue;
-      const pairs = pairSubtrees(sourceTree, describeSubtree(el));
+      const pairs = pairSubtrees(sourceTree, describeSubtree(el), isSkipped);
       if (pairs) passed.push({ id, pairs });
       else failedStructure.push({ id, title: getTitle(el) });
     }
@@ -221,13 +234,14 @@
       return;
     }
 
+    const isSkipped = await ns.getSkipMatcher();
     const { replaceChildrenStyles } = await browser.storage.local.get(
       "replaceChildrenStyles",
     );
     if (replaceChildrenStyles) {
-      await runDeepReplace(source, sourceId, sourceName, rootEl);
+      await runDeepReplace(source, sourceId, sourceName, rootEl, isSkipped);
     } else {
-      await runSimpleReplace(source, sourceId, sourceName, rootEl);
+      await runSimpleReplace(source, sourceId, sourceName, rootEl, isSkipped);
     }
   };
 

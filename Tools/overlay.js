@@ -27,20 +27,9 @@
     return m ? m[1] : null;
   }
 
-  const parseWorkingDomain = (raw) => {
-    if (!raw) return null;
-    const trimmed = String(raw).trim();
-    if (!trimmed) return null;
-    try {
-      const withProto = /^https?:\/\//i.test(trimmed)
-        ? trimmed
-        : `https://${trimmed}`;
-      const u = new URL(withProto);
-      return { hostname: u.hostname, origin: u.origin };
-    } catch {
-      return null;
-    }
-  };
+  // Shared with the panel so both build the same Edit URL — template-format.js.
+  const { parseWorkingDomain, elementorEditUrl } =
+    window.__ElementorTemplateFormat;
 
   const domainMatches = () => {
     const parsed = parseWorkingDomain(state.workingDomain);
@@ -170,8 +159,14 @@
     if (!overlay) return;
     const p = state.position;
     if (p && Number.isFinite(p.left) && Number.isFinite(p.top)) {
-      overlay.style.left = p.left + "px";
-      overlay.style.top = p.top + "px";
+      // Clamp to the current viewport: a position saved on a wider window
+      // would otherwise mount the overlay off-screen, with no way to drag it
+      // back and nothing to indicate it is there.
+      const rect = overlay.getBoundingClientRect();
+      const maxLeft = Math.max(0, window.innerWidth - rect.width);
+      const maxTop = Math.max(0, window.innerHeight - rect.height);
+      overlay.style.left = Math.max(0, Math.min(p.left, maxLeft)) + "px";
+      overlay.style.top = Math.max(0, Math.min(p.top, maxTop)) + "px";
       overlay.style.right = "";
       overlay.style.bottom = "";
     } else {
@@ -225,9 +220,8 @@
       editBtn.className = "et-ov-edit";
       editBtn.addEventListener("click", (e) => {
         e.stopPropagation();
-        const p = parseWorkingDomain(state.workingDomain);
-        if (!p || !state.wpPostId) return;
-        const url = `${p.origin}/wp-admin/post.php?post=${state.wpPostId}&action=elementor`;
+        const url = elementorEditUrl(state.workingDomain, state.wpPostId);
+        if (!url) return;
         window.open(url, "_blank", "noopener");
       });
       editBtn.addEventListener("mousedown", (e) => e.stopPropagation());
@@ -406,6 +400,10 @@
       sync();
     })
     .catch(() => {});
+
+  window.addEventListener("resize", () => {
+    if (overlay) applyPosition();
+  });
 
   browser.storage.onChanged.addListener((changes, area) => {
     if (area !== "local") return;

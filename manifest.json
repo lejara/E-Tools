@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "Elementor Tools",
-  "version": "1.1.0",
+  "version": "2.2.0",
   "description": "Time is an Element",
   "browser_specific_settings": {
     "gecko": {
@@ -42,12 +42,16 @@
       ],
       "js": [
         "Tools/preview-override.js",
+        "template-format.js",
         "Tools/core_utils.js",
         "Tools/multi-select.js",
         "Tools/layer-root-finder.js",
         "Tools/replace-styles.js",
         "Tools/replace-layer.js",
         "Tools/batch-rename.js",
+        "Tools/template-sync.js",
+        "Tools/template-insert.js",
+        "Tools/template-decouple.js",
         "Tools/overlay.js",
         "hotkey-defaults.js",
         "hotkeys.js"

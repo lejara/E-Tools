@@ -104,11 +104,101 @@
       .text-input:focus {
         border-color: #4a4a4a;
       }
+      .field-hint {
+        font-size: 10px;
+        color: #777;
+        line-height: 1.3;
+      }
       .logs-header {
         margin-top: 14px;
         display: flex;
         align-items: center;
         justify-content: space-between;
+      }
+      .templates-header {
+        margin-top: 14px;
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+      }
+      .templates-search {
+        margin-top: 6px;
+        width: 100%;
+        box-sizing: border-box;
+      }
+      .templates-status {
+        margin-top: 5px;
+        font-size: 10px;
+        color: #777;
+        min-height: 13px;
+      }
+      .templates-status.error {
+        color: #e07070;
+      }
+      .templates {
+        margin-top: 6px;
+        max-height: 240px;
+        overflow-y: auto;
+        background: #151515;
+        border: 1px solid #2a2a2a;
+        border-radius: 4px;
+        padding: 4px 6px;
+      }
+      .templates .empty {
+        color: #555;
+        padding: 2px 0;
+      }
+      .template {
+        display: flex;
+        align-items: flex-start;
+        gap: 8px;
+        padding: 4px 2px;
+        border-bottom: 1px solid #232323;
+      }
+      .template:last-child {
+        border-bottom: 0;
+      }
+      .template .text {
+        flex: 1 1 auto;
+        min-width: 0;
+        display: flex;
+        flex-direction: column;
+        gap: 1px;
+      }
+      .template .name {
+        color: #e6e6e6;
+        word-break: break-word;
+      }
+      .template .sub {
+        color: #777;
+        font-size: 10px;
+      }
+      .template .type {
+        color: #777;
+        font-size: 10px;
+        font-family: ui-monospace, monospace;
+        flex: 0 0 auto;
+        margin-top: 2px;
+      }
+      button.edit {
+        flex: 0 0 auto;
+        background: #2a2a2a;
+        color: #d0d0d0;
+        border: 1px solid #3a3a3a;
+        border-radius: 3px;
+        padding: 2px 8px;
+        font: inherit;
+        font-size: 10px;
+        cursor: pointer;
+      }
+      button.edit:hover:not(:disabled) {
+        background: #333;
+        border-color: #4a4a4a;
+        color: #fff;
+      }
+      button.edit:disabled {
+        opacity: 0.4;
+        cursor: default;
       }
       .logs {
         margin-top: 6px;
@@ -193,9 +283,29 @@
         border-color: #7a9cff;
         color: #7a9cff;
       }
-      .hotkey-reset {
+      .hotkey-run {
         flex: 0 0 auto;
         margin-left: auto;
+        background: #2a2a2a;
+        border: 1px solid #3a3a3a;
+        border-radius: 3px;
+        color: #d0d0d0;
+        padding: 1px 8px;
+        font: inherit;
+        font-size: 10px;
+        cursor: pointer;
+      }
+      .hotkey-run:hover:not(:disabled) {
+        background: #333;
+        border-color: #7a9cff;
+        color: #fff;
+      }
+      .hotkey-run:disabled {
+        opacity: 0.5;
+        cursor: default;
+      }
+      .hotkey-reset {
+        flex: 0 0 auto;
         background: transparent;
         border: 1px solid #333;
         border-radius: 3px;
@@ -223,9 +333,13 @@
         font-size: 11px;
         flex: 1 1 auto;
       }
+      .hotkey-error.ok {
+        color: #6ac47a;
+      }
     </style>
   </head>
   <body>
+    <span>Time is an Element</span>
     <img src="../assets/Froggy.gif" alt="" class="header-gif" />
     <h1>Root Layer</h1>
     <div id="title" class="title empty">No Root layer</div>
@@ -247,6 +361,21 @@
       <span>Show Froggy on Overlay</span>
     </label>
     <div class="field" style="margin-top: 10px">
+      <label for="opt-skip-word" class="field-label">Skip Word</label>
+      <input
+        id="opt-skip-word"
+        type="text"
+        class="text-input"
+        placeholder="skip"
+        spellcheck="false"
+        autocomplete="off"
+      />
+      <span class="field-hint"
+        >Layers whose name contains this are never restyled. Empty disables
+        it.</span
+      >
+    </div>
+    <div class="field" style="margin-top: 10px">
       <label for="opt-working-domain" class="field-label">Working Domain</label>
       <input
         id="opt-working-domain"
@@ -256,6 +385,28 @@
         spellcheck="false"
         autocomplete="off"
       />
+      <span class="field-hint"
+        >Origin used to build the Edit links below, e.g.
+        https://example.kinsta.cloud</span
+      >
+    </div>
+    <div class="templates-header">
+      <h1>Site Templates</h1>
+      <button id="refresh-templates" class="clear" type="button">
+        Refresh
+      </button>
+    </div>
+    <input
+      id="template-search"
+      type="search"
+      class="text-input templates-search"
+      placeholder="Search templates…"
+      spellcheck="false"
+      autocomplete="off"
+    />
+    <div id="template-status" class="templates-status"></div>
+    <div id="templates" class="templates">
+      <div class="empty">Not loaded</div>
     </div>
     <div class="logs-header">
       <h1>Logs</h1>
@@ -279,6 +430,7 @@
       </div>
     </div>
     <script src="../hotkey-defaults.js"></script>
+    <script src="../template-format.js"></script>
     <script src="panel.js"></script>
   </body>
 </html>
