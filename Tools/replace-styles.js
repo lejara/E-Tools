@@ -188,25 +188,37 @@
       }
     }
 
+    // One bridge call per chunk instead of two per source node. This loop was
+    // already grouped the right way — copy once, paste to every target that
+    // shares the source — so it only needed the round trips taken out from
+    // under it. Chunked so a big deep replace still yields to the page between
+    // batches; see STYLE_CHUNK in template-sync.js for why not one call.
+    const pairs = [...srcToTargets].map(([sourceId, targetIds]) => ({
+      sourceId,
+      targetIds,
+    }));
+    const CHUNK = 40;
     let done = 0;
-    for (const [srcId, targetIds] of srcToTargets) {
-      const copyRes = await ns.callBridge?.("copy", { id: srcId });
-      if (!copyRes || !copyRes.ok) {
+    for (let i = 0; i < pairs.length; i += CHUNK) {
+      const chunk = pairs.slice(i, i + CHUNK);
+      const res = await ns.callBridge?.(
+        "apply-style-pairs",
+        { pairs: chunk },
+        { timeout: 5000 + chunk.length * 400, waitLimit: 3 },
+      );
+      if (!res || !res.ok) {
         ns.log?.(
           "warn",
-          `Replace styles: copy failed for ${srcId}: ${copyRes?.error || "no bridge"}`,
+          `Replace styles: styling ${chunk.length} source node(s) failed: ${
+            res?.error || "no bridge"
+          }`,
         );
         continue;
       }
-      const pasteRes = await ns.callBridge?.("paste-style", { ids: targetIds });
-      if (!pasteRes || !pasteRes.ok) {
-        ns.log?.(
-          "warn",
-          `Replace styles: paste-style failed for src ${srcId}: ${pasteRes?.error || "unknown"}`,
-        );
-        continue;
+      done += res.done || 0;
+      for (const f of res.failures || []) {
+        ns.log?.("warn", `Replace styles: ${f}`);
       }
-      done += targetIds.length;
     }
 
     ns.log?.(

@@ -88,21 +88,94 @@
       ? structuredClone(value)
       : JSON.parse(JSON.stringify(value));
 
-  const getTemplateData = async (source, templateId, withPageSettings) => {
+  // The cache holds the in-flight *promise*, not the resolved value, so a
+  // prefetch and the insert that follows it share one request instead of racing
+  // into two. A rejection is evicted — otherwise one failed fetch would poison
+  // that template for the lifetime of the page.
+  const getTemplateData = (source, templateId, withPageSettings) => {
     if (!window.elementor?.templates?.requestTemplateContent) {
       throw new Error("elementor.templates.requestTemplateContent is unavailable");
     }
     const cacheKey = `${source}:${templateId}:${withPageSettings ? 1 : 0}`;
     let cached = templateContentCache.get(cacheKey);
     if (!cached) {
-      cached = await window.elementor.templates.requestTemplateContent(
-        source,
-        templateId,
-        { data: { with_page_settings: withPageSettings } },
+      // requestTemplateContent hands back a jQuery-style thenable; normalise it
+      // so .catch and Promise.all are safe to use on it.
+      cached = Promise.resolve(
+        window.elementor.templates.requestTemplateContent(source, templateId, {
+          data: { with_page_settings: withPageSettings },
+        }),
       );
+      cached.catch(() => templateContentCache.delete(cacheKey));
       templateContentCache.set(cacheKey, cached);
     }
     return cached;
+  };
+
+  // A template's JSON carries the ids of the elements it was saved from, and
+  // importing that JSON raw re-uses them. When the template was saved from a
+  // container that is still on the page, the import produces a second element
+  // with the SAME id — and every lookup afterwards (styling it, deleting the
+  // staging copy) can resolve to the wrong one. That is how a style sync deleted
+  // the page's own container instead of its temporary copy, and why undo could
+  // not put it back: the history entries pointed at the duplicated id too.
+  // Elementor's library modal regenerates ids on its way in; calling
+  // document/elements/import directly skips that, so do it here.
+  // Every id the document currently holds, from one walk. freshId used to ask
+  // elementor.getContainer per candidate — a recursive document lookup, asked
+  // once per element in the template, so a large template on a large page paid
+  // it hundreds of times. One walk answers all of them.
+  //
+  // An empty set is the safe degradation: it is what the old code effectively
+  // used when getContainer threw, and getUniqueID's ids are random anyway.
+  const liveIds = () => {
+    const ids = new Set();
+    let root = null;
+    try {
+      root = window.elementor?.getPreviewContainer?.() || null;
+    } catch (_) {
+      return ids;
+    }
+    if (!root) return ids;
+    const walk = (container) => {
+      for (const c of childContainers(container)) {
+        if (c?.id) ids.add(c.id);
+        walk(c);
+      }
+    };
+    walk(root);
+    return ids;
+  };
+
+  // taken is both the page's ids and the ids handed out so far in this import,
+  // so two elements of one template cannot collide with each other either —
+  // which the per-candidate getContainer check could not see.
+  const freshId = (taken) => {
+    const helpers = window.elementor?.helpers;
+    for (let i = 0; i < 50; i++) {
+      const id =
+        typeof helpers?.getUniqueID === "function"
+          ? helpers.getUniqueID()
+          : Math.random().toString(16).slice(2, 9);
+      if (!taken.has(id)) {
+        taken.add(id);
+        return id;
+      }
+    }
+    throw new Error("could not generate a free element id");
+  };
+
+  const regenerateIds = (node, taken) => {
+    if (Array.isArray(node)) {
+      node.forEach((n) => regenerateIds(n, taken));
+      return node;
+    }
+    if (!node || typeof node !== "object") return node;
+    if (node.id !== undefined) node.id = freshId(taken);
+    if (Array.isArray(node.elements)) {
+      node.elements.forEach((n) => regenerateIds(n, taken));
+    }
+    return node;
   };
 
   // Top-level elements as they exist in the template JSON, before any import.
@@ -162,6 +235,50 @@
       });
       return {};
     },
+    // The whole copy → paste-style loop for a batch of pairs, page-side. Driven
+    // a pair at a time from the content script this cost two postMessage round
+    // trips per node, and a sync over a large page is thousands of nodes — the
+    // messaging, not the Elementor commands, dominated the run. Same commands in
+    // the same order with the same clipboard semantics; only the hops are gone.
+    //
+    // targetIds is a list because one template root routinely styles several page
+    // containers: paste-style takes every one of them in a single command, so a
+    // source node is copied once instead of once per target. That grouping is
+    // what replace-styles.js has always done in its deep mode.
+    //
+    // A failing pair is recorded and the batch carries on, exactly as the
+    // per-pair loop did — one unstylable node must not abandon the rest of the
+    // block. Nothing here is retryable by the caller: see REPLAYABLE_OPS.
+    "apply-style-pairs": async ({ pairs }) => {
+      const list = Array.isArray(pairs) ? pairs : [];
+      let done = 0;
+      const failures = [];
+      for (const pair of list) {
+        const targetIds =
+          Array.isArray(pair?.targetIds) && pair.targetIds.length
+            ? pair.targetIds
+            : pair?.targetId
+              ? [pair.targetId]
+              : [];
+        if (!pair?.sourceId || !targetIds.length) continue;
+        try {
+          await runCommand("document/elements/copy", {
+            containers: [getContainer(pair.sourceId)],
+          });
+          await runCommand("document/elements/paste-style", {
+            containers: targetIds.map(getContainer),
+          });
+          done += targetIds.length;
+        } catch (err) {
+          failures.push(
+            `${pair.sourceId} → ${targetIds.join(", ")}: ${String(
+              err?.message || err,
+            )}`,
+          );
+        }
+      }
+      return { done, failures };
+    },
     paste: async ({ targetId, at }) => {
       const result = await runCommand("document/elements/paste", {
         containers: [getContainer(targetId)],
@@ -211,6 +328,86 @@
       });
       return {};
     },
+    // Set the navigator label (settings._title) through Elementor's own settings
+    // command, so the rename lands in the undo log and the navigator re-renders
+    // itself. batch-rename.js drives the navigator DOM instead, which requires
+    // the navigator to be open; this does not.
+    // Two shapes: { ids, title } names a batch the same thing in one command;
+    // { items: [{ id, title }] } names each element separately, for callers
+    // whose names are derived per element. Name formatting stays in the content
+    // script (template-format.js) — the page world cannot read that global, and
+    // duplicating the tag regex here is how the two would drift.
+    rename: async ({ ids, title, items }) => {
+      const list = Array.isArray(items)
+        ? items
+        : (ids || []).map((id) => ({ id, title }));
+
+      // Group equal names so the common case is still one command, and drop
+      // no-op renames outright — re-running a sync over an already-tagged page
+      // should not touch the document at all.
+      const byTitle = new Map();
+      const unchanged = [];
+      for (const it of list) {
+        const name = String(it.title ?? "").trim();
+        const container = getContainer(it.id);
+        if (containerTitle(container) === name) {
+          unchanged.push(it.id);
+          continue;
+        }
+        if (!byTitle.has(name)) byTitle.set(name, []);
+        byTitle.get(name).push(container);
+      }
+      for (const [name, containers] of byTitle) {
+        // NEVER pass options.external here. It marks the change as coming from
+        // outside the panel, which makes Elementor re-render the element — and
+        // re-rendering a live, populated container in the preview is what made a
+        // styled container vanish from the page. _title carries no selectors, so
+        // the model change on its own is all the navigator needs to relabel.
+        await runCommand("document/elements/settings", {
+          containers,
+          settings: { _title: name },
+          options: { render: false },
+        });
+      }
+      return {
+        renamed: [...byTitle.values()].flat().map((c) => c.id),
+        unchanged,
+      };
+    },
+    // Warm templateContentCache for a whole batch, several requests in flight at
+    // once. This is the only part of a batch insert that can genuinely overlap:
+    // the imports that follow share one clipboard and one document, so they stay
+    // serial, but their network waits do not have to.
+    //
+    // Every failure is reported rather than thrown — a template that could not be
+    // preloaded is simply fetched again by its own insert, so the batch carries on.
+    "prefetch-templates": async ({ items, concurrency = 3 }) => {
+      const list = Array.isArray(items) ? items : [];
+      const loaded = [];
+      const failed = [];
+      let next = 0;
+      const worker = async () => {
+        while (next < list.length) {
+          const it = list[next++];
+          try {
+            await getTemplateData(
+              it.source || "local",
+              it.templateId,
+              !!it.withPageSettings,
+            );
+            loaded.push(String(it.templateId));
+          } catch (err) {
+            failed.push({
+              templateId: String(it.templateId),
+              error: String(err?.message || err),
+            });
+          }
+        }
+      };
+      const lanes = Math.max(1, Math.min(Number(concurrency) || 1, list.length));
+      await Promise.all(Array.from({ length: lanes }, worker));
+      return { loaded, failed };
+    },
     // Placement is optional and defaults to the end of the page, which is what
     // this op has always done. intoId appends inside that container; afterId
     // drops the template in directly after that element. The parent for the
@@ -254,9 +451,11 @@
         type,
       });
       const cached = await getTemplateData(source, templateId, withPageSettings);
-      // import remaps ids and can mutate what it is handed — never pass the
-      // cached copy itself.
+      // import can mutate what it is handed — never pass the cached copy itself.
       const data = clone(cached);
+      // Every element gets a fresh id before it goes in, so an inserted copy can
+      // never collide with something already on the page. See regenerateIds.
+      regenerateIds(templateRoots(data), liveIds());
       const jsonRootCount = templateRoots(cached).length;
       const result = await runCommand("document/elements/import", {
         container,

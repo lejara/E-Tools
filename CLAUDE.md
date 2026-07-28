@@ -53,6 +53,8 @@ The rule:
 
 Build a third tool on this rather than copying it — it was three files' worth of duplication before it was extracted.
 
+**The row log follows the tail with `scrollTop`, never `scrollIntoView`.** `scrollIntoView` scrolls every ancestor, so it forces a layout of the whole editor page on every row — thousands of times in a long run — and it yanks the view back down the moment the user scrolls up to read a warning. Instead a `scroll` listener tracks whether the user is pinned to the bottom (so the common path reads no layout at all) and a `requestAnimationFrame` guard collapses a burst of rows into one scroll per frame. `template-insert.js` repeats the pattern in its own progress shell.
+
 `choose()` takes two shapes:
 
 - `choose(items, labelOf, buttonText)` → `items[] | null` — a plain checklist (`template-decouple.js`).
@@ -62,9 +64,44 @@ Tick state is tracked as the set of *unticked* items keyed on identity, so an it
 
 ## Page bridge
 
-`callBridge(op, payload, { timeout })` — default timeout is 3s. Ops that hit the network (`insert-template`, `list-templates`) pass 15s: a timeout there is worse than slow, because the insert still lands and orphans a copy in the document.
+`callBridge(op, payload, { timeout, waitLimit, onWait })` — default timeout is 3s. Ops that hit the network (`insert-template`, `list-templates`, `prefetch-templates`) pass 15s or more.
 
-Ops: `ping` · `copy` · `paste-style` · `paste` · `delete` · `insert-template` · `list-templates` · `describe-tree` · `describe-selection` · `list-containers` · `list-template-widgets` · `history-start` / `history-end`.
+Ops: `ping` · `copy` · `paste-style` · `apply-style-pairs` · `paste` · `delete` · `rename` · `insert-template` · `prefetch-templates` · `list-templates` · `describe-tree` · `describe-selection` · `list-containers` · `list-template-widgets` · `history-start` / `history-end`.
+
+### Style batches run page-side
+
+**`apply-style-pairs` is where a style sync spends its time, and it must stay page-side.** Driven a pair at a time from the content script, each node cost two `postMessage` round trips — and a sync over a large page is thousands of pairs, so the messaging dominated the run rather than the Elementor commands. The op takes `[{ sourceId, targetIds }]` and does the whole copy → paste-style loop in one message.
+
+- **`targetIds` is a list because `paste-style` takes every container in one command.** One template root routinely styles several page containers, so a source node is copied once rather than once per target. `replace-styles.js` deep mode has always grouped this way; that is where the shape comes from.
+- **Chunked, not one call.** `STYLE_CHUNK` (40) in `template-sync.js` bounds it: the page world cannot yield mid-op, so a thousand pairs in one message freezes the tab with no progress and no way to tell whether it is still working. A chunk is the unit of "still alive", and the timeout scales with it (`5000 + n * 400`).
+- **A failing pair is recorded and the batch carries on**, which is what the per-pair loop did. One unstylable node must not abandon the rest of the block.
+- Callers pass `waitLimit: 3`. It is a mutation so it is never re-sent, and unlike an insert a called-off wait leaves no orphan behind.
+
+### A timeout is not an answer
+
+**An expired deadline re-arms; it does not abandon the request.** The bridge is still working in the page world, and for anything network-backed the work lands *after* the deadline passes — an `insert-template` that "timed out" has still inserted the template. Dropping the pending entry there is exactly what leaves an orphaned copy in the document with nobody expecting it. So the request stays pending and a late response still resolves the original caller; only after `waitLimit` re-arms (10 by default) does `callBridge` give up, and the error then says how long it actually waited.
+
+- **Read-only ops are re-sent on each re-arm; document mutations are only waited on.** `REPLAYABLE_OPS` is the list — reads, plus `copy`, which writes the clipboard and nothing else. Re-sending a `paste`, `delete` or `import` would do the work twice, and re-sending a `delete` would turn a success into "No container for id". A resend reuses the same `requestId`, so whichever response arrives first wins and the rest are ignored by the `pending.has` guard.
+- **`onWait` is how a tool says "still waiting"** instead of freezing its modal on a stale phase. The three template tools pass one; `template-insert` writes to its status line because its progress shell has no `note()`.
+- **An op that already degrades to a no-op gets `waitLimit: 1`.** Re-arming buys nothing when failure is survivable, and it costs real time. `history-start` / `history-end` and `describe-selection` all pass 1 for that reason, and on `history-end` it matters most: it runs in a `finally` *after* `finish()` has told the user the run is over, so a re-arming wait would hold the undo group open long enough for the user's next edit to join this run's undo step — with the hotkey still locked. The rule of thumb is that `waitLimit` should be high where a lost answer orphans something (`insert-template`) and 1 where it merely costs a feature.
+
+### Batch inserts preload their content, 3 at a time
+
+`prefetch-templates` warms the page-side content cache for a whole batch with several requests in flight (`ns.prefetchTemplates(templates)`, `PREFETCH_CONCURRENCY = 3`). `template-sync`, `template-insert` and `template-decouple` all run it once the selection is known and before `history-start` — nothing there changes the document.
+
+**Only the network wait is parallelised.** The inserts themselves stay strictly serial: `document/elements/copy` writes a single clipboard, and paste indices are measured against a document every insert changes, so overlapping the *edits* would interleave them. The fetch is the slow part anyway.
+
+Preload failure is non-fatal by design — that template's own insert fetches it again and reports in the usual place — which is why `prefetchTemplates` passes `waitLimit: 1`. That value is load-bearing: its *span* is already the longest in the codebase (a ten-template batch asks for 60s), so re-arming would make a pure optimization the slowest thing in the run.
+
+`templateContentCache` holds the **in-flight promise**, not the resolved value, so a prefetch and the insert that follows it share one request instead of racing into two. A rejection is evicted from the cache; otherwise one failed fetch would poison that template for the lifetime of the page.
+
+`rename` sets `settings._title` through `document/elements/settings`, so it is undoable and the navigator relabels itself — it works with the navigator closed, unlike `batch-rename.js`, which types into the navigator DOM. Two shapes: `{ ids, title }` for one name across a batch, `{ items: [{ id, title }] }` when the name is derived per element. Equal names are grouped into one command, and a name that already matches is skipped entirely (reported as `unchanged`) so a re-run touches nothing. Name *formatting* stays in `template-format.js` — the page world cannot read that global, and a second copy of the tag regex here is exactly how the two would drift.
+
+**Never pass `options: { external: true }` on that settings command.** External marks the change as coming from outside the panel, which makes Elementor re-render the element — and re-rendering a live, populated container in the preview made a styled container disappear from the page. `_title` has no selectors attached, so the model change alone is what relabels the navigator; `render: false` says so explicitly.
+
+**`insert-template` regenerates every element id before importing** (`regenerateIds`), and this is not optional. A template's JSON carries the ids of the elements it was saved from; importing it raw re-uses them, so a template saved from a container that is *still on the page* produces a second element with the same id. Every lookup afterwards can then resolve to the wrong one — which is how a style sync deleted the page's own container instead of its staging copy, with undo unable to restore it because the history entries pointed at the duplicated id too. Elementor's library modal regenerates ids on its way in; calling `document/elements/import` directly skips that. `freshId` checks each candidate against a `liveIds()` snapshot — one walk of the document, taken per import — and adds every id it hands out to that set, so two elements of the *same* template cannot collide either. It used to ask `elementor.getContainer` per candidate, which is a recursive document lookup asked once per element in the template; an empty snapshot (no preview container) degrades exactly as the old thrown-lookup path did.
+
+`template-sync` keeps a second net for this: `tally.pageIds` snapshots the page before any insert, and a template whose inserted ids collide with it is abandoned **before** the `try`, so nothing is styled and nothing is deleted. An orphaned copy is a nuisance; deleting the original is not recoverable.
 
 `insert-template` takes optional placement: `intoId` appends inside that container, `afterId` lands the template directly after that element, neither means the end of the page. `import` can only append, so the `afterId` case imports into the anchor's parent and then moves the block into position (copy → paste at index → delete, the same shuffle as `replace-container`). The parent there is taken off the anchor object rather than through a second `getContainer` call — a top-level element's parent is the document container, which `getContainer` cannot resolve.
 
@@ -74,15 +111,30 @@ Ops: `ping` · `copy` · `paste-style` · `paste` · `delete` · `insert-templat
 
 `history-start`/`history-end` wrap a burst of `$e.run` calls in one undo step via `document/history/start-log`. Both degrade to no-ops (`logId: null`) rather than failing the caller.
 
+## Template tag
+
+Every layer these tools create carries the template's id as a suffix on its layer name — `TW Hero #4821` — and, when the template has more than one root, **which root it is**: `TW Hero #4821.2`. Written by `template-insert`, `template-sync` (both ops) and `template-decouple`; read by `template-sync` as its **first** matching pass. Helpers live in `template-format.js`: `templateTagKey` · `withTemplateTag` · `parseTemplateTag` · `stripTemplateTag`.
+
+- **Why the layer name.** It is the only per-layer field readable on every Elementor version, and it stays visible in the navigator — the link is never invisible state the user can't see or fix.
+- **Id first, name second.** The tag is exact; a name is hand-typed and drifts. A renamed layer still resolves to the template it came from, and name matching only has to answer for layers that were never tagged (hand-built containers).
+- **The root index is what makes multi-root templates work.** It is 1-based, matching how the tools label roots, and it is a *position* — re-saving a template with its roots reordered re-points the tags. That is inherent to identifying a root by where it sits; there is nothing else stable to key on.
+- **One place builds tag strings** (`templateTagKey`) and the same key is what the page-node index is keyed on, so a writer and a reader cannot disagree about the shape.
+- **Name matching strips the tag** before comparing (`stripTemplateTag`). Without that, tagging a layer would break the very name match that found it — `TW Hero #4821.2` still matches a root named `TW Hero`.
+- **`withTemplateTag` rewrites its own tag and appends anything else.** Same key ⇒ unchanged, so naming twice is idempotent. A tag for the *same template* is replaced in place (`#4821.1` → `#4821.3` when a root moves). Any other trailing `#n` is treated as part of a hand-typed name and kept: `Card #2` + 4821 → `Card #2 #4821`.
+- **A bare `#id` on a multi-root template is reported, not guessed.** It predates the template having several roots, so nothing says which root it holds — and guessing would style, or destroy, the wrong block. The modal lists the offending layers and says to add `.1`…`.N` or re-insert. A *single*-root template accepts `#id` and `#id.1` interchangeably, so a template that has since lost roots still finds its blocks.
+- Only roots are tagged, so tree pairing is unaffected at the root. A tagged layer nested *inside* a synced block (tagged by an earlier run) misses `pairTrees`' `type + name` pass and aligns on the type-only pass instead — degraded, not broken, which is what that second pass exists for.
+
 ## Template sync
 
 `Tools/template-sync.js` — one click, no layer selection required. Lists site templates, reads the document's top-level containers, and for each container whose name matches a template title: inserts the template, pairs the two trees, copies styles node-by-node, then deletes the inserted copy in a `finally`.
 
 - **Top-container names** come from the model (`settings._title`), not the navigator DOM — the navigator does not need to be open. A container that was never renamed reports `""` and simply never matches.
-- **Name matching** is trimmed, whitespace-collapsed, case-insensitive. A title that resolves to two or more templates is dropped as ambiguous rather than guessed.
+- **Matching is two-pass: tag, then name.** A page node carrying `#<templateId>` resolves to that template exactly (`byId`, which cannot collide); only an untagged node falls through to the name. Both passes run at the queue level (which templates get fetched — the id part alone) and at the target level (which containers a root acts on — the full key, root index included).
+- **Name matching** is trimmed, whitespace-collapsed, case-insensitive, and ignores any id tag. A title that resolves to two or more templates is dropped as ambiguous rather than guessed.
+- **Every touched target is renamed** to `<template title> #<tag>` afterwards, through the shared `nameTargets`. For a replace that is the only thing keeping the link: the paste brings the template's own root name with it, so without this the container's identity — tag included — would be gone and the next run could not find it. The name is **always** the library title, never the root's or the container's own name; roots of a kit therefore share a name, and the root index in the tag is what distinguishes them. Matching still consults the root's name (below), so hand-built untagged containers keep working.
 - **Tree pairing** (`ns.pairTrees`) aligns rather than marching in lockstep — see below.
-- **Multi-root templates are normal, and each root is its own template.** Elementor saves whatever was selected, so a template's JSON often holds several top-level elements. Every root is handled independently, keyed on *that root's* layer name — so one saved template can act as a kit of named blocks. A root with no name falls back to the template's own title, which keeps ordinary single-root templates working unchanged. Do not reintroduce a single-root requirement.
-- **Two-level matching.** A template enters the queue when its *title* matches some top container; the *root names* inside it then decide what each root actually styles. A root can therefore target a container other than the one that pulled its template in. A template whose title matches nothing is never fetched — that keeps the run to one insert per matched template instead of fetching the whole library.
+- **Multi-root templates are normal, and each root is its own template.** Elementor saves whatever was selected, so a template's JSON often holds several top-level elements. Every root is handled independently — by its `#id.N` tag first, then by *that root's* layer name — so one saved template can act as a kit of blocks, named or not. A root with no name falls back to the template's own title, which keeps ordinary single-root templates working unchanged. Do not reintroduce a single-root requirement, and do not warn about kits: `tally.multiRoot` is reported as information, and does not colour the run's outcome.
+- **Two-level matching.** A template enters the queue when a page node carries its id or its *title* matches one; the *tags and root names* inside it then decide what each root actually styles. A root can therefore target a container other than the one that pulled its template in. A template nothing points at is never fetched — that keeps the run to one insert per matched template instead of fetching the whole library.
 - The whole run is one undo step, and `copy` clobbers Elementor's clipboard (same as the other tools).
 
 ### Nested matching
@@ -92,7 +144,7 @@ Ops: `ping` · `copy` · `paste-style` · `paste` · `delete` · `insert-templat
 - Nested candidates must match the template root's **name and type**. Top-level matching stays name-only on purpose: the candidate set there is tiny, and a type clash is more useful surfaced as a pairing failure than silently dropped.
 - The toggle changes which *templates* qualify, not just which targets — a template whose title matches only a nested node is invisible when the toggle is off. That is why `choose` rebuilds its list from `buildQueue(toggleState)`.
 - Nested targets are processed **outermost first** (sorted by `depth`).
-- **Replace + nested needs the ancestor guard.** Replacing a container deletes its descendants, so any later target inside it has a stale id and the bridge would throw. `tally.replaced` plus `isDescendantOf` skips those with a warning. Styles mode needs no guard — nothing is deleted, so ids stay valid.
+- **Replace + nested needs the ancestor guard.** Replacing a container deletes its descendants, so any later target inside it has a stale id and the bridge would throw. `tally.replaced` plus `firstAncestorIn` (which walks the target's own ancestors and asks the set, rather than testing descendancy once per already-replaced container) skips those with a warning. Styles mode needs no guard — nothing is deleted, so ids stay valid.
 - Known gap: if an *inner* target is replaced before an outer one from a different template, the inner work is silently discarded. Depth sorting prevents this within a single root's target list, not across templates.
 
 ### Two operations, one pipeline
@@ -104,6 +156,10 @@ Ops: `ping` · `copy` · `paste-style` · `paste` · `delete` · `insert-templat
 
 Add an operation by extending `OPS`, not by forking the pipeline.
 
+`op.run` returns **the ids to name** — the target itself for styles, the newly pasted roots for replace — or `null` when it failed or skipped. That is what keeps naming in the shared pipeline instead of inside each operation; a new operation only has to say which elements now represent the block.
+
+`tally.skippedReplaced` guards a target that is *already* replaced as well as one inside a replaced ancestor. Two templates can legitimately land on one container — by id tag from one and by name from another — and the second replace would otherwise hand the bridge a deleted id.
+
 `replace-container` does copy → paste-at-index → delete-target page-side in one op, so the parent lookup and index can't drift between round trips. The staging copy survives each replace, so one template can replace several targets before being cleaned up. It takes `sourceIds` (an array) as well as the original single `sourceId`, so a multi-root template drops all of its roots into the one slot, in order.
 
 ## Template decouple
@@ -114,6 +170,7 @@ Add an operation by extending `OPS`, not by forking the pipeline.
 
 - **Placement** reuses `replace-container` rather than importing at a chosen index. The index is resolved page-side from the widget's own id at the moment of the swap, so earlier swaps shifting its siblings cannot misplace it. Two Template widgets sitting side by side in one container is the normal case, not an edge case.
 - **Grouped by template, not by widget.** Several widgets routinely point at one template — three cards holding the same button, say. The template is inserted once as a staging copy, pasted into each target, and deleted in a `finally`. One network fetch per distinct template, not per widget.
+- **The decoupled content is named and tagged** `<template title> #<tag>`. Decoupling is what destroys `settings.template_id`, so the tag is the only remaining trace of where the content came from — and it is what lets `template-sync` still find and re-style the block. The name is the library title; the widget's own layer name only stands in when the library fetch failed and there is no title to use. A multi-root template lands several siblings in the widget's place, so each takes its root index and they stay individually addressable.
 - **Skip word** applies to the widget's own layer name, so a single widget can be held back without unticking it every run.
 - **Nested Template widgets are left alone, by design.** Decoupled content can itself contain Template widgets; the run re-scans afterwards, reports anything carrying an id it hadn't seen before, and stops. A second keypress is safer than a recursive walk that a self-referencing template would send round forever.
 
@@ -126,6 +183,12 @@ Checklist labels are `"<template>" — inside "<parent>"`, which collides readil
 Each row shows the title, then author and last-modified date beneath it, with the template type on the right. Elementor's field names for those vary by version, so `list-templates` tries several candidates (`human_modified_date` → `human_date` → `modified` → `date`) and prefers the server's own preformatted string, which is already in the site's locale and timezone. It also returns `fields` — the raw key list from the first template — so a missing column can be diagnosed without guessing.
 
 Search is multi-term over title, type *and* author — every whitespace-separated term must appear somewhere, in any order, so `hero prim` finds "TW Hero Primary". `Select shown` ticks everything currently matching; a ticked template hidden by a later search still counts toward the total and the status line says how many are hidden, so the count never looks wrong.
+
+### Inserted roots are named and tagged
+
+Every root an insert creates is renamed to `<name> #<templateId>` (`rename` op, inside the same undo step). An imported root otherwise reads as a generic "Container" in the navigator, and the tag is what makes the block findable — and re-syncable — later.
+
+The name is **always the template's title from the library**, whatever the root was called inside the template. Each root of a multi-root template therefore gets the same name, and its tag carries the position (`#4821.1`, `#4821.2`) — the tag is the identity, not the name. A failed rename is non-fatal — the insert already landed, so it degrades to `rename failed` on the row rather than failing the batch.
 
 ### Insert at the selection
 

@@ -15,11 +15,19 @@
     error: "#e07070",
   };
 
-  const { metaLine, searchTerms, matchesTerms } =
+  const { metaLine, searchTerms, matchesTerms, withTemplateTag } =
     window.__ElementorTemplateFormat;
 
   const typeOf = (s) =>
     `${s.elType || "?"}${s.widgetType ? `:${s.widgetType}` : ""}`;
+
+  // The bridge keeps waiting past a timeout rather than abandoning the request —
+  // an insert that outran its deadline has still landed. Report the wait so the
+  // modal doesn't sit on a stale phase looking stuck.
+  const waitStatus = (shell) => (info) =>
+    shell.setStatus(
+      `Still waiting on ${info.op} — ${Math.round(info.waited / 1000)}s so far, not giving up…`,
+    );
 
   const nameOf = (s) => (s.title ? `"${s.title}"` : "(untitled)");
 
@@ -49,7 +57,12 @@
   };
 
   const readPlacement = async () => {
-    const res = await ns.callBridge("describe-selection");
+    // waitLimit 1. This read gates the picker (it shares a Promise.all with the
+    // library fetch), and a failed read is already non-fatal — the option simply
+    // isn't offered. Letting it re-arm would hold the picker shut for ten spans
+    // while the notice still read "Fetching site templates…", which is the exact
+    // stale-phase symptom the wait plumbing exists to prevent.
+    const res = await ns.callBridge("describe-selection", {}, { waitLimit: 1 });
     if (!res?.ok) {
       ns.log("warn", `Template insert: no selection read — ${res?.error}`);
       return null;
@@ -62,6 +75,43 @@
       )}) via ${res.selected.via}`,
     );
     return placementFor(res.selected, res.count);
+  };
+
+  // A freshly imported root lands in the navigator as a generic "Container",
+  // which is unreadable in a long page — and template-sync finds page blocks by
+  // name, so the template's title is exactly the name that keeps the block
+  // findable afterwards. The template id is appended as a tag, which is the
+  // exact link that survives the name being edited later.
+  //
+  // The name is always the template's title from the library, whatever the root
+  // happened to be called inside the template. With several roots the tag also
+  // carries the root's position (#id.1, #id.2), which is what tells them apart —
+  // identical names are fine because the tag, not the name, is the identity.
+  const nameRoots = async (ids, template) => {
+    const list = ids || [];
+    const multi = list.length > 1;
+    const items = list
+      .map((id, i) => ({
+        id,
+        title: withTemplateTag(
+          template.title,
+          template.templateId,
+          multi ? i + 1 : null,
+        ),
+      }))
+      .filter((it) => it.title);
+    if (!items.length) return "";
+
+    const res = await ns.callBridge("rename", { items });
+    if (!res?.ok) {
+      ns.log("warn", `Template insert: naming roots failed — ${res?.error}`);
+      return " · rename failed";
+    }
+    const names = [...new Set(items.map((it) => it.title))]
+      .map((n) => `"${n}"`)
+      .join(", ");
+    ns.log("info", `Template insert: named ${items.length} root(s) ${names}`);
+    return ` · named ${names}`;
   };
 
   const makeBtn = (text, primary) => {
@@ -427,6 +477,26 @@
     card.append(title, status, list, btnRow);
     document.body.appendChild(wrap);
 
+    // Same tail-following as the shared modal: scrollIntoView scrolls every
+    // ancestor and forces a layout of the whole editor, and it fights the user
+    // the moment they scroll up. One row per ticked template is a smaller burst
+    // than a sync's, but there is no reason for it to behave differently.
+    const PIN_SLACK = 24;
+    let pinned = true;
+    let tailQueued = false;
+    list.addEventListener("scroll", () => {
+      pinned =
+        list.scrollHeight - list.scrollTop - list.clientHeight <= PIN_SLACK;
+    });
+    const followTail = () => {
+      if (!pinned || tailQueued) return;
+      tailQueued = true;
+      requestAnimationFrame(() => {
+        tailQueued = false;
+        list.scrollTop = list.scrollHeight;
+      });
+    };
+
     const rows = new Map();
     return {
       setStatus: (t) => (status.textContent = t),
@@ -442,7 +512,7 @@
         row.append(n, d);
         list.appendChild(row);
         rows.set(id, d);
-        row.scrollIntoView({ block: "nearest" });
+        followTail();
       },
       setRow(id, state, text) {
         const d = rows.get(id);
@@ -477,7 +547,7 @@
       // cannot change while the modal is open. A failed read is non-fatal — the
       // option simply isn't offered.
       const [res, placement] = await Promise.all([
-        ns.listSiteTemplates(),
+        ns.listSiteTemplates({ onWait: waitStatus(notice) }),
         readPlacement(),
       ]);
       if (!res?.ok) {
@@ -509,9 +579,31 @@
         modal.addRow(i, `${i + 1}. ${picked[i].title}`);
       }
 
-      const historyRes = await ns.callBridge("history-start", {
-        title: "Insert site templates",
-      });
+      // Fetch every ticked template's content first, a few requests at a time, so
+      // the serial insert loop below is only paying for the edits. Failures are
+      // non-fatal: that template's own insert fetches it again.
+      if (picked.length > 1) {
+        modal.setStatus(
+          `Loading ${picked.length} template(s), ${ns.PREFETCH_CONCURRENCY} at a time…`,
+        );
+        const pre = await ns.prefetchTemplates(picked, {
+          onWait: waitStatus(modal),
+        });
+        for (const f of pre.failed || []) {
+          const i = picked.findIndex((t) => String(t.templateId) === f.templateId);
+          if (i >= 0) modal.setRow(i, "warn", "preload failed — will retry");
+        }
+      }
+
+      // waitLimit 1: both history ops degrade to a no-op already, and history-end
+      // runs in a finally after the summary is on screen — a re-arming wait there
+      // holds the undo group open long enough for a user edit to join this run's
+      // undo step, with the hotkey locked meanwhile.
+      const historyRes = await ns.callBridge(
+        "history-start",
+        { title: "Insert site templates" },
+        { waitLimit: 1 },
+      );
       const logId = historyRes?.ok ? historyRes.logId : null;
 
       // For the after-a-sibling case the anchor advances to whatever was just
@@ -532,6 +624,7 @@
             source: t.source,
             title: t.title,
             type: t.type,
+            onWait: waitStatus(modal),
             ...args,
           });
           if (!ins?.ok) {
@@ -541,14 +634,15 @@
           }
           done++;
           const ids = ins.ids || [];
-          modal.setRow(i, "ok", `inserted ${ids.length} element(s)`);
+          const named = await nameRoots(ids, t);
+          modal.setRow(i, "ok", `inserted ${ids.length} element(s)${named}`);
           if (args.afterId && ids.length) {
             args = { afterId: ids[ids.length - 1] };
           }
         }
       } finally {
         if (logId !== null && logId !== undefined) {
-          await ns.callBridge("history-end", { logId });
+          await ns.callBridge("history-end", { logId }, { waitLimit: 1 });
         }
       }
 

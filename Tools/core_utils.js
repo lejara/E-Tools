@@ -71,6 +71,42 @@
   const BRIDGE_URL = browser.runtime.getURL("Tools/page-bridge.js");
   const BRIDGE_TIMEOUT = 3000;
 
+  // A timeout is not an answer. The bridge is still doing the work in the page
+  // world, and for anything network-backed the work lands *after* the deadline
+  // passes — an insert-template that "timed out" has still inserted the
+  // template. Abandoning the request there is exactly what leaves an orphaned
+  // copy in the document with nobody waiting for it. So an expired deadline
+  // only re-arms: the request stays pending, and a late response still resolves
+  // the original caller.
+  //
+  // Ops that only read are re-sent on each re-arm too, in case the message
+  // itself was dropped. Anything that mutates the document is waited on and
+  // never re-sent — re-sending a paste, a delete or an import would do the work
+  // twice, and re-sending a delete turns a success into "No container for id".
+  //
+  // `copy` is the one writer in this list, and it is safe only because the
+  // style loop is serial. A re-arm fires strictly *before* the response that
+  // unblocks the caller's paste-style, and same-window postMessage is FIFO, so a
+  // duplicate copy can never land between some other pair's copy and its paste.
+  // If a caller ever runs style pairs concurrently that stops holding, and a
+  // resent copy would silently paste the wrong element's styles — which is why
+  // batching went into the page world (`apply-style-pairs`) rather than into
+  // concurrent callBridge calls out here.
+  const REPLAYABLE_OPS = new Set([
+    "ping",
+    "copy",
+    "describe-tree",
+    "describe-selection",
+    "inspect-template",
+    "list-containers",
+    "list-template-widgets",
+    "list-templates",
+    "prefetch-templates",
+  ]);
+
+  // How many times the deadline re-arms before the wait is finally called off.
+  const WAIT_LIMIT = 10;
+
   let bridgeInjected = false;
   let bridgeReady = false;
   let bridgeReadyResolvers = [];
@@ -111,29 +147,62 @@
       setTimeout(resolve, BRIDGE_TIMEOUT);
     });
 
-  const callBridge = async (op, payload, { timeout } = {}) => {
+  // onWait is called on every re-arm, so a tool can say "still waiting" in its
+  // own modal rather than looking dead for the whole grace period.
+  const callBridge = async (
+    op,
+    payload,
+    { timeout, waitLimit, onWait } = {},
+  ) => {
     injectBridge();
     await waitForBridge();
     if (!bridgeReady) {
       return { ok: false, error: "Bridge failed to load" };
     }
     const requestId = ++nextRequestId;
-    return new Promise((resolve) => {
-      const timer = setTimeout(() => {
-        pending.delete(requestId);
-        resolve({ ok: false, error: `Timeout on op: ${op}` });
-      }, timeout || BRIDGE_TIMEOUT);
-      pending.set(requestId, { resolve, timer });
+    const span = timeout || BRIDGE_TIMEOUT;
+    const limit = waitLimit ?? WAIT_LIMIT;
+    const replay = REPLAYABLE_OPS.has(op);
+    const send = () =>
       window.postMessage(
         { __ns: NS, requestId, op, payload: payload || {} },
         "*",
       );
+
+    return new Promise((resolve) => {
+      let waits = 0;
+      const expire = () => {
+        const entry = pending.get(requestId);
+        if (!entry) return; // answered while this timer was firing
+        waits++;
+        const waited = span * waits;
+        const seconds = Math.round(waited / 1000);
+        if (waits >= limit) {
+          pending.delete(requestId);
+          resolve({ ok: false, error: `Timeout on op: ${op} after ${seconds}s` });
+          return;
+        }
+        entry.timer = setTimeout(expire, span);
+        log(
+          "warn",
+          `Bridge slow: ${op} — ${seconds}s and still waiting` +
+            (replay ? ", resending" : ""),
+        );
+        try {
+          onWait?.({ op, waits, waited, replaying: replay });
+        } catch (_) {}
+        if (replay) send();
+      };
+
+      pending.set(requestId, { resolve, timer: setTimeout(expire, span) });
+      send();
     });
   };
 
   // The first insert of a given template fetches its content over the network,
   // which routinely outlives the 3s default. A timeout here is worse than slow:
-  // the insert still lands, leaving an orphaned copy in the document.
+  // the insert still lands, leaving an orphaned copy in the document — which is
+  // why the deadline re-arms rather than abandoning the request. See callBridge.
   const TEMPLATE_TIMEOUT = 15000;
 
   // intoId / afterId are optional placement: append inside that container, or
@@ -147,6 +216,7 @@
       withPageSettings = false,
       intoId,
       afterId,
+      onWait,
     } = {},
   ) => {
     if (!templateId) {
@@ -156,7 +226,7 @@
     const result = await callBridge(
       "insert-template",
       { templateId, source, title, type, withPageSettings, intoId, afterId },
-      { timeout: TEMPLATE_TIMEOUT },
+      { timeout: TEMPLATE_TIMEOUT, onWait },
     );
     log(
       result.ok ? "info" : "warn",
@@ -167,17 +237,74 @@
     return result;
   };
 
-  const listSiteTemplates = async ({ source = "local" } = {}) => {
+  const listSiteTemplates = async ({ source = "local", onWait } = {}) => {
     const result = await callBridge(
       "list-templates",
       { source },
-      { timeout: TEMPLATE_TIMEOUT },
+      { timeout: TEMPLATE_TIMEOUT, onWait },
     );
     log(
       result.ok ? "info" : "warn",
       result.ok
         ? `Fetched ${result.templates?.length ?? 0} templates (source=${source})`
         : `Failed to fetch templates: ${result.error}`,
+    );
+    return result;
+  };
+
+  // Fetching a template's content is the slow part of a batch — the import that
+  // follows it is fast once the content is cached page-side. So warm the cache
+  // for the whole batch up front, with several requests in flight at once: a run
+  // over ten templates then pays four round trips instead of ten.
+  //
+  // The inserts themselves stay strictly serial. document/elements/copy writes a
+  // single clipboard and paste indices are measured against a document that each
+  // insert changes, so overlapping the *edits* would interleave them. Only the
+  // network wait is parallelised.
+  const PREFETCH_CONCURRENCY = 3;
+
+  // Non-fatal by design: a template that fails to preload is simply fetched
+  // again by its own insert, which reports the failure in the usual place.
+  const prefetchTemplates = async (
+    templates,
+    { concurrency = PREFETCH_CONCURRENCY, onWait } = {},
+  ) => {
+    const items = (templates || [])
+      .filter((t) => t && t.templateId)
+      .map((t) => ({
+        templateId: t.templateId,
+        source: t.source || "local",
+        // Mirrors insertSiteTemplate's default. Library templates carry no such
+        // field, so in practice this is always false and matches the key the
+        // insert will look up. A caller that ever inserts with page settings has
+        // to pass it here too, or the warm lands on a key nobody reads.
+        withPageSettings: !!t.withPageSettings,
+      }));
+    if (!items.length) return { ok: true, loaded: [], failed: [] };
+
+    // Roughly one round trip per batch of `concurrency`, so the budget has to
+    // scale with the batch rather than sitting at a single fetch's timeout.
+    const result = await callBridge(
+      "prefetch-templates",
+      { items, concurrency },
+      {
+        timeout: TEMPLATE_TIMEOUT * Math.ceil(items.length / concurrency),
+        onWait,
+        // waitLimit 1, and it has to be 1: the span above is already the longest
+        // budget in the codebase (a ten-template batch asks for 60s), so
+        // re-arming would make a *pure optimization* the slowest thing in the
+        // run — three re-arms is three minutes before the first insert lands.
+        // Giving up on a cache warm costs nothing but speed, because every
+        // insert fetches whatever is still missing.
+        waitLimit: 1,
+      },
+    );
+    log(
+      result.ok ? "info" : "warn",
+      result.ok
+        ? `Preloaded ${result.loaded?.length ?? 0}/${items.length} template(s), ` +
+            `${result.failed?.length ?? 0} failed`
+        : `Failed to preload templates: ${result.error}`,
     );
     return result;
   };
@@ -482,6 +609,32 @@
 
     document.body.appendChild(wrap);
 
+    // Follow the tail of the log, but only while the user is already at the
+    // bottom — scrolling up to read a warning should not be yanked back down.
+    //
+    // Every row used to call scrollIntoView, which walks and scrolls *every*
+    // ancestor and so forces a layout of the whole editor page. A long run does
+    // that thousands of times, and it was a real share of the run. Writing
+    // scrollTop touches this element only, and the rAF guard collapses a burst
+    // of rows into one scroll per frame. `pinned` is recomputed on real scroll
+    // events rather than measured per row, so the common path reads no layout
+    // at all.
+    const PIN_SLACK = 24;
+    let pinned = true;
+    let tailQueued = false;
+    list.addEventListener("scroll", () => {
+      pinned =
+        list.scrollHeight - list.scrollTop - list.clientHeight <= PIN_SLACK;
+    });
+    const followTail = () => {
+      if (!pinned || tailQueued) return;
+      tailQueued = true;
+      requestAnimationFrame(() => {
+        tailQueued = false;
+        list.scrollTop = list.scrollHeight;
+      });
+    };
+
     const rows = new Map();
     let onEscape = null;
     const keyHandler = (e) => {
@@ -510,14 +663,14 @@
         list.appendChild(row);
         list.style.display = "block";
         rows.set(rowId, detail);
-        row.scrollIntoView({ block: "nearest" });
+        followTail();
       },
       setRow(rowId, state, text) {
         const detail = rows.get(rowId);
         if (!detail) return;
         detail.style.color = STATE_COLORS[state] || STATE_COLORS.pending;
         detail.textContent = ` — ${text}`;
-        detail.parentElement?.scrollIntoView({ block: "nearest" });
+        followTail();
       },
       note(text, state = "pending") {
         const row = document.createElement("div");
@@ -527,7 +680,7 @@
         };`;
         list.appendChild(row);
         list.style.display = "block";
-        row.scrollIntoView({ block: "nearest" });
+        followTail();
       },
       // Checklist confirm. Everything starts ticked, so the default is the
       // whole match set and unticking is the deliberate act.
@@ -740,6 +893,8 @@
   ns.callBridge = callBridge;
   ns.insertSiteTemplate = insertSiteTemplate;
   ns.listSiteTemplates = listSiteTemplates;
+  ns.prefetchTemplates = prefetchTemplates;
+  ns.PREFETCH_CONCURRENCY = PREFETCH_CONCURRENCY;
   ns.normalizeName = normalizeName;
   ns.pairTrees = pairTrees;
   ns.summarizeTree = summarizeTree;

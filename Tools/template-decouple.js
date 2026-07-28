@@ -7,6 +7,17 @@
 
   let running = false;
 
+  const { withTemplateTag } = window.__ElementorTemplateFormat;
+
+  // A slow op is not a dead one — the bridge keeps waiting past its deadline
+  // (an insert that outran it has still inserted), so record the wait instead
+  // of leaving the modal on a stale phase.
+  const waitNote = (modal) => (info) =>
+    modal.note(
+      `· still waiting on ${info.op} — ${Math.round(info.waited / 1000)}s so far, not giving up`,
+      "warn",
+    );
+
   // Unlike template-sync, nothing here matches on names: the Template widget
   // stores the template's id in settings.template_id, so the link is exact.
   // Titles are only ever used for labels.
@@ -74,7 +85,9 @@
         `Found ${widgets.length} template widget(s). Fetching template titles…`,
       );
       const titleById = new Map();
-      const templatesRes = await ns.listSiteTemplates();
+      const templatesRes = await ns.listSiteTemplates({
+        onWait: waitNote(modal),
+      });
       if (templatesRes?.ok) {
         for (const t of templatesRes.templates || []) {
           titleById.set(String(t.templateId), t);
@@ -148,9 +161,40 @@
       // arrived inside decoupled content.
       const knownIds = new Set(widgets.map((w) => w.id));
 
-      const historyRes = await ns.callBridge("history-start", {
-        title: "Decouple templates",
-      });
+      // One fetch per distinct template either way; doing them a few at a time
+      // up front keeps the staging inserts below from each waiting on their own
+      // round trip. Nothing here changes the document, so it sits outside the
+      // history log.
+      if (groups.size > 1) {
+        modal.setStatus(
+          `Loading ${groups.size} template(s), ${ns.PREFETCH_CONCURRENCY} at a time…`,
+        );
+        const pre = await ns.prefetchTemplates(
+          [...groups.keys()].map((id) => ({
+            templateId: id,
+            source: titleById.get(id)?.source,
+          })),
+          { onWait: waitNote(modal) },
+        );
+        for (const f of pre.failed || []) {
+          const meta = titleById.get(f.templateId);
+          modal.note(
+            `· could not preload "${meta?.title || `#${f.templateId}`}" — ${f.error}. ` +
+              `Its insert will try again.`,
+            "warn",
+          );
+        }
+      }
+
+      // waitLimit 1: both history ops degrade to a no-op already, and history-end
+      // runs in a finally after the summary is on screen — a re-arming wait there
+      // holds the undo group open long enough for a user edit to join this run's
+      // undo step, with the hotkey locked meanwhile.
+      const historyRes = await ns.callBridge(
+        "history-start",
+        { title: "Decouple templates" },
+        { waitLimit: 1 },
+      );
       logId = historyRes?.ok ? historyRes.logId : null;
 
       const tally = { done: 0, failed: 0, nodes: 0 };
@@ -166,6 +210,7 @@
           source: meta?.source,
           title: meta?.title,
           type: meta?.type,
+          onWait: waitNote(modal),
         });
         if (!ins?.ok) {
           tally.failed += members.length;
@@ -209,10 +254,45 @@
             }
             tally.done++;
             tally.nodes += nodes;
+
+            // Decoupling is what destroys settings.template_id, so the tag on
+            // the layer name becomes the only remaining trace of where this
+            // content came from — and it is what lets template-sync still find
+            // and re-style the block afterwards. The name is the template's title
+            // from the library; the widget's own layer name only stands in when
+            // the library fetch failed and there is no title to use.
+            // A multi-root template lands several siblings here, so each carries
+            // its root index and they stay individually addressable.
+            const newIds = res.ids || (res.id ? [res.id] : []);
+            const multi = newIds.length > 1;
+            const items = newIds
+              .map((id, k) => ({
+                id,
+                title: withTemplateTag(
+                  meta?.title || w.title,
+                  templateId,
+                  multi ? k + 1 : null,
+                ),
+              }))
+              .filter((it) => it.title);
+            let namedNote = "";
+            if (items.length) {
+              const ren = await ns.callBridge("rename", { items });
+              const names = [...new Set(items.map((it) => it.title))]
+                .map((n) => `"${n}"`)
+                .join(", ");
+              namedNote = ren?.ok ? ` · named ${names}` : " · rename failed";
+              if (!ren?.ok) {
+                ns.log(
+                  "warn",
+                  `Template decouple: naming ${names} — ${ren?.error}`,
+                );
+              }
+            }
             modal.setRow(
               w.id,
               "ok",
-              `decoupled — ${stagedIds.length} root(s), ${nodes} node(s)`,
+              `decoupled — ${stagedIds.length} root(s), ${nodes} node(s)${namedNote}`,
             );
           }
         } finally {
@@ -266,7 +346,7 @@
       modal.finish(`Error — ${err?.message || err}`, "error");
     } finally {
       if (logId !== null && logId !== undefined) {
-        await ns.callBridge("history-end", { logId });
+        await ns.callBridge("history-end", { logId }, { waitLimit: 1 });
       }
       running = false;
     }
