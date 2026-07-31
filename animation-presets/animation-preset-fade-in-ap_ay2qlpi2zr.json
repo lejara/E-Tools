@@ -1,0 +1,336 @@
+{
+  "id": "ap_ay2qlpi2zr",
+  "name": "Fade In",
+  "fields": {
+    "motion_fx_motion_fx_scrolling": {
+      "comment": "Master switch for every scroll effect below. \"yes\" to enable, \"\" to disable.",
+      "value": ""
+    },
+    "motion_fx_translateY_effect": {
+      "comment": "Vertical Scroll. \"yes\" enables, \"\" disables. Needs motion_fx_motion_fx_scrolling = \"yes\".",
+      "value": ""
+    },
+    "motion_fx_translateY_direction": {
+      "comment": "Vertical Scroll direction — \"\" = down, \"negative\" = up.",
+      "value": ""
+    },
+    "motion_fx_translateY_speed": {
+      "comment": "Slider object, NOT a number — {\"size\":4,\"unit\":\"px\",\"sizes\":[]}. px range 0–10 step 0.1. Higher is faster.",
+      "value": {
+        "unit": "px",
+        "size": 4,
+        "sizes": []
+      }
+    },
+    "motion_fx_translateY_affectedRange": {
+      "comment": "Viewport range object — {\"size\":\"\",\"unit\":\"%\",\"sizes\":{\"start\":0,\"end\":100}}. start/end are percentages of the scroll pass over which the effect plays.",
+      "value": {
+        "unit": "%",
+        "size": "",
+        "sizes": {
+          "start": 0,
+          "end": 100
+        }
+      }
+    },
+    "motion_fx_translateX_effect": {
+      "comment": "Horizontal Scroll. \"yes\" enables, \"\" disables. Needs motion_fx_motion_fx_scrolling = \"yes\".",
+      "value": ""
+    },
+    "motion_fx_translateX_direction": {
+      "comment": "Horizontal Scroll direction — \"\" = right, \"negative\" = left.",
+      "value": ""
+    },
+    "motion_fx_translateX_speed": {
+      "comment": "Slider object, NOT a number — {\"size\":4,\"unit\":\"px\",\"sizes\":[]}. px range 0–10 step 0.1. Higher is faster.",
+      "value": {
+        "unit": "px",
+        "size": 4,
+        "sizes": []
+      }
+    },
+    "motion_fx_translateX_affectedRange": {
+      "comment": "Viewport range object — {\"size\":\"\",\"unit\":\"%\",\"sizes\":{\"start\":0,\"end\":100}}. start/end are percentages of the scroll pass over which the effect plays.",
+      "value": {
+        "unit": "%",
+        "size": "",
+        "sizes": {
+          "start": 0,
+          "end": 100
+        }
+      }
+    },
+    "motion_fx_opacity_effect": {
+      "comment": "Transparency. \"yes\" enables, \"\" disables. Needs motion_fx_motion_fx_scrolling = \"yes\".",
+      "value": ""
+    },
+    "motion_fx_opacity_direction": {
+      "comment": "Transparency direction. One of \"out-in\", \"in-out\", \"in-out-in\", \"out-in-out\" — where in the viewport the effect runs.",
+      "value": "out-in"
+    },
+    "motion_fx_opacity_level": {
+      "comment": "Slider object, NOT a number — {\"size\":7,\"unit\":\"px\",\"sizes\":[]}. px range 1–10 step 0.1. 10 fades fully, 1 barely at all.",
+      "value": {
+        "unit": "px",
+        "size": 10,
+        "sizes": []
+      }
+    },
+    "motion_fx_opacity_range": {
+      "comment": "Viewport range object — {\"size\":\"\",\"unit\":\"%\",\"sizes\":{\"start\":0,\"end\":100}}. start/end are percentages of the scroll pass over which the effect plays.",
+      "value": {
+        "unit": "%",
+        "size": "",
+        "sizes": {
+          "start": 20,
+          "end": 80
+        }
+      }
+    },
+    "motion_fx_blur_effect": {
+      "comment": "Blur. \"yes\" enables, \"\" disables. Needs motion_fx_motion_fx_scrolling = \"yes\".",
+      "value": ""
+    },
+    "motion_fx_blur_direction": {
+      "comment": "Blur direction. One of \"out-in\", \"in-out\", \"in-out-in\", \"out-in-out\" — where in the viewport the effect runs.",
+      "value": "out-in"
+    },
+    "motion_fx_blur_level": {
+      "comment": "Slider object, NOT a number — {\"size\":7,\"unit\":\"px\",\"sizes\":[]}. px range 1–15 step 1.",
+      "value": {
+        "unit": "px",
+        "size": 7,
+        "sizes": []
+      }
+    },
+    "motion_fx_blur_range": {
+      "comment": "Viewport range object — {\"size\":\"\",\"unit\":\"%\",\"sizes\":{\"start\":0,\"end\":100}}. start/end are percentages of the scroll pass over which the effect plays.",
+      "value": {
+        "unit": "%",
+        "size": "",
+        "sizes": {
+          "start": 20,
+          "end": 80
+        }
+      }
+    },
+    "motion_fx_rotateZ_effect": {
+      "comment": "Rotate. \"yes\" enables, \"\" disables. Needs motion_fx_motion_fx_scrolling = \"yes\".",
+      "value": ""
+    },
+    "motion_fx_rotateZ_direction": {
+      "comment": "Rotate direction. \"\" = default direction, \"negative\" = reversed.",
+      "value": ""
+    },
+    "motion_fx_rotateZ_speed": {
+      "comment": "Slider object, NOT a number — {\"size\":4,\"unit\":\"px\",\"sizes\":[]}. px range 0–10 step 0.1. Higher is faster.",
+      "value": {
+        "unit": "px",
+        "size": 1,
+        "sizes": []
+      }
+    },
+    "motion_fx_rotateZ_affectedRange": {
+      "comment": "Viewport range object — {\"size\":\"\",\"unit\":\"%\",\"sizes\":{\"start\":0,\"end\":100}}. start/end are percentages of the scroll pass over which the effect plays.",
+      "value": {
+        "unit": "%",
+        "size": "",
+        "sizes": {
+          "start": 0,
+          "end": 100
+        }
+      }
+    },
+    "motion_fx_scale_effect": {
+      "comment": "Scale. \"yes\" enables, \"\" disables. Needs motion_fx_motion_fx_scrolling = \"yes\".",
+      "value": ""
+    },
+    "motion_fx_scale_direction": {
+      "comment": "Scale direction. One of \"out-in\", \"in-out\", \"in-out-in\", \"out-in-out\" — where in the viewport the effect runs.",
+      "value": "out-in"
+    },
+    "motion_fx_scale_speed": {
+      "comment": "Slider object, NOT a number — {\"size\":4,\"unit\":\"px\",\"sizes\":[]}. px range -10–10 step 1. Higher is faster. Negative shrinks instead of grows.",
+      "value": {
+        "unit": "px",
+        "size": 4,
+        "sizes": []
+      }
+    },
+    "motion_fx_scale_range": {
+      "comment": "Viewport range object — {\"size\":\"\",\"unit\":\"%\",\"sizes\":{\"start\":0,\"end\":100}}. start/end are percentages of the scroll pass over which the effect plays.",
+      "value": {
+        "unit": "%",
+        "size": "",
+        "sizes": {
+          "start": 20,
+          "end": 80
+        }
+      }
+    },
+    "motion_fx_transform_origin_x": {
+      "comment": "X anchor point for Rotate and Scale — \"left\", \"center\" or \"right\".",
+      "value": "center"
+    },
+    "motion_fx_transform_origin_y": {
+      "comment": "Y anchor point for Rotate and Scale — \"top\", \"center\" or \"bottom\".",
+      "value": "center"
+    },
+    "motion_fx_devices": {
+      "comment": "Which breakpoints run the scroll effects. Array of breakpoints, any of \"desktop\", \"tablet_extra\", \"tablet\", \"mobile_extra\", \"mobile\". An empty array means nowhere.",
+      "value": [
+        "desktop",
+        "tablet_extra",
+        "tablet",
+        "mobile_extra",
+        "mobile"
+      ]
+    },
+    "motion_fx_range": {
+      "comment": "What the effect is measured against — \"\" = default, \"viewport\", or \"page\".",
+      "value": ""
+    },
+    "motion_fx_motion_fx_mouse": {
+      "comment": "Master switch for the two mouse effects below. \"yes\" to enable, \"\" to disable.",
+      "value": ""
+    },
+    "motion_fx_mouseTrack_effect": {
+      "comment": "Mouse Track. \"yes\" enables, \"\" disables. Needs motion_fx_motion_fx_mouse = \"yes\".",
+      "value": ""
+    },
+    "motion_fx_mouseTrack_direction": {
+      "comment": "Mouse Track direction. \"\" = default direction, \"negative\" = reversed.",
+      "value": ""
+    },
+    "motion_fx_mouseTrack_speed": {
+      "comment": "Slider object, NOT a number — {\"size\":4,\"unit\":\"px\",\"sizes\":[]}. px range 0–10 step 0.1. Higher is faster.",
+      "value": {
+        "unit": "px",
+        "size": 1,
+        "sizes": []
+      }
+    },
+    "motion_fx_tilt_effect": {
+      "comment": "3D Tilt. \"yes\" enables, \"\" disables. Needs motion_fx_motion_fx_mouse = \"yes\".",
+      "value": ""
+    },
+    "motion_fx_tilt_direction": {
+      "comment": "3D Tilt direction. \"\" = default direction, \"negative\" = reversed.",
+      "value": ""
+    },
+    "motion_fx_tilt_speed": {
+      "comment": "Slider object, NOT a number — {\"size\":4,\"unit\":\"px\",\"sizes\":[]}. px range 0–10 step 0.1. Higher is faster.",
+      "value": {
+        "unit": "px",
+        "size": 4,
+        "sizes": []
+      }
+    },
+    "sticky": {
+      "comment": "Stick to \"top\" or \"bottom\". \"\" is not sticky.",
+      "value": ""
+    },
+    "sticky_on": {
+      "comment": "Which breakpoints stick. Array of breakpoints, any of \"desktop\", \"tablet_extra\", \"tablet\", \"mobile_extra\", \"mobile\". An empty array means nowhere.",
+      "value": [
+        "desktop",
+        "tablet_extra",
+        "tablet",
+        "mobile_extra",
+        "mobile"
+      ]
+    },
+    "sticky_offset": {
+      "comment": "Distance in px from the edge it sticks to. Number.",
+      "value": 0
+    },
+    "sticky_offset_tablet_extra": {
+      "comment": "Sticky Offset on Tablet Extra. Number, or \"\" to inherit.",
+      "value": ""
+    },
+    "sticky_offset_tablet": {
+      "comment": "Sticky Offset on Tablet. Number, or \"\" to inherit.",
+      "value": ""
+    },
+    "sticky_offset_mobile_extra": {
+      "comment": "Sticky Offset on Mobile Extra. Number, or \"\" to inherit.",
+      "value": ""
+    },
+    "sticky_offset_mobile": {
+      "comment": "Sticky Offset on Mobile. Number, or \"\" to inherit.",
+      "value": ""
+    },
+    "sticky_effects_offset": {
+      "comment": "How far past the sticky point before scroll effects start, in px. Number.",
+      "value": 0
+    },
+    "sticky_effects_offset_tablet_extra": {
+      "comment": "Effects Offset on Tablet Extra. Number, or \"\" to inherit.",
+      "value": ""
+    },
+    "sticky_effects_offset_tablet": {
+      "comment": "Effects Offset on Tablet. Number, or \"\" to inherit.",
+      "value": ""
+    },
+    "sticky_effects_offset_mobile_extra": {
+      "comment": "Effects Offset on Mobile Extra. Number, or \"\" to inherit.",
+      "value": ""
+    },
+    "sticky_effects_offset_mobile": {
+      "comment": "Effects Offset on Mobile. Number, or \"\" to inherit.",
+      "value": ""
+    },
+    "sticky_anchor_link_offset": {
+      "comment": "Extra px an anchor link leaves above this element while sticky. Number.",
+      "value": 0
+    },
+    "sticky_anchor_link_offset_tablet_extra": {
+      "comment": "Anchor Offset on Tablet Extra. Number, or \"\" to inherit.",
+      "value": ""
+    },
+    "sticky_anchor_link_offset_tablet": {
+      "comment": "Anchor Offset on Tablet. Number, or \"\" to inherit.",
+      "value": ""
+    },
+    "sticky_anchor_link_offset_mobile_extra": {
+      "comment": "Anchor Offset on Mobile Extra. Number, or \"\" to inherit.",
+      "value": ""
+    },
+    "sticky_anchor_link_offset_mobile": {
+      "comment": "Anchor Offset on Mobile. Number, or \"\" to inherit.",
+      "value": ""
+    },
+    "sticky_parent": {
+      "comment": "\"yes\" keeps it stuck only while its parent is on screen. \"\" lets it stick for the whole page.",
+      "value": ""
+    },
+    "animation": {
+      "comment": "Entrance animation. \"\" = Default (whatever the theme does), \"none\", or one of: fadeIn fadeInDown fadeInLeft fadeInRight fadeInUp · zoomIn zoomInDown zoomInLeft zoomInRight zoomInUp · bounceIn bounceInDown bounceInLeft bounceInRight bounceInUp · slideInDown slideInLeft slideInRight slideInUp · rotateIn rotateInDownLeft rotateInDownRight rotateInUpLeft rotateInUpRight · bounce flash pulse rubberBand shake headShake swing tada wobble jello · lightSpeedIn · rollIn",
+      "value": "fadeIn"
+    },
+    "animation_tablet_extra": {
+      "comment": "Entrance animation on Tablet Extra. Same values as `animation`.",
+      "value": ""
+    },
+    "animation_tablet": {
+      "comment": "Entrance animation on Tablet. Same values as `animation`.",
+      "value": ""
+    },
+    "animation_mobile_extra": {
+      "comment": "Entrance animation on Mobile Extra. Same values as `animation`.",
+      "value": ""
+    },
+    "animation_mobile": {
+      "comment": "Entrance animation on Mobile. Same values as `animation`.",
+      "value": ""
+    },
+    "animation_duration": {
+      "comment": "\"slow\", \"\" (normal) or \"fast\".",
+      "value": ""
+    },
+    "animation_delay": {
+      "comment": "Delay before the entrance animation, in ms. Number. This is the field Delay Accumulation adds to — with several layers shift-clicked, layer N gets this value plus (accumulation × (N-1)).",
+      "value": ""
+    }
+  }
+}

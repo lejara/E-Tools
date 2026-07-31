@@ -567,11 +567,13 @@ const presetFields = window.__AnimationPresetFields;
 
 let presets = [];
 let presetStatusTimer = 0;
-// Which preset's delete button is armed. Deleting is two clicks rather than a
+// The one row action waiting on a second click, as `{ id, kind }`. A destructive
+// button asks before it acts, and it asks in the row rather than through a
 // window.confirm — the panel avoids browser modals for the same reason the
-// in-editor tools do.
-let armedDeleteId = null;
-let armedDeleteTimer = 0;
+// in-editor tools do. One at a time on purpose: two rows both offering "Sure?"
+// is a misclick waiting to happen.
+let armed = null;
+let armedTimer = 0;
 // Which preset's name is being edited. Renaming is an inline input rather than a
 // window.prompt, for the same reason nothing here uses window.alert.
 let renamingId = null;
@@ -661,17 +663,91 @@ const applyPreset = async (preset, btn) => {
   }
 };
 
-const disarmDelete = () => {
-  clearTimeout(armedDeleteTimer);
-  armedDeleteId = null;
+const disarm = () => {
+  clearTimeout(armedTimer);
+  armed = null;
+};
+
+const isArmed = (id, kind) => armed?.id === id && armed?.kind === kind;
+
+// Arming cancels an open rename: the two are alternative things to be doing to
+// one row, and leaving a rename input focused under a "Sure?" button reads as if
+// the confirm applied to the name.
+const arm = (id, kind) => {
+  clearTimeout(armedTimer);
+  renamingId = null;
+  armed = { id, kind };
+  armedTimer = setTimeout(() => {
+    disarm();
+    renderPresets();
+  }, 4000);
+  renderPresets();
 };
 
 const deletePreset = async (preset) => {
   presets = presets.filter((p) => p.id !== preset.id);
-  disarmDelete();
+  disarm();
   await savePresets();
   renderPresets();
   showPresetStatus(`Deleted "${preset.name}" — export first if you want it back`);
+};
+
+// New and Replace both capture off the selection, so the request and its
+// no-tab case live in one place.
+const capturePreset = async () => {
+  const { reply } = await askElementorTab({
+    __elementorTools: true,
+    type: "capture-preset",
+  });
+  return (
+    reply || {
+      ok: false,
+      error: "No Elementor editor tab open — open one, then try again.",
+    }
+  );
+};
+
+// Re-capture into an existing preset. The values are replaced wholesale; the id
+// and the name are not — the id is what Import matches on, and the name is the
+// user's rather than the layer's.
+const replacePreset = async (preset) => {
+  disarm();
+  renderPresets();
+  showPresetStatus("Reading the selected layer…");
+  try {
+    const reply = await capturePreset();
+    if (!reply.ok) {
+      showPresetStatus(reply.error, "error");
+      return;
+    }
+    const at = presets.findIndex((p) => p.id === preset.id);
+    if (at < 0) {
+      showPresetStatus("That preset is no longer in the list", "error");
+      return;
+    }
+    const captured = presetFields.presetFromValues(reply.values, presets[at].name);
+    presets[at] = { ...captured, id: preset.id, name: presets[at].name };
+    await savePresets();
+    renderPresets();
+    const from = reply.layer?.title
+      ? `"${reply.layer.title}"`
+      : reply.layer?.id || "the selection";
+    showPresetStatus(
+      [
+        `Replaced the values in "${presets[at].name}" from ${from} (${reply.via})`,
+        reply.missing?.length
+          ? `${reply.missing.length} field(s) absent on that layer, defaulted`
+          : "",
+      ]
+        .filter(Boolean)
+        .join(" · "),
+    );
+  } catch (err) {
+    showPresetStatus(
+      `Could not replace "${preset.name}" — ${err?.message || err}`,
+      "error",
+    );
+  }
 };
 
 // The input stays open until it is committed or cancelled explicitly — clicking
@@ -727,6 +803,17 @@ const presetButton = (label, className, title, onClick) => {
   return btn;
 };
 
+// A row action that overwrites something: first click arms it, second runs it.
+const confirmButton = (preset, kind, label, title, run) => {
+  const hot = isArmed(preset.id, kind);
+  return presetButton(
+    hot ? "Sure?" : label,
+    hot ? "edit danger" : "edit",
+    hot ? "Click again to confirm" : title,
+    () => (hot ? run() : arm(preset.id, kind)),
+  );
+};
+
 const renderPresets = () => {
   if (!presets.length) {
     presetsEl.replaceChildren(
@@ -759,7 +846,6 @@ const renderPresets = () => {
 
     const actions = document.createElement("div");
     actions.className = "row-actions";
-    const armed = armedDeleteId === preset.id;
     actions.append(
       presetButton(
         editing ? "✓" : "✎",
@@ -770,32 +856,23 @@ const renderPresets = () => {
             commitRename(preset, name.value);
             return;
           }
-          disarmDelete();
+          disarm();
           renamingId = preset.id;
           renderPresets();
         },
       ),
+      confirmButton(
+        preset,
+        "replace",
+        "⟳",
+        "Replace this preset's values with the selected layer's",
+        () => replacePreset(preset),
+      ),
       presetButton("Export", "edit", "Save this preset as a JSON file", () =>
         exportPreset(preset),
       ),
-      presetButton(
-        armed ? "Sure?" : "✕",
-        armed ? "edit danger" : "edit",
-        armed ? "Click again to delete" : "Delete this preset",
-        () => {
-          if (armed) {
-            deletePreset(preset);
-            return;
-          }
-          renamingId = null;
-          clearTimeout(armedDeleteTimer);
-          armedDeleteId = preset.id;
-          armedDeleteTimer = setTimeout(() => {
-            disarmDelete();
-            renderPresets();
-          }, 4000);
-          renderPresets();
-        },
+      confirmButton(preset, "delete", "✕", "Delete this preset", () =>
+        deletePreset(preset),
       ),
     );
 
@@ -818,17 +895,7 @@ presetNewBtn.addEventListener("click", async () => {
   showPresetStatus("Reading the selected layer…");
   presetNewBtn.disabled = true;
   try {
-    const { reply } = await askElementorTab({
-      __elementorTools: true,
-      type: "capture-preset",
-    });
-    if (!reply) {
-      showPresetStatus(
-        "No Elementor editor tab open — open one, then try again.",
-        "error",
-      );
-      return;
-    }
+    const reply = await capturePreset();
     if (!reply.ok) {
       showPresetStatus(reply.error, "error");
       return;
@@ -1165,7 +1232,7 @@ browser.storage.onChanged.addListener((changes, area) => {
     presets = Array.isArray(changes.animationPresets.newValue)
       ? changes.animationPresets.newValue
       : [];
-    disarmDelete();
+    disarm();
     // The list this input was bound to is gone, so the edit has nowhere to land.
     renamingId = null;
     renderPresets();
