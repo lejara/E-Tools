@@ -868,6 +868,12 @@
         humanDate: t.human_date || null,
         humanModified:
           t.human_modified_date || t.humanModifiedDate || t.modified_date || null,
+        // The library hands back the template's own public permalink
+        // ("/?elementor_library=<slug>"). It is the panel's View link, and it
+        // beats deriving one from the title — a slug is not a slugified title
+        // once WordPress has deduplicated it.
+        url: t.url || null,
+        status: t.status || null,
       }));
       return { templates, fields: list.length ? Object.keys(list[0]) : [] };
     },
