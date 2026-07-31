@@ -5,8 +5,10 @@
 
   const SELECTED_CLASS = "ElementorTools-selected";
   const NAV_ELEMENT = ".elementor-navigator__element[data-id]";
+  const NAV_ITEM = ".elementor-navigator__item";
   const NAV_SCOPE =
     "#elementor-navigator, .elementor-navigator, .elementor-navigator__elements";
+  const ORDER_ATTR = "data-et-order";
 
   const style = document.createElement("style");
   style.textContent = `
@@ -14,6 +16,31 @@
       background: rgba(56, 128, 255, 0.35) !important;
       outline: 1px solid rgba(56, 128, 255, 0.75);
       outline-offset: -1px;
+    }
+    /* The selection-order badge, for tools that care which layer came first —
+       template-sync does not, animation presets' Delay Accumulation does.
+       It is a pseudo-element reading a data attribute rather than an injected
+       node, and that is load-bearing: the retint below is driven by a childList
+       MutationObserver, so a real element would be observed and re-inserted on
+       every pass. Attribute writes are not observed.
+       The navigator row is already position:relative with overflow:hidden and
+       its ::after is unused, so this claims space Elementor is not using. */
+    .${SELECTED_CLASS} > .elementor-navigator__item[${ORDER_ATTR}]::after {
+      content: attr(${ORDER_ATTR});
+      position: absolute;
+      left: 3px;
+      bottom: 1px;
+      z-index: 1;
+      min-width: 11px;
+      padding: 0 2px;
+      border-radius: 2px;
+      background: rgba(56, 128, 255, 0.95);
+      color: #fff;
+      font:
+        600 9px/12px ui-monospace,
+        monospace;
+      text-align: center;
+      pointer-events: none;
     }
   `;
   (document.head || document.documentElement).appendChild(style);
@@ -30,14 +57,29 @@
     }
   };
 
+  // Rank comes straight out of the Set — JS iterates insertion order, so this is
+  // shift-click order, which is the order getIds() hands to a tool. Deselecting
+  // renumbers whatever is left, and re-selecting a row puts it at the end rather
+  // than back where it was.
   const applyTint = () => {
+    const order = new Map(
+      [...selectedIds].map((id, i) => [id, String(i + 1)]),
+    );
     const rows = document.querySelectorAll(NAV_ELEMENT);
     for (const el of rows) {
       const id = el.getAttribute("data-id");
-      const shouldHave = selectedIds.has(id);
+      const rank = order.get(id);
+      const shouldHave = rank !== undefined;
       const hasIt = el.classList.contains(SELECTED_CLASS);
       if (shouldHave && !hasIt) el.classList.add(SELECTED_CLASS);
       else if (!shouldHave && hasIt) el.classList.remove(SELECTED_CLASS);
+
+      const item = el.querySelector(`:scope > ${NAV_ITEM}`);
+      if (!item) continue;
+      if (rank === undefined) item.removeAttribute(ORDER_ATTR);
+      else if (item.getAttribute(ORDER_ATTR) !== rank) {
+        item.setAttribute(ORDER_ATTR, rank);
+      }
     }
   };
 

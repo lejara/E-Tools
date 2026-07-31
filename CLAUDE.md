@@ -11,6 +11,7 @@ Browser extension (MV3, Firefox) that adds hotkey-driven tools to Elementor's Wo
 ├── hotkeys.js           # global keybindings (dispatches to tools)
 ├── hotkey-defaults.js   # dual-context: ACTIONS table + binding formatting
 ├── template-format.js   # dual-context: template/post metadata, search, list normalization, Edit & View URL building
+├── animation-preset-fields.js # dual-context: the Motion Effects field table, preset file build/parse/validate
 ├── UI/                  # window opened from the toolbar icon
 │   ├── panel.html
 │   └── panel.js         # reads browser.storage.local, re-renders on change; site-content list
@@ -26,13 +27,14 @@ Browser extension (MV3, Firefox) that adds hotkey-driven tools to Elementor's Wo
     ├── template-sync.js      # name-matches top containers to site templates; styles them, or replaces them outright
     ├── template-insert.js    # multi-select picker over the template library, inserts the ticked templates
     ├── template-decouple.js  # swaps Elementor Template widgets for a copy of the template's own content
+    ├── animation-presets.js  # applies a saved Motion Effects preset to the selection, with delay accumulation
     ├── wp-rest.js            # shared wp-admin REST access: wp_rest nonce + authenticated JSON GET
     ├── admin-templates.js    # serves the panel's template list from wp-admin (no editor, no page bridge)
     ├── wp-pages.js           # serves the panel's post list — every post type, with the Elementor flag
     └── overlay.js            # draggable in-page HUD (root layer, logs, Edit-in-Elementor link)
 ```
 
-- Load order: `template-format.js` first (`core_utils.js` reads `normalizeName` off it), then `core_utils.js`, then `multi-select.js`, then other tools, then `hotkeys.js`. `wp-rest.js` must precede `admin-templates.js` and `wp-pages.js` — both read `window.__WpRest` and bail without it.
+- Load order: `template-format.js` first (`core_utils.js` reads `normalizeName` off it), then `core_utils.js`, then `multi-select.js`, then other tools, then `hotkeys.js`. `wp-rest.js` must precede `admin-templates.js` and `wp-pages.js` — both read `window.__WpRest` and bail without it. `animation-preset-fields.js` must precede `Tools/animation-presets.js`, which reads `window.__AnimationPresetFields` and bails without it.
 - Tools share `window.__ElementorTools` inside the editor page; cross-window state uses `browser.storage.local` (`selectedLayer`, `logs`).
 - Hotkeys: `Ctrl+Shift+1` capture root layer · `Ctrl+Shift+2` replace styles · `Ctrl+Shift+3` replace layer · `Ctrl+Shift+4` batch rename · `Ctrl+Shift+5` reselect stored root · `Ctrl+Shift+6` sync template styles · `Ctrl+Shift+7` replace with template · `Ctrl+Shift+8` insert site templates · `Ctrl+Shift+9` decouple templates.
 - Add a tool: drop a file in `Tools/`, append its path to `content_scripts[0].js` in `manifest.json`.
@@ -69,7 +71,9 @@ Tick state is tracked as the set of *unticked* items keyed on identity, so an it
 
 `callBridge(op, payload, { timeout, waitLimit, onWait })` — default timeout is 3s. Ops that hit the network (`insert-template`, `list-templates`, `prefetch-templates`) pass 15s or more.
 
-Ops: `ping` · `copy` · `paste-style` · `apply-style-pairs` · `apply-advanced-settings` · `paste` · `delete` · `rename` · `create-element` · `insert-template` · `prefetch-templates` · `list-templates` · `describe-tree` · `describe-selection` · `list-containers` · `list-template-widgets` · `history-start` / `history-end`.
+Ops: `ping` · `copy` · `paste-style` · `apply-style-pairs` · `apply-advanced-settings` · `apply-preset-settings` · `read-preset-settings` · `paste` · `delete` · `rename` · `create-element` · `insert-template` · `prefetch-templates` · `list-templates` · `describe-tree` · `describe-selection` · `list-containers` · `list-template-widgets` · `history-start` / `history-end`.
+
+`apply-advanced-settings` and `apply-preset-settings` share `resolveControlKey` — **exact match, then strip a leading underscore, then add one.** Widgets prefix *some* advanced controls and containers do not, and it is not a rule you can write down: a widget carries `_animation` and `_animation_delay` but plain `animation_duration`. Measured on this Elementor Pro build, 6 of the Motion Effects section's 61 settings need the added underscore on a widget and the other 55 resolve exactly. A hand-written prefix table would write `animation_delay` onto a widget, where the real key is `_animation_delay`, and the value would land nowhere with nothing raised.
 
 ### `create-element` is the cheap path, and the linked one
 
@@ -254,6 +258,59 @@ root: template is "section" but page is "container"
 
 `ns.summarizeTree(node, depth)` and `ns.countNodes(node)` produce those; both live in `core_utils.js`.
 
+## Animation presets
+
+`Tools/animation-presets.js` overrides an element's **Motion Effects** dropdown — the whole `section_effects` block on the Advanced tab — from a saved preset. The UI is entirely in the panel (`Animation Presets`): `New`, `Import…`, a button per preset carrying its name, and `Export` / delete per row. **There is no hotkey**, because which preset to apply cannot be expressed as a keystroke.
+
+**A preset is authored in Elementor, not in a text editor.** `New` copies the selected layer's Motion Effects into a preset and adds it — style a block with Elementor's own UI, then capture it. That is why there is no blank template to fill in: the controls are conditional, unit-bearing and slider-shaped, and Elementor's panel is simply a better editor for them than JSON is. Export → edit → Import remains for tuning a captured preset by hand.
+
+**Apply means the tab now equals the preset.** All 61 settings are reset to their Elementor defaults and then the preset's own values are written over the top, so a field the preset omits goes back to default rather than keeping what the previous preset left there. That is what makes applying two presets in a row predictable, and it is the whole reason the op resets rather than merges.
+
+- The reset is `document/elements/reset-settings` — a real Elementor command, so it is history-tracked and undoes together with the write as **one** step. 61 default-valued writes would do the same thing; this is one command instead.
+- **It does not make the saved document leaner, and it was never going to.** Elementor's settings model always carries every control (~856 on a container) and strips default-valued keys itself at save time — `toJSON({ remove: ['default'] })` is what gets persisted. Delete-then-write and write-the-defaults produce byte-identical saved JSON. The reason to prefer the reset is that it is one command, not that it saves space.
+
+### The field table is hardcoded; the key it resolves to is not
+
+`animation-preset-fields.js` holds all 61 fields with their type, Elementor default and a hand-written comment, captured from Elementor Pro on 2026-07-31. It is deliberately a snapshot: the point of a preset file is that a human reads and edits it, and a comment generated at runtime cannot be reviewed before it ships. Re-diff it against `container.settings.controls` after an Elementor upgrade — anything new simply goes unmanaged until it is added.
+
+What is *not* hardcoded is the key each field goes by on a given element. Every key in the table is the **container** spelling; `apply-preset-settings` resolves it against the target's own control list, which is what makes one preset work on both containers and widgets. See `resolveControlKey` above for why a prefix table is the wrong shape.
+
+- **The section has 65 controls and 61 settings.** `ai_animation` (a raw_html "Animate With AI" button), `handle_motion_fx_asset_loading` (hidden bookkeeping), `anchor_offset_description` (raw_html help text) and `sticky_divider` are not settings and are absent from the table.
+- **Sliders are objects, not numbers** — `{"size":4,"unit":"px","sizes":[]}`, and the viewport ranges nest `{"start":20,"end":80}`. Every slider comment says so, because writing `4` puts garbage in the model.
+- **Default comparison ignores key order.** Elementor serialises a slider's keys in a different order than this file does, so a plain `JSON.stringify` compare calls an untouched default "changed" and writes it back. `canon()` sorts keys first. Without it a preset that sets nothing sends a 61-field message.
+- Everything in the section is in scope: Scrolling Effects, Mouse Effects, Sticky *and* Entrance Animation. This is Pro-only territory apart from the entrance animation, and Pro is assumed.
+
+### Preset files
+
+`{ id, name, fields: { <key>: { comment, value } } }`. **`id` decides replace-or-add** — importing a file whose id matches an existing preset overwrites it in place, name included, so the loop is Export → edit → Import.
+
+- **`New` requires a selection and writes no file.** With nothing selected there is nothing to copy, so it reports instead of creating an empty preset there would be no way to fill in. The new preset takes the layer's own name (`Untitled preset` when the layer has none) and is saved straight to `browser.storage.local`.
+- **Capture reads through `read-preset-settings`**, the exact inverse of the write and the reason both directions agree: one `resolveControlKey`, one canonical key list. It answers **every** requested key, defaults included, because a preset describes the whole tab — "this effect is off" is a fact a preset has to be able to state, and an omitted key cannot. A key the element lacks falls back to the Elementor default, so a preset captured from a widget still carries container-only fields and applies to either.
+- **Two captures of one layer are two presets.** Same name, different ids, both listed — `✎` renames them apart.
+- **Rename is an inline input, and it stays open until it is committed or cancelled** (`Enter` / `✓` saves, `Escape` discards). Clicking away deliberately leaves it alone: committing on blur either discards the edit silently or swallows the click that caused the blur, because the commit re-renders the row out from under it. Anything that rewrites the stored list — a capture, an import, a delete — drops the edit, since the preset it was bound to is no longer the one in hand.
+- **Import is tolerant, export is canonical.** A field may be `{comment, value}` or a bare value, so stripping the comments by hand does not break a preset. Comments are re-attached from the current table on export, and an unknown key is *reported* rather than kept — a typo in a key is otherwise indistinguishable from a field that had no effect.
+- A file with no `id` is imported as a new preset with a generated one rather than rejected.
+
+### Delay Accumulation
+
+A panel field, not a preset property — the same preset gets staggered differently run to run. With **more than one** layer shift-clicked, layer *N* gets `base + accumulation × (N − 1)`, where base is the preset's own `animation_delay` (0 if it sets none). One layer gets the preset's delay untouched.
+
+- **Order is shift-click order, and it comes for free.** `selectedIds` in `multi-select.js` is a `Set`, and JS iterates insertion order, so `getIds()` already answers in the order the user clicked. Deselecting renumbers what is left; re-selecting a row puts it at the **end**, which is what "the order it was selected in" means.
+- `animation_delay` is the one non-responsive field in the entrance group (`animation` has five breakpoint variants, the delay has none), so a stagger is one value per layer with nothing to decide per breakpoint.
+- When a stagger is in effect the computed number is written on **every** layer including the first, rather than leaving layer 1 unset — `0` and "no delay" should not look different in the document for no reason.
+
+### Reporting
+
+Shift-click always wins over the navigator selection: it is an explicit act, and its order is the whole input to the stagger. With nothing shift-clicked it falls back to `describe-selection`, which is always a single element. **Capture uses the same resolution but reads only the first** — the layer wearing badge #1 — because picking one of several has to be predictable and visible, and that badge is both.
+
+Capture answers the panel over its own `capture-preset` message rather than `run-action`: the panel needs the values *back*, and `run-action` deliberately replies as soon as a run has started. The listener returns `undefined` for every other message type so the page's other listeners stay free to answer.
+
+Results go to the **log**, not a modal — nothing here touches the network, so the modal rule does not apply, and the panel already re-renders the log live. One line for the run (layer count, field count, the delay sequence), one warning per layer that skipped a field, one line for the outcome. **Every skip is reported**: a field that could not be written is a value the user put in the preset and did not get, which is exactly where silence reads as success.
+
+Targets are sent in batches of `NODE_CHUNK` (20). The page world cannot yield mid-op and each element costs two Elementor commands, so a batch is the unit of "still alive" and the timeout scales with it — the same reasoning as `STYLE_CHUNK` in `template-sync.js`.
+
+**Known limitation: a preset leaves no trace on the element.** Unlike the template tag, nothing records which preset an element carries, so "re-apply preset X everywhere it was used" is not a question this design can answer. Accepted deliberately.
+
 ## Panel: site content list
 
 The panel has one **Site Content** section listing the whole site — Elementor library templates *and* every post type — through a single search box, with three filter buttons and **Edit** / **View** on each row.
@@ -344,7 +401,7 @@ Every row in the panel's Hotkeys list has a **Run** button beside it, so the too
 
 ### Dual-context files
 
-`template-format.js` and `hotkey-defaults.js` are loaded **both** as content scripts and by `panel.html`, each assigning one global. That is the mechanism for anything the panel and the editor must agree on — template metadata rendering, the search predicate, `normalizeTemplateList`, and Edit-URL construction all live in `template-format.js` precisely because `panel.js`, `template-insert.js`, `admin-templates.js` and `overlay.js` would otherwise drift. Neither file may touch `location` or the DOM at load time.
+`template-format.js`, `hotkey-defaults.js` and `animation-preset-fields.js` are loaded **both** as content scripts and by `panel.html`, each assigning one global. `animation-preset-fields.js` is there because the panel authors preset files and the editor applies them: one side writes the comments and validates an import, the other reads the defaults and types, and a second copy of the field table is exactly how the two would drift. That is the mechanism for anything the panel and the editor must agree on — template metadata rendering, the search predicate, `normalizeTemplateList`, and Edit-URL construction all live in `template-format.js` precisely because `panel.js`, `template-insert.js`, `admin-templates.js` and `overlay.js` would otherwise drift. Neither file may touch `location` or the DOM at load time.
 
 **The page world is outside this mechanism.** `page-bridge.js` is injected as a page-world script and cannot read a content-script global, so its `list-templates` op carries its own copy of the field mapping that `normalizeTemplateList` holds — the same boundary that keeps the template-tag regex out of it. Those two are the one sanctioned duplication here; change one, change both. Do not "fix" it by having the bridge reach for the global.
 
@@ -375,9 +432,15 @@ A skipped node yields no style pair **and exempts its whole subtree from structu
 
 `Tools/multi-select.js` is a shared subsystem — future tools should read from it, not reinvent selection. Shift+click on a `.elementor-navigator__element[data-id]` row toggles that layer into a plugin-only set, tinted blue via the `ElementorTools-selected` class. Shift+click within the navigator but not on a row clears the whole set. A `MutationObserver` re-applies the tint by `data-id` whenever Elementor re-renders the navigator (collapse/expand/etc), so selection survives DOM churn.
 
+Each tinted row also shows its **selection order** as a small numbered badge in the row's bottom-left. `animation-presets.js` keys its delay stagger on that order, so the order has to be visible before the run rather than inferred from the result.
+
+- **It is a `::after` reading a `data-et-order` attribute, never an injected node.** The retint is driven by a `childList` MutationObserver, so a real element would be observed and re-inserted on every pass — a runaway. Attribute writes are not observed, which is also why the existing class toggling has never looped.
+- The navigator row is already `position: relative` with `overflow: hidden` and its `::after` is unused, so this claims space Elementor is not using and needs no layout changes of its own. (The row is `display: flex`, so absolute positioning is required regardless — a static pseudo-element would become a flex item.)
+- Badges sit at the row's left edge rather than the indented content's, so they line up in a readable column whatever the nesting depth.
+
 API (on `window.__ElementorTools.multiSelect`):
 
-- `getIds()` → `string[]` of currently selected `data-id`s
+- `getIds()` → `string[]` of currently selected `data-id`s, **in shift-click order** — it is a `Set`, so insertion order is click order. Re-selecting a deselected row moves it to the end.
 - `has(id)` → boolean
 - `clear()` — empty the set + strip tints
 - `onChange(cb)` — cb receives a `Set<string>` snapshot; returns an unsubscribe fn

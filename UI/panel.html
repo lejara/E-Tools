@@ -254,6 +254,43 @@
         opacity: 0.4;
         cursor: default;
       }
+      /* A preset's own name is the button that applies it. */
+      .preset-name {
+        flex: 1 1 auto;
+        min-width: 0;
+        text-align: left;
+        background: #2a2a2a;
+        color: #e6e6e6;
+        border: 1px solid #3a3a3a;
+        border-radius: 3px;
+        padding: 3px 8px;
+        font: inherit;
+        font-size: 11px;
+        cursor: pointer;
+        word-break: break-word;
+      }
+      .preset-name:hover:not(:disabled) {
+        background: #333;
+        border-color: #7a9cff;
+        color: #fff;
+      }
+      .preset-name:disabled {
+        opacity: 0.5;
+        cursor: default;
+      }
+      .preset-rename {
+        flex: 1 1 auto;
+        min-width: 0;
+        padding: 3px 7px;
+      }
+      button.edit.danger {
+        color: #e09090;
+      }
+      button.edit.danger:hover:not(:disabled) {
+        border-color: #7a3a3a;
+        color: #fff;
+        background: #3a2a2a;
+      }
       .logs {
         margin-top: 6px;
         max-height: 180px;
@@ -491,6 +528,45 @@
     <div id="content" class="templates">
       <div class="empty">Not loaded</div>
     </div>
+    <div class="templates-header">
+      <h1>Animation Presets</h1>
+      <button
+        id="preset-new"
+        class="clear"
+        type="button"
+        title="Copy the selected layer's Motion Effects into a new preset"
+      >
+        New
+      </button>
+    </div>
+    <div class="field" style="margin-top: 8px">
+      <label for="preset-delay" class="field-label"
+        >Delay Accumulation (ms)</label
+      >
+      <input
+        id="preset-delay"
+        type="number"
+        min="0"
+        step="10"
+        class="text-input"
+        placeholder="0"
+        autocomplete="off"
+      />
+      <span class="field-hint"> 0 turns it off.</span>
+    </div>
+    <div id="preset-status" class="templates-status"></div>
+    <div id="presets" class="templates">
+      <div class="empty">No presets yet</div>
+    </div>
+    <div class="hotkey-footer">
+      <button id="preset-import" class="clear" type="button">Import…</button>
+      <input
+        id="preset-file"
+        type="file"
+        accept="application/json,.json"
+        hidden
+      />
+    </div>
     <div class="logs-header">
       <h1>Logs</h1>
       <button id="clear-logs" class="clear" type="button" disabled>
@@ -514,6 +590,7 @@
     </div>
     <script src="../hotkey-defaults.js"></script>
     <script src="../template-format.js"></script>
+    <script src="../animation-preset-fields.js"></script>
     <script src="panel.js"></script>
   </body>
 </html>

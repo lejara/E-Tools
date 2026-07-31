@@ -34,6 +34,13 @@
       window.__ElementorTools?.decoupleTemplates?.();
       return true;
     },
+    // Not in ACTIONS — it has no binding, because which preset to apply cannot
+    // be expressed as a keystroke. It lives here anyway so the panel's preset
+    // buttons dispatch through the same table as everything else.
+    applyAnimationPreset: (args) => {
+      window.__ElementorTools?.applyAnimationPreset?.(args || {});
+      return true;
+    },
     reselectRoot: async () => {
       const { selectedLayer } =
         await browser.storage.local.get("selectedLayer");
@@ -63,7 +70,11 @@
       // Tools own their own UI, so the reply only reports that the run
       // started — awaiting the whole operation would hold the panel's
       // sendMessage open for the length of a template sync.
-      Promise.resolve(runner()).catch((err) => {
+      //
+      // msg.args carries whatever the caller needs the action parameterised by
+      // (which animation preset, and its delay accumulation). The keydown path
+      // passes the event instead, which every bound action ignores.
+      Promise.resolve(runner(msg.args)).catch((err) => {
         window.__ElementorTools?.log?.(
           "error",
           `${msg.action} failed — ${err?.message || err}`,

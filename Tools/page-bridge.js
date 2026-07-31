@@ -69,6 +69,20 @@
   // look like an accidental drop.
   const NEVER_TRANSFER = new Set(["_title", "_element_cache"]);
 
+  // Which key a setting name actually goes by on a given element. Widgets prefix
+  // some advanced controls with an underscore and containers do not — _padding
+  // vs padding — and it is not a rule that can be written down: a widget carries
+  // `_animation` and `_animation_delay` but plain `animation_duration`. So the
+  // live schema is asked, in both directions, and callers keep one spelling.
+  //
+  // Exact match first: a key that exists as-is is never reinterpreted.
+  const resolveControlKey = (controls, key) => {
+    if (!key) return null;
+    if (controls[key]) return key;
+    if (key.startsWith("_")) return controls[key.slice(1)] ? key.slice(1) : null;
+    return controls[`_${key}`] ? `_${key}` : null;
+  };
+
   // The Advanced tab, as data. Only controls the user actually moved off their
   // default are returned: a widget carries ~550 advanced controls and all but a
   // handful are untouched, so the diff against `defaults` is what keeps this
@@ -453,11 +467,7 @@
         for (const entry of item.settings || []) {
           const key = entry?.key;
           if (!key) continue;
-          const mapped = controls[key]
-            ? key
-            : key.startsWith("_") && controls[key.slice(1)]
-              ? key.slice(1)
-              : null;
+          const mapped = resolveControlKey(controls, key);
           if (!mapped) {
             dropped.push({ key, why: "no matching control on the target" });
             continue;
@@ -483,6 +493,117 @@
           });
         }
         results.push({ id: item.id, applied, dropped });
+      }
+      return { results };
+    },
+    // Read one element's Motion Effects tab back out, in the canonical
+    // (container) spelling a preset file uses — the exact inverse of
+    // apply-preset-settings, and what lets the panel's New button capture a
+    // preset from an element the user already styled in Elementor's own UI.
+    //
+    // Every requested key is answered, default-valued ones included: a preset
+    // describes the whole tab, so a captured one has to say what the tab was,
+    // not only where it differed. `keys` is the caller's canonical list rather
+    // than a section walk, so the page world never has to know which of
+    // section_effects' controls are settings.
+    "read-preset-settings": async ({ id, keys }) => {
+      const target = getContainer(id);
+      const controls = target.settings?.controls || {};
+      const current = target.settings?.toJSON?.() || {};
+      const defaults = target.settings?.defaults || {};
+      const values = [];
+      const missing = [];
+      for (const key of Array.isArray(keys) ? keys : []) {
+        const mapped = resolveControlKey(controls, key);
+        if (!mapped) {
+          missing.push(key);
+          continue;
+        }
+        values.push({
+          key,
+          value: current[mapped] !== undefined ? current[mapped] : defaults[mapped],
+        });
+      }
+      return {
+        id,
+        title: containerTitle(target),
+        elType: target.model?.get?.("elType") || null,
+        widgetType: target.model?.get?.("widgetType") || null,
+        values,
+        missing,
+      };
+    },
+    // Put a whole tab back to its defaults and then write a preset over it, per
+    // element. animation-presets.js is the caller: "apply this preset" means the
+    // Motion Effects tab now *equals* the preset, so a field the preset omits has
+    // to go back to default rather than keep whatever the last preset left there.
+    //
+    // The reset is document/elements/reset-settings — a real Elementor command,
+    // so it lands in history and undoes with the write as one step. Doing it as
+    // 61 default-valued writes would work too; this is one command instead.
+    //
+    // Reset misses are silent, set misses are reported. A key that resolves to
+    // nothing has nothing to reset, which is not news; a *value* that could not
+    // be written is the caller's warning to raise.
+    "apply-preset-settings": async ({ items }) => {
+      const list = Array.isArray(items) ? items : [];
+      const results = [];
+      for (const item of list) {
+        const target = getContainer(item.id);
+        const controls = target.settings?.controls || {};
+
+        const resetKeys = [];
+        for (const key of item.reset || []) {
+          const mapped = resolveControlKey(controls, key);
+          if (mapped) resetKeys.push(mapped);
+        }
+
+        const settings = {};
+        const applied = [];
+        const skipped = [];
+        for (const entry of item.settings || []) {
+          const mapped = resolveControlKey(controls, entry?.key);
+          if (!mapped) {
+            skipped.push({
+              key: entry?.key,
+              why: "no such control on this element",
+            });
+            continue;
+          }
+          const targetType = controls[mapped]?.type;
+          if (entry.type && targetType && targetType !== entry.type) {
+            skipped.push({
+              key: entry.key,
+              why: `type mismatch (${entry.type} vs ${targetType})`,
+            });
+            continue;
+          }
+          settings[mapped] = entry.value;
+          applied.push(mapped);
+        }
+
+        if (resetKeys.length) {
+          await runCommand("document/elements/reset-settings", {
+            containers: [target],
+            settings: resetKeys,
+          });
+        }
+        // These controls carry selectors, so the model change alone would leave
+        // the preview stale — the default render is wanted. options.external
+        // still stays off, for the reason documented on rename.
+        if (applied.length) {
+          await runCommand("document/elements/settings", {
+            containers: [target],
+            settings,
+          });
+        }
+        results.push({
+          id: item.id,
+          title: containerTitle(target),
+          reset: resetKeys.length,
+          applied,
+          skipped,
+        });
       }
       return { results };
     },

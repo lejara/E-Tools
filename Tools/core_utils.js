@@ -102,6 +102,7 @@
     "list-template-widgets",
     "list-templates",
     "prefetch-templates",
+    "read-preset-settings",
   ]);
 
   // How many times the deadline re-arms before the wait is finally called off.

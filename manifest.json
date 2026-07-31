@@ -43,8 +43,10 @@
       "js": [
         "Tools/preview-override.js",
         "template-format.js",
+        "animation-preset-fields.js",
         "Tools/core_utils.js",
         "Tools/multi-select.js",
+        "Tools/animation-presets.js",
         "Tools/layer-root-finder.js",
         "Tools/replace-styles.js",
         "Tools/replace-layer.js",

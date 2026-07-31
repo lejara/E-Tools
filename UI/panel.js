@@ -17,6 +17,12 @@ const contentSearchEl = document.getElementById("content-search");
 const contentStatusEl = document.getElementById("content-status");
 const contentTabsEl = document.getElementById("content-tabs");
 const refreshContentBtn = document.getElementById("refresh-content");
+const presetsEl = document.getElementById("presets");
+const presetStatusEl = document.getElementById("preset-status");
+const presetNewBtn = document.getElementById("preset-new");
+const presetImportBtn = document.getElementById("preset-import");
+const presetFileEl = document.getElementById("preset-file");
+const presetDelayEl = document.getElementById("preset-delay");
 const hotkeysEl = document.getElementById("hotkeys");
 const resetAllHotkeysBtn = document.getElementById("reset-all-hotkeys");
 const hotkeyErrorEl = document.getElementById("hotkey-error");
@@ -549,6 +555,359 @@ contentTabsEl.addEventListener("click", (e) => {
   if (btn) selectTab(btn.dataset.kind);
 });
 
+// ---- Animation presets ------------------------------------------------------
+// A preset is a JSON file the user edits by hand: "New" writes a template with a
+// fresh id and every Motion Effects field commented, "Import" turns a filled-in
+// file into a preset. The id is what decides replace-or-add, so re-importing an
+// edited export updates the preset in place.
+const PRESETS_KEY = "animationPresets";
+const DELAY_ACCUMULATION_KEY = "animationDelayAccumulation";
+
+const presetFields = window.__AnimationPresetFields;
+
+let presets = [];
+let presetStatusTimer = 0;
+// Which preset's delete button is armed. Deleting is two clicks rather than a
+// window.confirm — the panel avoids browser modals for the same reason the
+// in-editor tools do.
+let armedDeleteId = null;
+let armedDeleteTimer = 0;
+// Which preset's name is being edited. Renaming is an inline input rather than a
+// window.prompt, for the same reason nothing here uses window.alert.
+let renamingId = null;
+
+const showPresetStatus = (text, level = "info") => {
+  presetStatusEl.textContent = text;
+  presetStatusEl.classList.toggle("error", !!text && level === "error");
+  clearTimeout(presetStatusTimer);
+  if (text) {
+    presetStatusTimer = setTimeout(() => {
+      presetStatusEl.textContent = "";
+      presetStatusEl.classList.remove("error");
+    }, 6000);
+  }
+};
+
+const savePresets = () => browser.storage.local.set({ [PRESETS_KEY]: presets });
+
+const delayAccumulation = () => Math.max(0, Number(presetDelayEl.value) || 0);
+
+// An anchor with a blob URL rather than browser.downloads: it needs no extra
+// manifest permission, and the panel is an extension page so the blob is its own
+// origin's.
+const downloadJson = (filename, text) => {
+  const url = URL.createObjectURL(
+    new Blob([text], { type: "application/json" }),
+  );
+  const a = document.createElement("a");
+  a.href = url;
+  a.download = filename;
+  document.body.append(a);
+  a.click();
+  a.remove();
+  setTimeout(() => URL.revokeObjectURL(url), 10000);
+};
+
+const presetSlug = (name) =>
+  String(name || "")
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, "-")
+    .replace(/^-+|-+$/g, "") || "preset";
+
+const exportPreset = (preset) =>
+  downloadJson(
+    `animation-preset-${presetSlug(preset.name)}-${preset.id}.json`,
+    presetFields.stringifyPreset(preset),
+  );
+
+// The run reports that it *started*, same as the hotkey Run buttons: the tool
+// logs its own per-layer results, and the panel re-renders the log live.
+const applyPreset = async (preset, btn) => {
+  showPresetStatus("");
+  btn.disabled = true;
+  try {
+    const { tab, reply } = await askElementorTab({
+      __elementorTools: true,
+      type: "run-action",
+      action: "applyAnimationPreset",
+      args: {
+        presetId: preset.id,
+        delayAccumulation: delayAccumulation(),
+      },
+    });
+    if (!reply) {
+      showPresetStatus(
+        "No Elementor editor tab open — open one, then try again.",
+        "error",
+      );
+    } else if (!reply.ok) {
+      showPresetStatus(
+        `Could not apply "${preset.name}" — ${reply.error}`,
+        "error",
+      );
+    } else {
+      showPresetStatus(`Applying "${preset.name}" — results in Logs`);
+      // The tool logs into the editor page, and the panel is a separate popup
+      // window, so bring that tab forward to see what happened.
+      await focusTab(tab);
+    }
+  } catch (err) {
+    showPresetStatus(
+      `Could not apply "${preset.name}" — ${err?.message || err}`,
+      "error",
+    );
+  } finally {
+    btn.disabled = false;
+  }
+};
+
+const disarmDelete = () => {
+  clearTimeout(armedDeleteTimer);
+  armedDeleteId = null;
+};
+
+const deletePreset = async (preset) => {
+  presets = presets.filter((p) => p.id !== preset.id);
+  disarmDelete();
+  await savePresets();
+  renderPresets();
+  showPresetStatus(`Deleted "${preset.name}" — export first if you want it back`);
+};
+
+// The input stays open until it is committed or cancelled explicitly — clicking
+// away leaves it alone. Committing on blur would either discard the edit
+// silently or swallow the click that caused the blur, because the commit
+// re-renders the row out from under it.
+const commitRename = async (preset, value) => {
+  const next = String(value || "").trim();
+  renamingId = null;
+  const at = presets.findIndex((p) => p.id === preset.id);
+  if (!next || at < 0 || next === presets[at].name) {
+    renderPresets();
+    return;
+  }
+  presets[at] = { ...presets[at], name: next };
+  await savePresets();
+  renderPresets();
+  showPresetStatus(`Renamed to "${next}"`);
+};
+
+const cancelRename = () => {
+  renamingId = null;
+  renderPresets();
+};
+
+const renameInput = (preset) => {
+  const input = document.createElement("input");
+  input.type = "text";
+  input.className = "text-input preset-rename";
+  input.value = preset.name || "";
+  input.spellcheck = false;
+  input.autocomplete = "off";
+  input.title = "Enter to save, Escape to cancel";
+  input.addEventListener("keydown", (e) => {
+    if (e.key === "Enter") {
+      e.preventDefault();
+      commitRename(preset, input.value);
+    } else if (e.key === "Escape") {
+      e.preventDefault();
+      cancelRename();
+    }
+  });
+  return input;
+};
+
+const presetButton = (label, className, title, onClick) => {
+  const btn = document.createElement("button");
+  btn.type = "button";
+  btn.className = className;
+  btn.textContent = label;
+  btn.title = title;
+  btn.addEventListener("click", onClick);
+  return btn;
+};
+
+const renderPresets = () => {
+  if (!presets.length) {
+    presetsEl.replaceChildren(
+      Object.assign(document.createElement("div"), {
+        className: "empty",
+        textContent:
+          "None yet — select a layer in the editor and press New to copy its Motion Effects",
+      }),
+    );
+    return;
+  }
+  let focusEl = null;
+  const rows = presets.map((preset) => {
+    const row = document.createElement("div");
+    row.className = "template";
+
+    const editing = renamingId === preset.id;
+    let name;
+    if (editing) {
+      name = renameInput(preset);
+      focusEl = name;
+    } else {
+      name = presetButton(
+        preset.name || "(unnamed)",
+        "preset-name",
+        `Apply to the shift-clicked layers, or the selected one · id ${preset.id}`,
+        () => applyPreset(preset, name),
+      );
+    }
+
+    const actions = document.createElement("div");
+    actions.className = "row-actions";
+    const armed = armedDeleteId === preset.id;
+    actions.append(
+      presetButton(
+        editing ? "✓" : "✎",
+        "edit",
+        editing ? "Save the name" : "Rename this preset",
+        () => {
+          if (editing) {
+            commitRename(preset, name.value);
+            return;
+          }
+          disarmDelete();
+          renamingId = preset.id;
+          renderPresets();
+        },
+      ),
+      presetButton("Export", "edit", "Save this preset as a JSON file", () =>
+        exportPreset(preset),
+      ),
+      presetButton(
+        armed ? "Sure?" : "✕",
+        armed ? "edit danger" : "edit",
+        armed ? "Click again to delete" : "Delete this preset",
+        () => {
+          if (armed) {
+            deletePreset(preset);
+            return;
+          }
+          renamingId = null;
+          clearTimeout(armedDeleteTimer);
+          armedDeleteId = preset.id;
+          armedDeleteTimer = setTimeout(() => {
+            disarmDelete();
+            renderPresets();
+          }, 4000);
+          renderPresets();
+        },
+      ),
+    );
+
+    row.append(name, actions);
+    return row;
+  });
+  presetsEl.replaceChildren(...rows);
+  // replaceChildren threw the old input away, so focus has to be re-established
+  // on the new one — otherwise clicking Rename puts a caret nowhere.
+  if (focusEl) {
+    focusEl.focus();
+    focusEl.select();
+  }
+};
+
+// New copies the selected layer's Motion Effects into a preset and adds it
+// straight away — no file in the middle. A selection is required, so this
+// reports rather than creating an empty preset there is no way to fill in.
+presetNewBtn.addEventListener("click", async () => {
+  showPresetStatus("Reading the selected layer…");
+  presetNewBtn.disabled = true;
+  try {
+    const { reply } = await askElementorTab({
+      __elementorTools: true,
+      type: "capture-preset",
+    });
+    if (!reply) {
+      showPresetStatus(
+        "No Elementor editor tab open — open one, then try again.",
+        "error",
+      );
+      return;
+    }
+    if (!reply.ok) {
+      showPresetStatus(reply.error, "error");
+      return;
+    }
+    const preset = presetFields.presetFromValues(
+      reply.values,
+      reply.layer?.title,
+    );
+    presets.push(preset);
+    await savePresets();
+    renderPresets();
+    const from = reply.layer?.title
+      ? `"${reply.layer.title}"`
+      : reply.layer?.id || "the selection";
+    showPresetStatus(
+      [
+        `Added "${preset.name}" from ${from} (${reply.via})`,
+        reply.missing?.length
+          ? `${reply.missing.length} field(s) absent on that layer, defaulted`
+          : "",
+        "✎ renames it",
+      ]
+        .filter(Boolean)
+        .join(" · "),
+    );
+  } catch (err) {
+    showPresetStatus(
+      `Could not create a preset — ${err?.message || err}`,
+      "error",
+    );
+  } finally {
+    presetNewBtn.disabled = false;
+  }
+});
+
+presetImportBtn.addEventListener("click", () => {
+  // Reset first: picking the same file twice in a row fires no change event
+  // otherwise, which reads as a dead button.
+  presetFileEl.value = "";
+  presetFileEl.click();
+});
+
+presetFileEl.addEventListener("change", async () => {
+  const file = presetFileEl.files?.[0];
+  if (!file) return;
+  let text = "";
+  try {
+    text = await file.text();
+  } catch (err) {
+    showPresetStatus(`Could not read that file — ${err?.message || err}`, "error");
+    return;
+  }
+  const res = presetFields.parsePreset(text);
+  if (!res.ok) {
+    showPresetStatus(res.error, "error");
+    return;
+  }
+  const at = presets.findIndex((p) => p.id === res.preset.id);
+  const replaced = at >= 0;
+  if (replaced) presets[at] = res.preset;
+  else presets.push(res.preset);
+  await savePresets();
+  renderPresets();
+  showPresetStatus(
+    [
+      replaced
+        ? `Replaced "${res.preset.name}"`
+        : `Added "${res.preset.name}"`,
+      ...(res.warnings || []),
+    ].join(" · "),
+  );
+});
+
+presetDelayEl.addEventListener("change", () => {
+  browser.storage.local.set({
+    [DELAY_ACCUMULATION_KEY]: delayAccumulation(),
+  });
+});
+
 const showHotkeyError = (msg, level = "error") => {
   hotkeyErrorEl.textContent = msg;
   hotkeyErrorEl.classList.toggle("ok", !!msg && level === "ok");
@@ -739,6 +1098,8 @@ browser.storage.local
     "workingDomain",
     "hotkeyBindings",
     "contentTab",
+    "animationPresets",
+    "animationDelayAccumulation",
   ])
   .then((state) => {
     renderLayer(state.selectedLayer || null);
@@ -751,6 +1112,11 @@ browser.storage.local
     workingDomain = state.workingDomain || "";
     workingDomainEl.value = workingDomain;
     hotkeyBindings = mergeWithDefaults(state.hotkeyBindings || null);
+    presets = Array.isArray(state.animationPresets)
+      ? state.animationPresets
+      : [];
+    presetDelayEl.value = state.animationDelayAccumulation ?? "";
+    renderPresets();
     if (ALL_KINDS.includes(state.contentTab)) activeTab = state.contentTab;
     contentSearchEl.placeholder = `Search ${TAB_LABELS[activeTab]}…`;
     renderHotkeys();
@@ -794,5 +1160,20 @@ browser.storage.onChanged.addListener((changes, area) => {
   if (changes.hotkeyBindings) {
     hotkeyBindings = mergeWithDefaults(changes.hotkeyBindings.newValue || null);
     if (!recordingActionId) renderHotkeys();
+  }
+  if (changes.animationPresets) {
+    presets = Array.isArray(changes.animationPresets.newValue)
+      ? changes.animationPresets.newValue
+      : [];
+    disarmDelete();
+    // The list this input was bound to is gone, so the edit has nowhere to land.
+    renamingId = null;
+    renderPresets();
+  }
+  if (
+    changes.animationDelayAccumulation &&
+    document.activeElement !== presetDelayEl
+  ) {
+    presetDelayEl.value = changes.animationDelayAccumulation.newValue ?? "";
   }
 });
