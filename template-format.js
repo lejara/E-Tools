@@ -44,10 +44,41 @@
   // and an author name narrows the list too.
   const searchTerms = (query) => normalizeName(query).split(" ").filter(Boolean);
 
+  // `extra` is what lets one search box serve rows of different shapes: a
+  // template contributes its author, a post contributes its status and post
+  // type, and neither has to know the other exists.
   const matchesTerms = (t, terms) => {
     if (!terms.length) return true;
-    const hay = normalizeName(`${t.title || ""} ${t.type || ""} ${t.author || ""}`);
+    const hay = normalizeName(
+      `${t.title || ""} ${t.type || ""} ${t.author || ""} ${t.extra || ""}`,
+    );
     return terms.every((q) => hay.includes(q));
+  };
+
+  const STATUS_LABELS = {
+    publish: "Published",
+    draft: "Draft",
+    pending: "Pending",
+    private: "Private",
+    future: "Scheduled",
+    trash: "Trash",
+    "auto-draft": "Auto-draft",
+  };
+
+  const statusLabel = (status) => {
+    const key = String(status || "").toLowerCase();
+    return STATUS_LABELS[key] || key;
+  };
+
+  // The template list's second line is "author · date"; a post's is
+  // "status · date". Same slot, same separator, different facts.
+  const postMetaLine = (p) => {
+    const bits = [];
+    const status = statusLabel(p.status);
+    if (status) bits.push(status);
+    const when = formatDate({ modified: p.modified });
+    if (when) bits.push(when);
+    return bits.join(" · ");
   };
 
   // Every layer these tools create carries the template's id as a "#123"
@@ -110,6 +141,38 @@
       .replace(TEMPLATE_TAG, "")
       .trim();
 
+  // Elementor's template-library payload, flattened to the shape every consumer
+  // here reads. Field names vary across Elementor versions, so take the first of
+  // several candidates and hand back the raw key list so a missing column can be
+  // diagnosed without guessing.
+  //
+  // Tools/page-bridge.js carries its own copy of this mapping, and has to: the
+  // bridge is injected into the *page* world, which cannot read a content-script
+  // global. Same boundary that keeps the tag regex out of it. Change one, change
+  // both.
+  const normalizeTemplateList = (raw, source = "local") => {
+    const list = Array.isArray(raw) ? raw : Object.values(raw || {});
+    const templates = list.map((t) => ({
+      templateId: t.template_id,
+      title: t.title,
+      type: t.type,
+      source: t.source || source,
+      author: t.author || t.user || null,
+      date: t.date ?? null,
+      modified: t.modified ?? t.post_modified ?? null,
+      humanDate: t.human_date || null,
+      humanModified:
+        t.human_modified_date || t.humanModifiedDate || t.modified_date || null,
+      // The library hands back the template's own public permalink
+      // ("/?elementor_library=<slug>"). It is the panel's View link, and it
+      // beats deriving one from the title — a slug is not a slugified title
+      // once WordPress has deduplicated it.
+      url: t.url || null,
+      status: t.status || null,
+    }));
+    return { templates, fields: list.length ? Object.keys(list[0]) : [] };
+  };
+
   const parseWorkingDomain = (raw) => {
     if (!raw) return null;
     const trimmed = String(raw).trim();
@@ -134,17 +197,43 @@
     return `${parsed.origin}/wp-admin/post.php?post=${encodeURIComponent(postId)}&action=elementor`;
   };
 
+  // WordPress's own editor, for a post Elementor did not build. Same shape as
+  // elementorEditUrl so the panel can pick between them by one flag.
+  const wpAdminEditUrl = (workingDomain, postId) => {
+    const parsed = parseWorkingDomain(workingDomain);
+    if (!parsed || postId === null || postId === undefined || postId === "") {
+      return null;
+    }
+    return `${parsed.origin}/wp-admin/post.php?post=${encodeURIComponent(postId)}&action=edit`;
+  };
+
+  // A published post has a permalink already. For anything else `link` is the
+  // permalink it *would* have and does not render, so an unpublished post needs
+  // the preview route instead — which works for a signed-in editor.
+  const contentViewUrl = (workingDomain, item) => {
+    if (!item || item.viewable === false) return null;
+    if (item.status === "publish" && item.link) return item.link;
+    const parsed = parseWorkingDomain(workingDomain);
+    if (!parsed || item.id === null || item.id === undefined) return null;
+    return `${parsed.origin}/?p=${encodeURIComponent(item.id)}&preview=true`;
+  };
+
   window.__ElementorTemplateFormat = {
     normalizeName,
     formatDate,
     metaLine,
+    postMetaLine,
+    statusLabel,
     searchTerms,
     matchesTerms,
+    normalizeTemplateList,
     templateTagKey,
     withTemplateTag,
     parseTemplateTag,
     stripTemplateTag,
     parseWorkingDomain,
     elementorEditUrl,
+    wpAdminEditUrl,
+    contentViewUrl,
   };
 })();

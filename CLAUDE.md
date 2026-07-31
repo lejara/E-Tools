@@ -10,10 +10,10 @@ Browser extension (MV3, Firefox) that adds hotkey-driven tools to Elementor's Wo
 ├── background.js        # toolbar-icon click → opens UI/panel.html
 ├── hotkeys.js           # global keybindings (dispatches to tools)
 ├── hotkey-defaults.js   # dual-context: ACTIONS table + binding formatting
-├── template-format.js   # dual-context: template metadata, search, Edit-URL building
+├── template-format.js   # dual-context: template/post metadata, search, list normalization, Edit & View URL building
 ├── UI/                  # window opened from the toolbar icon
 │   ├── panel.html
-│   └── panel.js         # reads browser.storage.local, re-renders on change; site-template list
+│   └── panel.js         # reads browser.storage.local, re-renders on change; site-content list
 └── Tools/               # one self-contained tool per file
     ├── preview-override.js   # forces fixed widths on mobile/tablet preview
     ├── core_utils.js         # shared helpers on window.__ElementorTools (log, selectLayerById, callBridge, insertSiteTemplate, createTemplateWidget, createContainer, listSiteTemplates, pairTrees, normalizeName)
@@ -26,10 +26,13 @@ Browser extension (MV3, Firefox) that adds hotkey-driven tools to Elementor's Wo
     ├── template-sync.js      # name-matches top containers to site templates; styles them, or replaces them outright
     ├── template-insert.js    # multi-select picker over the template library, inserts the ticked templates
     ├── template-decouple.js  # swaps Elementor Template widgets for a copy of the template's own content
+    ├── wp-rest.js            # shared wp-admin REST access: wp_rest nonce + authenticated JSON GET
+    ├── admin-templates.js    # serves the panel's template list from wp-admin (no editor, no page bridge)
+    ├── wp-pages.js           # serves the panel's post list — every post type, with the Elementor flag
     └── overlay.js            # draggable in-page HUD (root layer, logs, Edit-in-Elementor link)
 ```
 
-- Load order: `template-format.js` first (`core_utils.js` reads `normalizeName` off it), then `core_utils.js`, then `multi-select.js`, then other tools, then `hotkeys.js`.
+- Load order: `template-format.js` first (`core_utils.js` reads `normalizeName` off it), then `core_utils.js`, then `multi-select.js`, then other tools, then `hotkeys.js`. `wp-rest.js` must precede `admin-templates.js` and `wp-pages.js` — both read `window.__WpRest` and bail without it.
 - Tools share `window.__ElementorTools` inside the editor page; cross-window state uses `browser.storage.local` (`selectedLayer`, `logs`).
 - Hotkeys: `Ctrl+Shift+1` capture root layer · `Ctrl+Shift+2` replace styles · `Ctrl+Shift+3` replace layer · `Ctrl+Shift+4` batch rename · `Ctrl+Shift+5` reselect stored root · `Ctrl+Shift+6` sync template styles · `Ctrl+Shift+7` replace with template · `Ctrl+Shift+8` insert site templates · `Ctrl+Shift+9` decouple templates.
 - Add a tool: drop a file in `Tools/`, append its path to `content_scripts[0].js` in `manifest.json`.
@@ -251,15 +254,85 @@ root: template is "section" but page is "container"
 
 `ns.summarizeTree(node, depth)` and `ns.countNodes(node)` produce those; both live in `core_utils.js`.
 
-## Panel: site template list
+## Panel: site content list
 
-The panel has a **Site Templates** section — the same library as `template-insert.js`, but browsable outside the editor: search box, title + author/date + type per row, and an **Edit** button that opens that template in Elementor in a new tab.
+The panel has one **Site Content** section listing the whole site — Elementor library templates *and* every post type — through a single search box, with three filter buttons and **Edit** / **View** on each row.
 
-- **The panel has no page bridge.** Only an editor tab holds Elementor's REST nonce, so the panel asks one: `browser.tabs.sendMessage` → the `runtime.onMessage` listener at the bottom of `core_utils.js` → `listSiteTemplates()`. That listener sits behind the file's `action=elementor` guard, so only editor tabs answer and the panel can take the first responder. No editor tab open ⇒ "No Elementor editor tab open — open one, then Refresh."
-- `tab.url` is only populated where host permission is held, so the query filters on it when present and **broadcasts to every tab otherwise** — tabs without the listener just reject, which is the intended miss.
-- **Edit URLs come from the Working Domain field**, not from the tab: `{origin}/wp-admin/post.php?post={templateId}&action=elementor`. Empty or unparseable domain ⇒ the button is disabled with a tooltip saying why, rather than opening a guessed URL. Editing the field re-renders the rows immediately.
+It was two things once: a Site Templates list, and a plan for a separate Pages list. One list with filters is what it became, because the search box, the row layout, the tab plumbing and the Working-Domain URL building were going to be duplicated wholesale otherwise.
+
+- **`Templates` · `Pages` · `Other` are tabs, not filters** — exclusive, one at a time. Stored as `contentTab`.
+- **Each tab owns its own request, rows, error and warnings.** That separation is the whole speed story, below. `rows: null` means "never loaded" and is a different thing from an empty array: the first says "Not loaded", the second says "no pages on this site".
+- **The rows are unified before anything reads them.** `asRow()` in `panel.js` is the one place a template or a post becomes the same shape; search, sort and both buttons see only that. A template's second line is `author · date`, a post's is `status · date` — same slot, different facts.
+- **Search spans both shapes** via `matchesTerms`' `extra` field: a template contributes its author, a post contributes its post-type slug, status, doc type, and the literal word `elementor` so the badge is searchable like any other text. The placeholder names the current tab, because the search only ever covers that tab.
+- A loaded tab keeps its **row count on the tab itself**, so the shape of the site stays readable without clicking through.
+
+### What makes a refresh fast
+
+Four things, in rough order of how much they buy:
+
+- **Refresh re-fetches the active tab and nothing else.** One tab is one message: `list-templates`, or `list-posts` with `include: ["page"]` / `exclude: ["page"]`. The Pages tab no longer paginates every CPT on the site to render a list of pages.
+- **A tab that has never been opened costs nothing.** Only the tab on screen loads at startup; the others load the first time they are selected, if they ever are.
+- **Switching tabs does not re-fetch.** A loaded tab renders from what it already has — re-fetching on every switch would give back everything the split just won. Refresh is the only thing that goes back to the network.
+- **Pagination runs four pages at a time** (`PAGE_CONCURRENCY`). Page 1 has to land before the page count is known, but pages 2..N have no dependency on each other; they were serial only because a `while` loop is the obvious way to write it.
+- **`/wp/v2/types` is cached** for the page's lifetime. Post types are registered at boot and cannot change under a live tab, so it is one round trip on the first refresh and none after — including across a tab switch.
+
+**Do not put `_fields` on `/wp/v2/types`.** It answers with an object *keyed by slug*, not an array of records, so `_fields` filters the top-level keys — `post`, `page`, … — none of which are named `slug` or `rest_base`. `?_fields=slug,rest_base,name,viewable` returns **`{}` with a 200**, which reads as "this site has no post types" and silently empties the Pages and Other tabs. This was shipped once and cost a debugging session; the trim it buys is worth nothing next to the cache above. `_fields` is fine on the collection endpoints, which *are* arrays — that is where `meta._elementor_edit_mode` is doing real work.
+
+### The Elementor badge
+
+A post row carries an **Elementor** badge exactly when wp-admin's posts table would show its `— Elementor` label, and for the same reason. That label comes from the `display_post_states` filter, and the whole test behind it is one meta key:
+
+```php
+Document::is_built_with_elementor()  =>  (bool) get_meta( '_elementor_edit_mode' )
+```
+
+Elementor registers that key with `show_in_rest` — unconditionally, on `rest_api_init`, for every post type with `elementor` support — so `wp-pages.js` reads the same answer with `?context=edit&_fields=…,meta._elementor_edit_mode`.
+
+- **The nested `meta.<key>` form is load-bearing.** `_elementor_data` is registered on the same object and its value is the *entire page document* as a string. Asking for a bare `meta` would pull a megabyte per row. Name the keys.
+- **`context=edit` is mandatory** — those meta keys are edit-context only, and so are drafts. That is also what makes the nonce matter.
+- **Absent key and empty value are different answers.** A post type Elementor does not support has no such key registered at all; that stays `null` and the panel says nothing, rather than reporting "not Elementor" as a fact it did not establish.
+- Do not reach for `elementor/v2/site-navigation/recent-posts` instead. It returns exactly this plus a prebuilt edit URL, but its experiment is `'default' => STATE_INACTIVE, 'hidden' => true` — off by default and not even toggleable in the experiments UI.
+
+### Edit and View
+
+- **Edit picks an editor from the flag.** Elementor for a template or a post built with it, WordPress otherwise — and **unknown falls to WordPress deliberately**: `post.php?action=elementor` works on a post Elementor never built, quietly converting it, so a wrong guess in that direction edits the document.
+- **View is the permalink for a published post, the preview route for anything else.** `link` on an unpublished post is the permalink it *would* have and does not render, so those get `{origin}/?p={id}&preview=true`, which works for a signed-in editor. A type with `viewable: false` disables the button.
+- Both URLs come from the **Working Domain** field, not from the responding tab. Empty or unparseable ⇒ disabled with a tooltip saying why. Editing the field re-renders the rows immediately.
+- **Templates get a View button too**, from the `url` the library endpoint already returns — `{origin}/?elementor_library=<slug>`. `elementor_library` is not a viewable *post type*, but that permalink renders. Take the field; do not derive it from the title, because a slug stops being a slugified title the moment WordPress deduplicates it (`hero`, `hero-2`). `normalizeTemplateList` carries `url` and `status` for this, in **both** copies — `template-format.js` and the page-world one in `page-bridge.js`.
 - Tabs open in a **normal** browser window — the panel is a popup window and cannot hold tabs, so defaulting the `windowId` would misfire.
+
+### Which tab answers
+
+- **The panel has no page bridge**, so it asks a tab that can reach the endpoints: `browser.tabs.sendMessage` → a `runtime.onMessage` listener. Neither kind of tab open ⇒ "No Elementor editor or WordPress admin tab open — open one, then Refresh."
+- **One ranking across both kinds of tab: origin, then active, then editor.** `askElementorTab` scores every candidate rather than trying editors as a block and admin tabs as a block. Grouping first was a real bug: a background editor on *any* site outranked the wp-admin tab in front of the user, so `list-templates` went down the editor's page-bridge path while `list-posts` — which `wp-pages.js` answers in either tab — went to the admin one. Same panel, two sources, only one of them failing.
+  - `origin` (the Working Domain) outranks everything: another client's tab must never answer for this site.
+  - `active` outranks `editor`. That costs one declined message before `run-action` finds its tab, and buys the panel agreeing with what is on screen.
+- **The status line names the responder** (`via editor` / `via wp-admin`). Two tabs can serve these reads by different routes, and a list fetched by the wrong route is otherwise indistinguishable from a broken endpoint — which is precisely what made the bug above hard to see.
+- `tab.url` is only populated where host permission is held, so the query filters on it when present and **broadcasts to every tab otherwise** — tabs without the listener just reject, which is the intended miss.
 - A failed Refresh keeps the list that was already there and puts the error in the status line; only a panel that never loaded shows an empty state.
+
+### Serving the list from wp-admin
+
+Three files split the job, and the split matters:
+
+- **`Tools/wp-rest.js`** — the `wp_rest` nonce and an authenticated JSON GET. Guarded on `/wp-admin/` only, so it loads on editor *and* plain admin pages.
+- **`Tools/admin-templates.js`** — `list-templates`, excluding the editor (`action=elementor`), because `core_utils.js` already answers that there.
+- **`Tools/wp-pages.js`** — `list-posts`, on **every** `/wp-admin/` page including the editor, since nothing else answers it.
+
+**No page bridge is injected, and the fetches stay in the content script's own world.** Same-origin, so the login cookie rides along with no SameSite question to answer, and there is no page-world `<script>` tag for a site's CSP to reject. Doing this from the background page instead would be a *worse* bet on both counts: an extension-origin request is cross-site, and WordPress leaves its login cookies at the browser default of `SameSite=Lax`, which is not sent on a cross-site subresource fetch.
+
+**The nonce comes from `admin-ajax.php?action=rest-nonce`, not `wpApiSettings`.** The global is page-world and unreadable from a content script — but it is also merely *usually* there, enqueued by whichever plugin pulled in `wp-api-request`. The admin-ajax handler is WP core, so it is on every admin page, and it returns the identical value. It answers `-1`/`0` with an HTTP **200** for a logged-out session, so the body is checked rather than the status; that is what turns a bare 401 into "Not signed in to WordPress on this site".
+
+- **The in-flight nonce promise is cached, not the value** — a page listing asks once and then makes a request per post type, and without this they would race into one fetch each. A rejection is evicted; otherwise one blip would poison the tab for its lifetime. Same reasoning as `templateContentCache` in `page-bridge.js`.
+- **A 401/403 buys exactly one silent retry** with a fresh nonce. Nonces expire in 12–24h and a long-lived admin tab will eventually present a stale one, which is indistinguishable from being logged out until you retry.
+- **`run-action` is not handled by either admin file, deliberately.** `hotkeys.js` is editor-only; returning `undefined` leaves `askElementorTab` free to try the next tab rather than resolving a run nothing here can perform.
+- **Only one file answers `ping` per page type.** `core_utils.js` on the editor, `admin-templates.js` on plain admin. `wp-pages.js` answers neither `ping` nor anything but `list-posts` — a third listener replying to one message means two replies racing, and `sendMessage` keeps whichever lands first.
+
+`wp-pages.js` walks `/wp/v2/types` and then paginates each type's collection at `per_page=100`, reading `X-WP-TotalPages` for the bound. It takes `include` / `exclude` slug lists so the panel can ask for one tab's worth rather than the whole site.
+
+- **Per-type failures and truncation are reported, never silent.** An editor routinely lacks `edit_others_posts` on a CPT or two; that type contributes a warning to the status line instead of failing the run. A list that quietly dropped a post type reads as "that type has nothing in it".
+- `SKIP_TYPES` drops WordPress's own bookkeeping types and `elementor_library` — the Templates filter already lists that through Elementor's endpoint, which knows about template *type* in a way `wp/v2` does not.
+- `title.rendered` is HTML and gets decoded through **`DOMParser`, not `innerHTML`**. These are site-supplied strings on every admin page, and `web-ext lint` fails an `innerHTML` assignment outright (`UNSAFE_VAR_ASSIGNMENT`).
 
 ### Panel: Run buttons
 
@@ -267,11 +340,13 @@ Every row in the panel's Hotkeys list has a **Run** button beside it, so the too
 
 - The reply reports that the run *started*, not that it finished. Tools draw their own modals and a template sync can take a minute; holding `sendMessage` open for that would time out the panel for no gain. Failures after dispatch land in the tool's own modal and the log.
 - On success the panel **focuses the responding tab**. The panel is a separate popup window, so without this the tool's modal opens somewhere the user isn't looking and the click reads as dead.
-- `askElementorTab` sorts active tabs first. A side-effectful run with two editors open should land in the one on screen; first-responder order was fine when the only message was a read.
+- `askElementorTab` sorts active tabs first. A side-effectful run with two editors open should land in the one on screen; first-responder order was fine when the only message was a read. It does **not** pass `preferOrigin` — a run belongs in the tab the user is looking at, not in whichever tab matches a text field they may have set for something else.
 
 ### Dual-context files
 
-`template-format.js` and `hotkey-defaults.js` are loaded **both** as content scripts and by `panel.html`, each assigning one global. That is the mechanism for anything the panel and the editor must agree on — template metadata rendering, the search predicate, and Edit-URL construction all live in `template-format.js` precisely because `panel.js`, `template-insert.js` and `overlay.js` would otherwise drift. Neither file may touch `location` or the DOM at load time.
+`template-format.js` and `hotkey-defaults.js` are loaded **both** as content scripts and by `panel.html`, each assigning one global. That is the mechanism for anything the panel and the editor must agree on — template metadata rendering, the search predicate, `normalizeTemplateList`, and Edit-URL construction all live in `template-format.js` precisely because `panel.js`, `template-insert.js`, `admin-templates.js` and `overlay.js` would otherwise drift. Neither file may touch `location` or the DOM at load time.
+
+**The page world is outside this mechanism.** `page-bridge.js` is injected as a page-world script and cannot read a content-script global, so its `list-templates` op carries its own copy of the field mapping that `normalizeTemplateList` holds — the same boundary that keeps the template-tag regex out of it. Those two are the one sanctioned duplication here; change one, change both. Do not "fix" it by having the bridge reach for the global.
 
 ## Tree alignment
 

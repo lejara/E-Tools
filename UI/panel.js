@@ -12,10 +12,11 @@ const overlayEl = document.getElementById("opt-overlay");
 const overlayFroggyEl = document.getElementById("opt-overlay-froggy");
 const skipWordEl = document.getElementById("opt-skip-word");
 const workingDomainEl = document.getElementById("opt-working-domain");
-const templatesEl = document.getElementById("templates");
-const templateSearchEl = document.getElementById("template-search");
-const templateStatusEl = document.getElementById("template-status");
-const refreshTemplatesBtn = document.getElementById("refresh-templates");
+const contentEl = document.getElementById("content");
+const contentSearchEl = document.getElementById("content-search");
+const contentStatusEl = document.getElementById("content-status");
+const contentTabsEl = document.getElementById("content-tabs");
+const refreshContentBtn = document.getElementById("refresh-content");
 const hotkeysEl = document.getElementById("hotkeys");
 const resetAllHotkeysBtn = document.getElementById("reset-all-hotkeys");
 const hotkeyErrorEl = document.getElementById("hotkey-error");
@@ -23,8 +24,16 @@ const hotkeyErrorEl = document.getElementById("hotkey-error");
 const { ACTIONS, formatBinding, bindingKey, mergeWithDefaults } =
   window.__ElementorHotkeyDefaults;
 
-const { metaLine, searchTerms, matchesTerms, elementorEditUrl } =
-  window.__ElementorTemplateFormat;
+const {
+  metaLine,
+  postMetaLine,
+  searchTerms,
+  matchesTerms,
+  elementorEditUrl,
+  wpAdminEditUrl,
+  contentViewUrl,
+  parseWorkingDomain,
+} = window.__ElementorTemplateFormat;
 
 let hotkeyBindings = mergeWithDefaults(null);
 let recordingActionId = null;
@@ -118,27 +127,83 @@ workingDomainEl.addEventListener("change", () => {
   browser.storage.local.set({ workingDomain: workingDomainEl.value.trim() });
 });
 
-// null until a load has been attempted, so "not loaded" and "empty library"
-// stay distinguishable.
-let templates = null;
-let templateError = null;
-let templatesLoading = false;
 let workingDomain = "";
 
-// The panel window has no page bridge — only an Elementor editor tab can reach
-// the authenticated template endpoint. Ask the first tab that answers.
-// Returns { tab, reply } — the responding tab matters for run-action, which
-// has to bring the editor forward so the tool's own modal is visible.
-const askElementorTab = async (message) => {
+// One tab at a time, and each tab owns its own request, rows, error and
+// warnings. That separation is the whole speed story: Refresh re-fetches the
+// tab you are looking at and nothing else, and a tab you have never opened
+// costs nothing at all.
+//
+// `rows: null` means "never loaded", which is a different thing from an empty
+// array — the list says "Not loaded" for the first and "nothing here" for the
+// second.
+const ALL_KINDS = ["template", "page", "other"];
+// Two vocabularies on purpose: TAB_LABELS reads as a noun inside a sentence
+// ("Fetching pages…", "Search posts…"), TAB_TITLES matches the tab caption
+// exactly, which is what the Refresh button has to echo.
+const TAB_LABELS = { template: "templates", page: "pages", other: "posts" };
+const TAB_TITLES = { template: "Templates", page: "Pages", other: "Other" };
+const tabState = Object.fromEntries(
+  ALL_KINDS.map((kind) => [
+    kind,
+    { rows: null, error: null, warnings: [], loading: false, via: null },
+  ]),
+);
+let activeTab = "template";
+
+// Each tab is one message. Pages and Other split the post types between them
+// rather than both pulling the lot — fetching every CPT to render the Pages tab
+// was the bulk of what made a refresh slow.
+const TAB_REQUESTS = {
+  template: { type: "list-templates" },
+  page: { type: "list-posts", options: { include: ["page"] } },
+  other: { type: "list-posts", options: { exclude: ["page"] } },
+};
+
+// The panel window has no page bridge — it cannot reach the authenticated
+// template endpoint itself, so it asks a tab that can. Returns { tab, reply } —
+// the responding tab matters for run-action, which has to bring the editor
+// forward so the tool's own modal is visible.
+//
+// Two kinds of tab answer. An editor tab answers everything (core_utils.js and
+// hotkeys.js); a plain wp-admin tab answers list-templates
+// (Tools/admin-templates.js) and list-posts (Tools/wp-pages.js, which also runs
+// in the editor) but stays silent on run-action, so an editor-only message
+// simply falls through to the next candidate.
+const askElementorTab = async (message, { preferOrigin = "" } = {}) => {
   const tabs = await browser.tabs.query({});
+  const urlOf = (t) => t.url || "";
   // tab.url is only populated where the extension holds host permission for
   // that tab; fall back to broadcasting rather than assuming it is there.
-  const editors = tabs.filter((t) => (t.url || "").includes("action=elementor"));
-  // Active tabs first — with two editors open, a side-effectful run should land
-  // in the one the user is actually looking at, not whichever answers first.
-  const candidates = (editors.length ? editors : tabs)
-    .slice()
-    .sort((a, b) => (b.active ? 1 : 0) - (a.active ? 1 : 0));
+  const editors = tabs.filter((t) => urlOf(t).includes("action=elementor"));
+  const admins = tabs.filter(
+    (t) => !editors.includes(t) && urlOf(t).includes("/wp-admin/"),
+  );
+  // One ranking across both kinds of tab, not editors-as-a-block followed by
+  // admins-as-a-block. Grouping first meant a background editor on any site
+  // outranked the wp-admin tab in front of the user, so list-templates went
+  // down the editor's page-bridge path while list-posts — which wp-pages.js
+  // answers in either tab — went to the admin one. Same panel, two sources,
+  // and only one of them failing.
+  //
+  //   origin  the Working Domain names the site being asked about, so another
+  //           client's tab must never answer for it
+  //   active  the tab in front of the user, which is the one they mean
+  //   editor  a tiebreak only: it can service every message, including
+  //           run-action, which an admin tab declines
+  //
+  // Ranking editor below active costs one declined message before run-action
+  // finds its tab, and buys the panel agreeing with what is on screen.
+  const matchesOrigin = (t) =>
+    !!preferOrigin && urlOf(t).startsWith(`${preferOrigin}/`);
+  const score = (t) =>
+    (matchesOrigin(t) ? 4 : 0) +
+    (t.active ? 2 : 0) +
+    (editors.includes(t) ? 1 : 0);
+  const known = [...editors, ...admins];
+  const candidates = (known.length ? known : tabs.slice()).sort(
+    (a, b) => score(b) - score(a),
+  );
   for (const tab of candidates) {
     try {
       const reply = await browser.tabs.sendMessage(tab.id, message);
@@ -176,28 +241,86 @@ const openInNewTab = async (url) => {
   await browser.windows.create({ url });
 };
 
-const renderTemplateStatus = () => {
-  templateStatusEl.classList.toggle("error", !!templateError && !templatesLoading);
-  if (templatesLoading) {
-    templateStatusEl.textContent = "Fetching site templates…";
-    return;
-  }
-  if (templateError) {
-    templateStatusEl.textContent = templateError;
-    return;
-  }
-  if (!templates) {
-    templateStatusEl.textContent = "";
-    return;
-  }
-  const shown = templatesEl.querySelectorAll(".template").length;
-  const bits = [`${shown} of ${templates.length} shown`];
-  if (!workingDomain) bits.push("set a Working Domain to enable Edit");
-  templateStatusEl.textContent = bits.join(" · ");
+// A template and a post arrive in two different shapes from two endpoints.
+// This is the one place either becomes a row, so everything downstream —
+// search, sort, the two buttons — sees a single kind of thing.
+const asRow = (raw, kind) =>
+  kind === "template"
+    ? {
+        kind,
+        id: raw.templateId,
+        title: raw.title,
+        type: raw.type || "",
+        sub: metaLine(raw),
+        // A library template is Elementor by definition, so the badge would be
+        // noise on every row of this tab.
+        elementor: true,
+        badge: false,
+        // elementor_library is not a viewable *post type*, but the library
+        // endpoint still hands back each template's own permalink
+        // ("/?elementor_library=<slug>"), which renders. So View works here —
+        // it just cannot be built from the id the way a post's preview is.
+        viewable: !!raw.url,
+        status: raw.status || "",
+        link: raw.url || "",
+        extra: raw.author || "",
+      }
+    : {
+        kind,
+        id: raw.id,
+        title: raw.title,
+        type: raw.typeLabel || raw.typeSlug || "",
+        sub: postMetaLine(raw),
+        elementor: raw.elementor,
+        badge: raw.elementor === true,
+        docType: raw.docType,
+        viewable: raw.viewable,
+        status: raw.status,
+        link: raw.link,
+        // Searchable but not shown: the raw type slug, the status, and the word
+        // "elementor" so the badge can be searched for like any other text.
+        extra: [
+          raw.typeSlug,
+          raw.status,
+          raw.elementor ? "elementor" : "",
+          raw.docType,
+        ]
+          .filter(Boolean)
+          .join(" "),
+      };
+
+const activeItems = () => {
+  const { rows } = tabState[activeTab];
+  if (!rows) return null;
+  return rows
+    .map((raw) => asRow(raw, activeTab))
+    .sort((a, b) =>
+      String(a.title || "").localeCompare(String(b.title || "")),
+    );
 };
 
-const setTemplatesMessage = (text) => {
-  templatesEl.replaceChildren(
+const renderContentStatus = (shown, total) => {
+  const state = tabState[activeTab];
+  contentStatusEl.classList.toggle("error", !!state.error && !state.loading);
+  if (state.loading) {
+    contentStatusEl.textContent = `Fetching ${TAB_LABELS[activeTab]}…`;
+    return;
+  }
+  if (!state.rows) {
+    contentStatusEl.textContent = state.error || "";
+    return;
+  }
+  // A failed refresh still lists what was there before; the failure goes in the
+  // status line rather than replacing a perfectly good list with an error.
+  const bits = [`${shown} of ${total} shown`];
+  if (state.via) bits.push(`via ${state.via}`);
+  if (!workingDomain) bits.push("set a Working Domain to enable Edit");
+  if (state.error) bits.push(state.error);
+  contentStatusEl.textContent = [...bits, ...state.warnings].join(" · ");
+};
+
+const setContentMessage = (text) => {
+  contentEl.replaceChildren(
     Object.assign(document.createElement("div"), {
       className: "empty",
       textContent: text,
@@ -205,30 +328,92 @@ const setTemplatesMessage = (text) => {
   );
 };
 
-const renderTemplates = () => {
+// Which editor a row opens is the one place the Elementor flag changes what the
+// panel does rather than what it says. Unknown falls to WordPress deliberately:
+// post.php?action=elementor works on a post Elementor never built, quietly
+// converting it, so guessing wrong in that direction edits the document.
+const editTarget = (item) => {
+  if (item.kind === "template" || item.elementor === true) {
+    return {
+      url: elementorEditUrl(workingDomain, item.id),
+      hint: "Edit in Elementor",
+    };
+  }
+  return {
+    url: wpAdminEditUrl(workingDomain, item.id),
+    hint:
+      item.elementor === null
+        ? "Elementor status unknown for this post type — opens the WordPress editor"
+        : "Edit in WordPress",
+  };
+};
+
+const linkButton = (label, url, { hint, disabledHint }) => {
+  const btn = document.createElement("button");
+  btn.type = "button";
+  btn.className = "edit";
+  btn.textContent = label;
+  btn.disabled = !url;
+  btn.title = url ? `${hint} — ${url}` : disabledHint;
+  btn.addEventListener("click", () => {
+    if (url) openInNewTab(url);
+  });
+  return btn;
+};
+
+const renderTabs = () => {
+  // Refresh only ever re-fetches the active tab, so it says which one.
+  refreshContentBtn.textContent = `Refresh ${TAB_TITLES[activeTab]}`;
+  for (const btn of contentTabsEl.querySelectorAll(".tab")) {
+    const kind = btn.dataset.kind;
+    btn.setAttribute("aria-selected", kind === activeTab ? "true" : "false");
+    // A loaded tab keeps its count visible while you are on another one, so the
+    // shape of the site is readable without clicking through.
+    const { rows, loading } = tabState[kind];
+    const badge = loading ? "…" : rows ? String(rows.length) : "";
+    let count = btn.querySelector(".count");
+    if (!badge) {
+      count?.remove();
+    } else {
+      if (!count) {
+        count = document.createElement("span");
+        count.className = "count";
+        btn.append(count);
+      }
+      count.textContent = badge;
+    }
+  }
+};
+
+const renderContent = () => {
+  renderTabs();
+  const state = tabState[activeTab];
+
   // A failed refresh keeps whatever was already listed — the error goes in the
   // status line rather than throwing away a good list.
-  if (!templates) {
-    setTemplatesMessage(
-      templateError
-        ? "Could not load templates"
-        : templatesLoading
+  const items = activeItems();
+  if (!items) {
+    setContentMessage(
+      state.error
+        ? `Could not load ${TAB_LABELS[activeTab]}`
+        : state.loading
           ? "Loading…"
           : "Not loaded",
     );
-    renderTemplateStatus();
-    return;
-  }
-  if (!templates.length) {
-    setTemplatesMessage("No site templates in this library");
-    renderTemplateStatus();
+    renderContentStatus(0, 0);
     return;
   }
 
-  const terms = searchTerms(templateSearchEl.value);
-  const rows = templates
-    .filter((t) => matchesTerms(t, terms))
-    .map((t) => {
+  if (!items.length) {
+    setContentMessage(`No ${TAB_LABELS[activeTab]} on this site`);
+    renderContentStatus(0, 0);
+    return;
+  }
+
+  const terms = searchTerms(contentSearchEl.value);
+  const rows = items
+    .filter((item) => matchesTerms(item, terms))
+    .map((item) => {
       const row = document.createElement("div");
       row.className = "template";
 
@@ -236,78 +421,133 @@ const renderTemplates = () => {
       text.className = "text";
       const name = document.createElement("span");
       name.className = "name";
-      name.textContent = t.title || "(untitled)";
+      name.textContent = item.title || "(untitled)";
       text.append(name);
-      const sub = metaLine(t);
-      if (sub) {
+      if (item.sub) {
         const subEl = document.createElement("span");
         subEl.className = "sub";
-        subEl.textContent = sub;
+        subEl.textContent = item.sub;
         text.append(subEl);
+      }
+      row.append(text);
+
+      if (item.badge) {
+        const badge = document.createElement("span");
+        badge.className = "badge";
+        badge.textContent = "Elementor";
+        badge.title = item.docType
+          ? `Built with Elementor · ${item.docType}`
+          : "Built with Elementor";
+        row.append(badge);
       }
 
       const type = document.createElement("span");
       type.className = "type";
-      type.textContent = t.type || "";
+      type.textContent = item.type;
+      row.append(type);
 
-      const edit = document.createElement("button");
-      edit.type = "button";
-      edit.className = "edit";
-      edit.textContent = "Edit";
-      const url = elementorEditUrl(workingDomain, t.templateId);
-      edit.disabled = !url;
-      edit.title = url || "Set a Working Domain to build the Edit link";
-      edit.addEventListener("click", () => {
-        if (url) openInNewTab(url);
-      });
-
-      row.append(text, type, edit);
+      const actions = document.createElement("div");
+      actions.className = "row-actions";
+      const target = editTarget(item);
+      actions.append(
+        linkButton("Edit", target.url, {
+          hint: target.hint,
+          disabledHint: "Set a Working Domain to build the Edit link",
+        }),
+        linkButton("View", contentViewUrl(workingDomain, item), {
+          hint: item.status === "publish" ? "View page" : "Preview draft",
+          disabledHint:
+            item.kind === "template"
+              ? "The library did not return a permalink for this template"
+              : "Set a Working Domain to build the View link",
+        }),
+      );
+      row.append(actions);
       return row;
     });
 
   if (!rows.length) {
-    setTemplatesMessage("Nothing matches that search");
-    renderTemplateStatus();
+    setContentMessage("Nothing matches that search");
+    renderContentStatus(0, items.length);
     return;
   }
-  templatesEl.replaceChildren(...rows);
-  renderTemplateStatus();
+  contentEl.replaceChildren(...rows);
+  renderContentStatus(rows.length, items.length);
 };
 
-const loadTemplates = async () => {
-  if (templatesLoading) return;
-  templatesLoading = true;
-  templateError = null;
-  refreshTemplatesBtn.disabled = true;
-  renderTemplates();
+const NO_TAB =
+  "No Elementor editor or WordPress admin tab open — open one, then Refresh.";
+
+const loadTab = async (kind) => {
+  const state = tabState[kind];
+  if (state.loading) return;
+  state.loading = true;
+  state.error = null;
+  state.warnings = [];
+  if (kind === activeTab) {
+    refreshContentBtn.disabled = true;
+    renderContent();
+  } else {
+    renderTabs();
+  }
+
+  // Prefer a tab on the Working Domain, so a second client's WP tab cannot
+  // answer for this one.
+  const preferOrigin = parseWorkingDomain(workingDomain)?.origin || "";
+  const request = TAB_REQUESTS[kind];
+
   try {
-    const { reply } = await askElementorTab({
-      __elementorTools: true,
-      type: "list-templates",
-    });
+    const { tab, reply } = await askElementorTab(
+      { __elementorTools: true, ...request },
+      { preferOrigin },
+    );
+    // Which tab answered is worth showing. Two tabs can serve these reads by
+    // different routes, and a list that came from the wrong one — or by the
+    // wrong route — is otherwise indistinguishable from a broken endpoint.
+    state.via = tab
+      ? (tab.url || "").includes("action=elementor")
+        ? "editor"
+        : "wp-admin"
+      : null;
     if (!reply) {
-      templateError = "No Elementor editor tab open — open one, then Refresh.";
+      state.error = NO_TAB;
     } else if (!reply.ok) {
-      templateError = `Could not fetch templates — ${reply.error}`;
+      state.error = reply.error;
     } else {
-      templates = (reply.templates || [])
-        .slice()
-        .sort((a, b) =>
-          String(a.title || "").localeCompare(String(b.title || "")),
-        );
+      state.rows = kind === "template" ? reply.templates || [] : reply.posts || [];
+      // Per-type failures and truncation are reported, never silent: a list
+      // that quietly dropped a post type reads as "that type has nothing in it".
+      state.warnings = reply.warnings || [];
     }
   } catch (err) {
-    templateError = `Could not fetch templates — ${err?.message || err}`;
+    state.error = err?.message || String(err);
   } finally {
-    templatesLoading = false;
-    refreshTemplatesBtn.disabled = false;
-    renderTemplates();
+    state.loading = false;
+    if (kind === activeTab) refreshContentBtn.disabled = false;
+    renderContent();
   }
 };
 
-templateSearchEl.addEventListener("input", renderTemplates);
-templateSearchEl.addEventListener("search", renderTemplates);
-refreshTemplatesBtn.addEventListener("click", loadTemplates);
+// Switching tabs shows what is already there and only reaches the network for a
+// tab that has never loaded. Re-fetching on every switch would undo the point
+// of splitting the requests up.
+const selectTab = (kind) => {
+  if (!ALL_KINDS.includes(kind) || kind === activeTab) return;
+  activeTab = kind;
+  browser.storage.local.set({ contentTab: kind });
+  contentSearchEl.placeholder = `Search ${TAB_LABELS[kind]}…`;
+  renderContent();
+  if (!tabState[kind].rows && !tabState[kind].loading) loadTab(kind);
+};
+
+contentSearchEl.addEventListener("input", renderContent);
+contentSearchEl.addEventListener("search", renderContent);
+refreshContentBtn.addEventListener("click", () => loadTab(activeTab));
+
+contentTabsEl.addEventListener("click", (e) => {
+  const btn = e.target.closest(".tab");
+  if (btn) selectTab(btn.dataset.kind);
+});
 
 const showHotkeyError = (msg, level = "error") => {
   hotkeyErrorEl.textContent = msg;
@@ -498,6 +738,7 @@ browser.storage.local
     "skipWord",
     "workingDomain",
     "hotkeyBindings",
+    "contentTab",
   ])
   .then((state) => {
     renderLayer(state.selectedLayer || null);
@@ -510,8 +751,12 @@ browser.storage.local
     workingDomain = state.workingDomain || "";
     workingDomainEl.value = workingDomain;
     hotkeyBindings = mergeWithDefaults(state.hotkeyBindings || null);
+    if (ALL_KINDS.includes(state.contentTab)) activeTab = state.contentTab;
+    contentSearchEl.placeholder = `Search ${TAB_LABELS[activeTab]}…`;
     renderHotkeys();
-    loadTemplates();
+    // Only the tab that is actually on screen. The other two load the first
+    // time they are opened, if they ever are.
+    loadTab(activeTab);
   });
 
 browser.storage.onChanged.addListener((changes, area) => {
@@ -542,8 +787,9 @@ browser.storage.onChanged.addListener((changes, area) => {
     if (document.activeElement !== workingDomainEl) {
       workingDomainEl.value = workingDomain;
     }
-    // The Edit links are built from it, so they have to be rebuilt with it.
-    renderTemplates();
+    // The Edit and View links are built from it, so they have to be rebuilt
+    // with it.
+    renderContent();
   }
   if (changes.hotkeyBindings) {
     hotkeyBindings = mergeWithDefaults(changes.hotkeyBindings.newValue || null);

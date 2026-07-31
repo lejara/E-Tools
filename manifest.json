@@ -53,6 +53,9 @@
         "Tools/template-insert.js",
         "Tools/template-decouple.js",
         "Tools/overlay.js",
+        "Tools/wp-rest.js",
+        "Tools/admin-templates.js",
+        "Tools/wp-pages.js",
         "hotkey-defaults.js",
         "hotkeys.js"
       ],

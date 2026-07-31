@@ -850,6 +850,13 @@
       const list = Array.isArray(raw) ? raw : Object.values(raw || {});
       // Field names vary across Elementor versions, so take the first of
       // several candidates and return the raw key list for diagnosis.
+      //
+      // This mapping is duplicated as normalizeTemplateList in
+      // template-format.js, which Tools/admin-templates.js uses to answer the
+      // same request from wp-admin. It has to be: this file is injected into
+      // the page world and cannot read a content-script global — the same
+      // boundary that keeps the template-tag regex out of here. Change one,
+      // change both.
       const templates = list.map((t) => ({
         templateId: t.template_id,
         title: t.title,

@@ -126,6 +126,42 @@
         width: 100%;
         box-sizing: border-box;
       }
+      .content-tabs {
+        margin-top: 8px;
+        display: flex;
+        gap: 2px;
+        border-bottom: 1px solid #2a2a2a;
+      }
+      .tab {
+        flex: 1 1 0;
+        background: transparent;
+        color: #888;
+        border: 0;
+        border-bottom: 2px solid transparent;
+        padding: 5px 6px;
+        margin-bottom: -1px;
+        font: inherit;
+        font-size: 10px;
+        text-transform: uppercase;
+        letter-spacing: 0.4px;
+        cursor: pointer;
+      }
+      .tab:hover {
+        color: #bbb;
+      }
+      .tab[aria-selected="true"] {
+        color: #cddaff;
+        border-bottom-color: #7a9cff;
+      }
+      .tab .count {
+        color: #666;
+        font-size: 9px;
+        margin-left: 4px;
+        letter-spacing: 0;
+      }
+      .tab[aria-selected="true"] .count {
+        color: #7a9cff;
+      }
       .templates-status {
         margin-top: 5px;
         font-size: 10px;
@@ -179,6 +215,24 @@
         font-family: ui-monospace, monospace;
         flex: 0 0 auto;
         margin-top: 2px;
+      }
+      /* The same "— Elementor" flag wp-admin's posts table shows. */
+      .template .badge {
+        flex: 0 0 auto;
+        margin-top: 2px;
+        font-size: 9px;
+        letter-spacing: 0.3px;
+        text-transform: uppercase;
+        color: #9db4ff;
+        border: 1px solid #39456b;
+        border-radius: 3px;
+        padding: 0 4px;
+        white-space: nowrap;
+      }
+      .template .row-actions {
+        flex: 0 0 auto;
+        display: flex;
+        gap: 4px;
       }
       button.edit {
         flex: 0 0 auto;
@@ -391,21 +445,50 @@
       >
     </div>
     <div class="templates-header">
-      <h1>Site Templates</h1>
-      <button id="refresh-templates" class="clear" type="button">
-        Refresh
+      <h1>Site Content</h1>
+      <button id="refresh-content" class="clear" type="button">
+        Refresh Templates
+      </button>
+    </div>
+    <div class="content-tabs" id="content-tabs" role="tablist">
+      <button
+        class="tab"
+        type="button"
+        role="tab"
+        data-kind="template"
+        aria-selected="true"
+      >
+        Templates
+      </button>
+      <button
+        class="tab"
+        type="button"
+        role="tab"
+        data-kind="page"
+        aria-selected="false"
+      >
+        Pages
+      </button>
+      <button
+        class="tab"
+        type="button"
+        role="tab"
+        data-kind="other"
+        aria-selected="false"
+      >
+        Other
       </button>
     </div>
     <input
-      id="template-search"
+      id="content-search"
       type="search"
       class="text-input templates-search"
       placeholder="Search templates…"
       spellcheck="false"
       autocomplete="off"
     />
-    <div id="template-status" class="templates-status"></div>
-    <div id="templates" class="templates">
+    <div id="content-status" class="templates-status"></div>
+    <div id="content" class="templates">
       <div class="empty">Not loaded</div>
     </div>
     <div class="logs-header">
