@@ -66,7 +66,7 @@ Tick state is tracked as the set of *unticked* items keyed on identity, so an it
 
 `callBridge(op, payload, { timeout, waitLimit, onWait })` — default timeout is 3s. Ops that hit the network (`insert-template`, `list-templates`, `prefetch-templates`) pass 15s or more.
 
-Ops: `ping` · `copy` · `paste-style` · `apply-style-pairs` · `paste` · `delete` · `rename` · `create-element` · `insert-template` · `prefetch-templates` · `list-templates` · `describe-tree` · `describe-selection` · `list-containers` · `list-template-widgets` · `history-start` / `history-end`.
+Ops: `ping` · `copy` · `paste-style` · `apply-style-pairs` · `apply-advanced-settings` · `paste` · `delete` · `rename` · `create-element` · `insert-template` · `prefetch-templates` · `list-templates` · `describe-tree` · `describe-selection` · `list-containers` · `list-template-widgets` · `history-start` / `history-end`.
 
 ### `create-element` is the cheap path, and the linked one
 
@@ -120,7 +120,19 @@ Preload failure is non-fatal by design — that template's own insert fetches it
 
 `describe-selection` reports the editor's current selection: id, name, type, `canHoldChildren`, parent, index. It tries `elementor.selection`, then the panel's edited element, then the navigator's editing row, and returns which one answered in `via` — the navigator alone would mean the tool only works with the navigator open. The document root is never a selection; some versions report it when nothing is selected, so a candidate with no parent is skipped.
 
-`list-template-widgets` is the only op that reads a widget's `settings`. Everything else describes structure; the Template widget's whole identity is `settings.template_id`, so it needs its own walk.
+`list-template-widgets` is the only op that reads a widget's `settings`. Everything else describes structure; the Template widget's whole identity is `settings.template_id`, so it needs its own walk. It also returns the widget's **Advanced tab** as `advanced` — see below.
+
+### Transferring an Advanced tab
+
+`apply-advanced-settings` writes one element's Advanced tab onto the elements that replaced it. `template-decouple.js` is the caller: a Template widget's own padding, CSS classes, motion effects and so on are **not in the template's content**, so a plain content swap drops them.
+
+- **Captured at scan time, in `list-template-widgets`.** `replace-container` deletes the widget, so by the time there is somewhere to put these values the element holding them is gone. `advancedSettings()` diffs `settings.toJSON()` against `settings.defaults` and keeps only what the user actually moved — a widget carries ~550 advanced controls and all but a handful are untouched, which is what makes it cheap enough to ride along with every scan.
+- **Keys are resolved against the *target's* live control list, not a mapping table.** Widgets prefix advanced controls with an underscore and containers mostly don't (`_padding` → `padding`). Reading the schema is what keeps this working across Elementor versions.
+- **The lookup spans every tab on the target.** A widget's `_background_*` sits under Advanced while a container's `background_*` sits under Style; filtering the target by tab loses ~245 keys that map perfectly well. This is the easy mistake here.
+- **The control `type` travels with the value** because the source is deleted before the write. A key that resolves to a different type is dropped rather than written — same name, different value shape. Measured on Elementor 4.2.1: 499 of a Template widget's 553 advanced controls resolve onto a container with **zero** type mismatches. The rest (`_mask_*`, `_element_width`, `_element_vertical_align`) have no container twin and come back in `dropped` for the caller to report.
+- **`_title` and `_element_cache` are never transferred.** `_title` is the navigator label and the decouple writes its own tagged name there.
+- **Default render, unlike `rename`.** These controls carry selectors, so the model change alone leaves the preview stale — `render: false` would put the padding in the model and nowhere on screen. `options.external` still stays off, for the reason documented on `rename`.
+- **Multi-root: `_element_id` is dropped, everything else repeats.** Several siblings land where one widget stood; repeating spacing across them is a judgement call the modal warns about, but the same CSS ID on three elements is three duplicate DOM ids. The toggle is **on by default** — decoupling is meant to produce the same block, unlinked, and silently losing the widget's box was the gap this closes.
 
 `history-start`/`history-end` wrap a burst of `$e.run` calls in one undo step via `document/history/start-log`. Both degrade to no-ops (`logId: null`) rather than failing the caller.
 
@@ -184,6 +196,7 @@ Add an operation by extending `OPS`, not by forking the pipeline.
 - **Placement** reuses `replace-container` rather than importing at a chosen index. The index is resolved page-side from the widget's own id at the moment of the swap, so earlier swaps shifting its siblings cannot misplace it. Two Template widgets sitting side by side in one container is the normal case, not an edge case.
 - **Grouped by template, not by widget.** Several widgets routinely point at one template — three cards holding the same button, say. The template is inserted once as a staging copy, pasted into each target, and deleted in a `finally`. One network fetch per distinct template, not per widget.
 - **The decoupled content is named and tagged** `<template title> #<tag>`. Decoupling is what destroys `settings.template_id`, so the tag is the only remaining trace of where the content came from — and it is what lets `template-sync` still find and re-style the block. The name is the library title; the widget's own layer name only stands in when the library fetch failed and there is no title to use. A multi-root template lands several siblings in the widget's place, so each takes its root index and they stay individually addressable.
+- **The widget's Advanced tab comes with it** — padding, margin, z-index, CSS classes, motion effects. None of that lives in the template's content, so without this a decoupled block loses the box it sat in. A toggle in the confirm modal, **on by default**; the mechanics are `apply-advanced-settings`, above. Non-fatal by design: the content has already landed and the widget is already gone, so a failure degrades the row rather than failing the run.
 - **Skip word** applies to the widget's own layer name, so a single widget can be held back without unticking it every run.
 - **Nested Template widgets are left alone, by design.** Decoupled content can itself contain Template widgets; the run re-scans afterwards, reports anything carrying an id it hadn't seen before, and stops. A second keypress is safer than a recursive walk that a self-referencing template would send round forever.
 

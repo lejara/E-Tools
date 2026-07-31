@@ -55,6 +55,68 @@
     return labels;
   };
 
+  // Push the widget's Advanced tab onto whatever replaced it, and return the
+  // fragment the caller appends to its row. The key mapping (_padding→padding
+  // and the rest) is the bridge's job — it needs the target's live control
+  // schema, which only the page world can read.
+  //
+  // Never fatal: the content is already in place and the widget is already
+  // gone, so a failure here is a degraded decouple, not a broken one.
+  const carryOverAdvanced = async (modal, advanced, newIds, multi, tally) => {
+    const entries = advanced || [];
+    if (!entries.length || !newIds.length) return "";
+
+    // A multi-root template lands several siblings where one widget stood.
+    // Repeating spacing across them is a judgement call the modal warns about,
+    // but repeating a CSS ID is not — the same _element_id on three elements is
+    // three duplicate DOM ids, which is invalid whatever the intent was.
+    const payload = multi
+      ? entries.filter((e) => e.key !== "_element_id")
+      : entries;
+    if (!payload.length) return "";
+
+    // A mutation, so it is waited on rather than re-sent; unlike an insert a
+    // called-off wait leaves nothing orphaned behind.
+    const res = await ns.callBridge(
+      "apply-advanced-settings",
+      { items: newIds.map((id) => ({ id, settings: payload })) },
+      { waitLimit: 3 },
+    );
+    if (!res?.ok) {
+      ns.log("warn", `Template decouple: advanced settings — ${res?.error}`);
+      return ` · advanced failed (${res?.error})`;
+    }
+
+    // Every root gets the same payload, so report the distinct keys rather than
+    // counting the same setting once per sibling.
+    const applied = new Set();
+    const dropped = new Map();
+    for (const r of res.results || []) {
+      for (const k of r.applied || []) applied.add(k);
+      for (const d of r.dropped || []) dropped.set(d.key, d.why);
+    }
+    tally.advanced += applied.size;
+
+    if (dropped.size) {
+      for (const [key, why] of dropped) {
+        modal.note(`    ⚠ Advanced "${key}" not transferred — ${why}`, "warn");
+      }
+    }
+    if (multi && applied.size) {
+      modal.note(
+        `    ⚠ the template has ${newIds.length} roots, so the widget's Advanced ` +
+          `settings were copied onto each of them — spacing is worth a look`,
+        "warn",
+      );
+    }
+
+    if (!applied.size) return ` · advanced: nothing transferable`;
+    return (
+      ` · advanced: ${applied.size} setting(s)` +
+      (dropped.size ? `, ${dropped.size} dropped` : "")
+    );
+  };
+
   const decoupleTemplates = async () => {
     if (running) {
       ns.log("warn", "Template decouple: already running");
@@ -133,15 +195,28 @@
           `leave linked — decoupling swaps the widget for a copy of the ` +
           `template's content, which then stops tracking the template.`,
       );
-      const selected = await modal.choose(
-        candidates,
-        (w) => labels.get(w.id),
-        "Decouple",
-      );
-      if (!selected) {
+      const chosen = await modal.choose({
+        buildItems: () => candidates,
+        labelOf: (w) => labels.get(w.id),
+        buttonText: "Decouple",
+        toggles: [
+          {
+            key: "advanced",
+            label: "Carry over each widget's Advanced tab",
+            default: true,
+            hint: "padding, margin, z-index, CSS classes, motion effects — none of which live in the template's content",
+          },
+        ],
+      });
+      if (!chosen) {
         ns.log("info", "Template decouple: cancelled");
         modal.close();
         return;
+      }
+      const selected = chosen.items;
+      const carryAdvanced = !!chosen.toggles.advanced;
+      if (!carryAdvanced) {
+        modal.note("· Advanced tab left behind — content only");
       }
       if (selected.length < candidates.length) {
         modal.note(
@@ -197,7 +272,7 @@
       );
       logId = historyRes?.ok ? historyRes.logId : null;
 
-      const tally = { done: 0, failed: 0, nodes: 0 };
+      const tally = { done: 0, failed: 0, nodes: 0, advanced: 0 };
 
       for (const [templateId, members] of groups) {
         const meta = titleById.get(templateId);
@@ -265,6 +340,20 @@
             // its root index and they stay individually addressable.
             const newIds = res.ids || (res.id ? [res.id] : []);
             const multi = newIds.length > 1;
+
+            // The template's content says nothing about the box the widget sat
+            // in — its padding, CSS classes, motion effects and the rest live on
+            // the widget, and the replace above just deleted it. Captured at
+            // scan time for exactly that reason; written here, inside the same
+            // undo step.
+            const advNote = await carryOverAdvanced(
+              modal,
+              carryAdvanced ? w.advanced : null,
+              newIds,
+              multi,
+              tally,
+            );
+
             const items = newIds
               .map((id, k) => ({
                 id,
@@ -292,7 +381,7 @@
             modal.setRow(
               w.id,
               "ok",
-              `decoupled — ${stagedIds.length} root(s), ${nodes} node(s)${namedNote}`,
+              `decoupled — ${stagedIds.length} root(s), ${nodes} node(s)${advNote}${namedNote}`,
             );
           }
         } finally {
@@ -338,6 +427,7 @@
 
       const summary =
         `${tally.done} decoupled (${tally.nodes} node(s)), ${tally.failed} failed` +
+        (tally.advanced ? `, ${tally.advanced} advanced setting(s) carried over` : "") +
         (fresh.length ? `, ${fresh.length} nested left alone` : "");
       ns.log(tally.done ? "info" : "warn", `Template decouple: ${summary}`);
       modal.finish(summary, tally.failed || fresh.length ? "warn" : "ok");

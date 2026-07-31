@@ -50,6 +50,51 @@
     children: childContainers(container).map(describeContainer),
   });
 
+  // Controls that structure the Advanced tab rather than hold a value.
+  const ADVANCED_LAYOUT_TYPES = new Set([
+    "section",
+    "tab",
+    "tabs",
+    "raw_html",
+    "heading",
+    "divider",
+    "deprecated_notice",
+    "notice",
+    "alert",
+  ]);
+
+  // _title is the navigator label, and template-decouple names its own output —
+  // transferring it would clobber the template tag. _element_cache is widget-only
+  // and has no container twin; naming it here says so rather than leaving it to
+  // look like an accidental drop.
+  const NEVER_TRANSFER = new Set(["_title", "_element_cache"]);
+
+  // The Advanced tab, as data. Only controls the user actually moved off their
+  // default are returned: a widget carries ~550 advanced controls and all but a
+  // handful are untouched, so the diff against `defaults` is what keeps this
+  // small enough to ride along with every scan.
+  //
+  // The control's `type` travels with the value because the source element is
+  // deleted before the value is ever written — apply-advanced-settings has no
+  // other way to check that the key it resolves to on the target holds the same
+  // shape.
+  const advancedSettings = (container) => {
+    const controls = container?.settings?.controls || {};
+    const current = container?.settings?.toJSON?.() || {};
+    const defaults = container?.settings?.defaults || {};
+    const out = [];
+    for (const [key, def] of Object.entries(controls)) {
+      if ((def?.tab || "") !== "advanced") continue;
+      if (ADVANCED_LAYOUT_TYPES.has(def?.type)) continue;
+      if (NEVER_TRANSFER.has(key)) continue;
+      if (JSON.stringify(current[key]) === JSON.stringify(defaults[key])) {
+        continue;
+      }
+      out.push({ key, type: def?.type || null, value: current[key] });
+    }
+    return out;
+  };
+
   // Element types that can take children. A widget cannot, which is what
   // decides between "insert inside this" and "insert after this".
   const CHILD_BEARING = new Set(["container", "section", "column"]);
@@ -374,6 +419,73 @@
         unchanged,
       };
     },
+    // Write one element's Advanced tab (as captured by advancedSettings) onto
+    // the elements that replaced it. template-decouple is the caller: the
+    // Template widget it swaps out carries its own padding, CSS classes, motion
+    // effects and so on, and none of that is in the template's content.
+    //
+    // Widgets prefix their advanced controls with an underscore and containers
+    // mostly do not — _padding vs padding — so each key is resolved against the
+    // TARGET's own control list. Two things about that lookup matter:
+    //
+    //  - It spans every tab, not just the target's advanced one. A widget's
+    //    _background_* sits under Advanced while a container's background_*
+    //    sits under Style, and filtering the target by tab loses ~245 keys that
+    //    map perfectly well.
+    //  - It reads the live schema instead of consulting a hand-written mapping
+    //    table, which is what keeps it standing up across Elementor versions.
+    //
+    // A key that resolves to a control of a different type is dropped: same
+    // name, different value shape, and writing it would put garbage in the
+    // model. Measured against Elementor 4.2.1, 499 of a Template widget's 553
+    // advanced controls resolve onto a container with zero type mismatches; the
+    // rest (mask, _element_width and friends) genuinely have no container twin,
+    // so they come back in `dropped` for the caller to report.
+    "apply-advanced-settings": async ({ items }) => {
+      const list = Array.isArray(items) ? items : [];
+      const results = [];
+      for (const item of list) {
+        const target = getContainer(item.id);
+        const controls = target.settings?.controls || {};
+        const settings = {};
+        const applied = [];
+        const dropped = [];
+        for (const entry of item.settings || []) {
+          const key = entry?.key;
+          if (!key) continue;
+          const mapped = controls[key]
+            ? key
+            : key.startsWith("_") && controls[key.slice(1)]
+              ? key.slice(1)
+              : null;
+          if (!mapped) {
+            dropped.push({ key, why: "no matching control on the target" });
+            continue;
+          }
+          const targetType = controls[mapped]?.type;
+          if (entry.type && targetType && targetType !== entry.type) {
+            dropped.push({
+              key,
+              why: `type mismatch (${entry.type} vs ${targetType})`,
+            });
+            continue;
+          }
+          settings[mapped] = entry.value;
+          applied.push(mapped);
+        }
+        // Unlike rename, these controls carry selectors, so the model change on
+        // its own would leave the preview stale — the default render is wanted
+        // here. options.external still stays off, for the reason on rename.
+        if (applied.length) {
+          await runCommand("document/elements/settings", {
+            containers: [target],
+            settings,
+          });
+        }
+        results.push({ id: item.id, applied, dropped });
+      }
+      return { results };
+    },
     // Warm templateContentCache for a whole batch, several requests in flight at
     // once. This is the only part of a batch insert that can genuinely overlap:
     // the imports that follow share one clipboard and one document, so they stay
@@ -630,9 +742,10 @@
     // top-level container, so the caller filters rather than needing a
     // second op for the shallow case.
     // Every Elementor Pro Template widget in the document, wherever it sits.
-    // Separate from list-containers because the thing that matters here lives
-    // in settings.template_id, which no other op reads. The model stores it as
-    // a string; it is normalised to one so callers can key on it safely.
+    // Separate from list-containers because the things that matter here live in
+    // settings — template_id, and the widget's own Advanced tab — which no other
+    // op reads. The model stores template_id as a string; it is normalised to
+    // one so callers can key on it safely.
     "list-template-widgets": async () => {
       if (typeof window.elementor?.getPreviewContainer !== "function") {
         throw new Error("elementor.getPreviewContainer is unavailable");
@@ -655,6 +768,12 @@
                   ? null
                   : String(raw),
               title: containerTitle(child),
+              // Captured here, at scan time, because replace-container deletes
+              // the widget — by the time there is somewhere to put these the
+              // element that holds them is gone. The default-diff keeps it to
+              // the handful of controls actually set, so carrying it on every
+              // scan costs next to nothing.
+              advanced: advancedSettings(child),
               parentId: container.id,
               parentTitle: containerTitle(container),
               index,
