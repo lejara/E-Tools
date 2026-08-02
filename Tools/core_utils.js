@@ -954,6 +954,10 @@
   ns.openProgressModal = openProgressModal;
   ns.MODAL_STATE_COLORS = STATE_COLORS;
   ns.callBridge = callBridge;
+  // Exposed so a tool listening for the bridge's unsolicited __event messages
+  // (pure-container-reset.js) matches on the same namespace this file sends and
+  // receives on, rather than repeating the literal a third time.
+  ns.BRIDGE_NS = NS;
   ns.insertSiteTemplate = insertSiteTemplate;
   ns.createTemplateWidget = createTemplateWidget;
   ns.createContainer = createContainer;

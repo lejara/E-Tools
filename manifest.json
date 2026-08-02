@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "Elementor Tools",
-  "version": "2.4.2",
+  "version": "2.4.3",
   "description": "Time is an Element",
   "browser_specific_settings": {
     "gecko": {
@@ -46,6 +46,8 @@
         "animation-preset-fields.js",
         "Tools/core_utils.js",
         "Tools/multi-select.js",
+        "Tools/pure-container-reset.js",
+        "Tools/breakpoint-flyout.js",
         "Tools/animation-presets.js",
         "Tools/layer-root-finder.js",
         "Tools/replace-styles.js",
@@ -69,6 +71,7 @@
     {
       "resources": [
         "Tools/page-bridge.js",
+        "Tools/breakpoint-flyout-page.js",
         "assets/Froggy.gif",
         "assets/Froggy1.png"
       ],

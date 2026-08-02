@@ -2,6 +2,15 @@ const EMPTY_TEXT = "No layer selected";
 // Mirrors DEFAULT_SKIP_WORD in Tools/core_utils.js — the panel does not load
 // content scripts, so the default is stated in both places. Keep them in sync.
 const DEFAULT_SKIP_WORD = "skip";
+// Mirrors DEFAULT_PURE_CONTAINER_RESET in Tools/pure-container-reset.js, for the
+// same reason as the skip word above. On by default: zeroing a fresh container's
+// box is the whole point of the option, and a stored `undefined` means the user
+// has never touched it rather than having turned it off.
+const DEFAULT_PURE_CONTAINER_RESET = true;
+// Mirrors DEFAULT_UNLINK_NEW_ELEMENTS in Tools/pure-container-reset.js. On by
+// default for the same reason: the option exists because the linked default is
+// the wrong one to start from, so shipping it off would be shipping it unused.
+const DEFAULT_UNLINK_NEW_ELEMENTS = true;
 const titleEl = document.getElementById("title");
 const metaEl = document.getElementById("meta");
 const clearBtn = document.getElementById("clear");
@@ -10,6 +19,10 @@ const clearLogsBtn = document.getElementById("clear-logs");
 const replaceChildrenEl = document.getElementById("opt-replace-children");
 const overlayEl = document.getElementById("opt-overlay");
 const overlayFroggyEl = document.getElementById("opt-overlay-froggy");
+const pureContainerResetEl = document.getElementById(
+  "opt-pure-container-reset",
+);
+const unlinkNewEl = document.getElementById("opt-unlink-new");
 const skipWordEl = document.getElementById("opt-skip-word");
 const workingDomainEl = document.getElementById("opt-working-domain");
 const contentEl = document.getElementById("content");
@@ -114,7 +127,9 @@ clearLogsBtn.addEventListener("click", () => {
 });
 
 replaceChildrenEl.addEventListener("change", () => {
-  browser.storage.local.set({ replaceChildrenStyles: replaceChildrenEl.checked });
+  browser.storage.local.set({
+    replaceChildrenStyles: replaceChildrenEl.checked,
+  });
 });
 
 overlayEl.addEventListener("change", () => {
@@ -123,6 +138,16 @@ overlayEl.addEventListener("change", () => {
 
 overlayFroggyEl.addEventListener("change", () => {
   browser.storage.local.set({ overlayFroggy: overlayFroggyEl.checked });
+});
+
+pureContainerResetEl.addEventListener("change", () => {
+  browser.storage.local.set({
+    pureContainerReset: pureContainerResetEl.checked,
+  });
+});
+
+unlinkNewEl.addEventListener("change", () => {
+  browser.storage.local.set({ unlinkNewElements: unlinkNewEl.checked });
 });
 
 skipWordEl.addEventListener("change", () => {
@@ -300,9 +325,7 @@ const activeItems = () => {
   if (!rows) return null;
   return rows
     .map((raw) => asRow(raw, activeTab))
-    .sort((a, b) =>
-      String(a.title || "").localeCompare(String(b.title || "")),
-    );
+    .sort((a, b) => String(a.title || "").localeCompare(String(b.title || "")));
 };
 
 const renderContentStatus = (shown, total) => {
@@ -520,7 +543,8 @@ const loadTab = async (kind) => {
     } else if (!reply.ok) {
       state.error = reply.error;
     } else {
-      state.rows = kind === "template" ? reply.templates || [] : reply.posts || [];
+      state.rows =
+        kind === "template" ? reply.templates || [] : reply.posts || [];
       // Per-type failures and truncation are reported, never silent: a list
       // that quietly dropped a post type reads as "that type has nothing in it".
       state.warnings = reply.warnings || [];
@@ -689,7 +713,9 @@ const deletePreset = async (preset) => {
   disarm();
   await savePresets();
   renderPresets();
-  showPresetStatus(`Deleted "${preset.name}" — export first if you want it back`);
+  showPresetStatus(
+    `Deleted "${preset.name}" — export first if you want it back`,
+  );
 };
 
 // New and Replace both capture off the selection, so the request and its
@@ -725,7 +751,10 @@ const replacePreset = async (preset) => {
       showPresetStatus("That preset is no longer in the list", "error");
       return;
     }
-    const captured = presetFields.presetFromValues(reply.values, presets[at].name);
+    const captured = presetFields.presetFromValues(
+      reply.values,
+      presets[at].name,
+    );
     presets[at] = { ...captured, id: preset.id, name: presets[at].name };
     await savePresets();
     renderPresets();
@@ -945,7 +974,10 @@ presetFileEl.addEventListener("change", async () => {
   try {
     text = await file.text();
   } catch (err) {
-    showPresetStatus(`Could not read that file — ${err?.message || err}`, "error");
+    showPresetStatus(
+      `Could not read that file — ${err?.message || err}`,
+      "error",
+    );
     return;
   }
   const res = presetFields.parsePreset(text);
@@ -961,9 +993,7 @@ presetFileEl.addEventListener("change", async () => {
   renderPresets();
   showPresetStatus(
     [
-      replaced
-        ? `Replaced "${res.preset.name}"`
-        : `Added "${res.preset.name}"`,
+      replaced ? `Replaced "${res.preset.name}"` : `Added "${res.preset.name}"`,
       ...(res.warnings || []),
     ].join(" · "),
   );
@@ -1001,7 +1031,9 @@ const runHotkeyAction = async (action, btn) => {
       action: action.id,
     });
     if (!reply) {
-      showHotkeyError("No Elementor editor tab open — open one, then try again.");
+      showHotkeyError(
+        "No Elementor editor tab open — open one, then try again.",
+      );
     } else if (!reply.ok) {
       showHotkeyError(`Could not run "${action.label}" — ${reply.error}`);
     } else {
@@ -1161,6 +1193,8 @@ browser.storage.local
     "replaceChildrenStyles",
     "overlayEnabled",
     "overlayFroggy",
+    "pureContainerReset",
+    "unlinkNewElements",
     "skipWord",
     "workingDomain",
     "hotkeyBindings",
@@ -1174,6 +1208,14 @@ browser.storage.local
     replaceChildrenEl.checked = !!state.replaceChildrenStyles;
     overlayEl.checked = !!state.overlayEnabled;
     overlayFroggyEl.checked = !!state.overlayFroggy;
+    pureContainerResetEl.checked =
+      state.pureContainerReset === undefined
+        ? DEFAULT_PURE_CONTAINER_RESET
+        : !!state.pureContainerReset;
+    unlinkNewEl.checked =
+      state.unlinkNewElements === undefined
+        ? DEFAULT_UNLINK_NEW_ELEMENTS
+        : !!state.unlinkNewElements;
     skipWordEl.value =
       state.skipWord === undefined ? DEFAULT_SKIP_WORD : state.skipWord;
     workingDomain = state.workingDomain || "";
@@ -1208,6 +1250,18 @@ browser.storage.onChanged.addListener((changes, area) => {
   }
   if (changes.overlayFroggy) {
     overlayFroggyEl.checked = !!changes.overlayFroggy.newValue;
+  }
+  if (changes.pureContainerReset) {
+    pureContainerResetEl.checked =
+      changes.pureContainerReset.newValue === undefined
+        ? DEFAULT_PURE_CONTAINER_RESET
+        : !!changes.pureContainerReset.newValue;
+  }
+  if (changes.unlinkNewElements) {
+    unlinkNewEl.checked =
+      changes.unlinkNewElements.newValue === undefined
+        ? DEFAULT_UNLINK_NEW_ELEMENTS
+        : !!changes.unlinkNewElements.newValue;
   }
   if (changes.skipWord && document.activeElement !== skipWordEl) {
     skipWordEl.value =

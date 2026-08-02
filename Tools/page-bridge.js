@@ -11,8 +11,19 @@
     );
   };
 
+  // A one-way page → content-script notification, for something that happens
+  // without anyone having asked. Every other message here answers a request and
+  // carries its requestId; the pure-reset hook fires off an Elementor command
+  // instead, so it has nothing to answer on and needs its own channel.
+  const emit = (event, detail) => {
+    window.postMessage({ __ns: NS, __event: event, ...detail }, "*");
+  };
+
   const getContainer = (id) => {
-    if (!window.elementor || typeof window.elementor.getContainer !== "function") {
+    if (
+      !window.elementor ||
+      typeof window.elementor.getContainer !== "function"
+    ) {
       throw new Error("elementor.getContainer is unavailable");
     }
     const c = window.elementor.getContainer(id);
@@ -79,7 +90,8 @@
   const resolveControlKey = (controls, key) => {
     if (!key) return null;
     if (controls[key]) return key;
-    if (key.startsWith("_")) return controls[key.slice(1)] ? key.slice(1) : null;
+    if (key.startsWith("_"))
+      return controls[key.slice(1)] ? key.slice(1) : null;
     return controls[`_${key}`] ? `_${key}` : null;
   };
 
@@ -153,7 +165,9 @@
   // that template for the lifetime of the page.
   const getTemplateData = (source, templateId, withPageSettings) => {
     if (!window.elementor?.templates?.requestTemplateContent) {
-      throw new Error("elementor.templates.requestTemplateContent is unavailable");
+      throw new Error(
+        "elementor.templates.requestTemplateContent is unavailable",
+      );
     }
     const cacheKey = `${source}:${templateId}:${withPageSettings ? 1 : 0}`;
     let cached = templateContentCache.get(cacheKey);
@@ -280,8 +294,272 @@
     return movedIds;
   };
 
+  /* ---------------------------------------------- pure container reset */
+
+  // Zeroing a fresh container's box is a *reaction* to an Elementor command
+  // rather than a request, so it hangs off $e.hooks and lives here: a hook fires
+  // inside the page world and a content script cannot be on the other end of
+  // one. Tools/pure-container-reset.js owns nothing but the on/off flag.
+
+  let pureResetEnabled = false;
+  // The second, independent option riding the same create hook: force the "link
+  // values together" button off. Separate flag rather than a mode of the reset,
+  // because the two have different scopes — the reset is about a container's box,
+  // this is about every control that has the button.
+  let unlinkNewEnabled = false;
+  let pureResetHook = null;
+  let pureResetError = null;
+
+  // Every route that produces a container by *copying* an existing one, and the
+  // reason the hook can tell a fresh container from a copied one at all.
+  //
+  // All of them funnel through document/elements/create — measured on this
+  // build, a paste fires create with elType "container" and
+  // "document/elements/paste" sitting in $e.commands.currentTrace. So the trace
+  // is the test, and it is exact. The tempting alternative — inferring it from
+  // whether the spacing is still at its defaults — would zero a pasted
+  // container that happened to have no spacing set, which is precisely the case
+  // "don't touch what I pasted" exists to protect.
+  const COPY_COMMANDS = new Set([
+    "document/elements/paste",
+    "document/elements/import",
+    "document/elements/duplicate",
+    "document/elements/paste-area",
+    "document/ui/paste",
+    "document/ui/duplicate",
+    "editor/browser-import/import",
+  ]);
+
+  // This extension's own creates. createContainer builds the wrapper a
+  // widget-mode batch insert needs somewhere to put its widgets, and that is not
+  // the user adding a container — so it is held out rather than being zeroed as
+  // a side effect of a template run. Every *other* tool here reaches the
+  // document through paste or import, which COPY_COMMANDS already covers.
+  let pureResetSuppressed = 0;
+
+  // The zero value for a box control, by control type. A dimensions control and
+  // a gaps control take different shapes, and writing one into the other puts
+  // garbage in the model.
+  //
+  // "0" rather than "": empty means "inherit whatever the kit or theme says",
+  // which is the default this feature exists to override.
+  // isLinked is deliberately absent here: it is the *other* option's business, and
+  // one place decides it (createSettings) so the two cannot disagree. Asserting
+  // `true` here — which this did — would quietly re-link a control every time the
+  // user dropped an element, whatever the unlink option said.
+  const BOX_ZEROS = {
+    dimensions: { unit: "px", top: "0", right: "0", bottom: "0", left: "0" },
+    gaps: { unit: "px", column: "0", row: "0" },
+  };
+
+  // The control types that carry the "link values together" button. Measured on
+  // this build, a container has 30 `dimensions` and 10 `gaps` controls and every
+  // one of them holds isLinked — so the button is a property of the *type*, which
+  // is what makes it detectable without naming a single field.
+  //
+  // This is why widgets need no special case. A widget prefixes some of these
+  // controls with an underscore (`_padding` where a container has `padding`), and
+  // a name-based rule would need that mapping; a type-based one never sees it.
+  const LINKED_TYPES = new Set(["dimensions", "gaps"]);
+
+  // padding, margin and the container's gap, at every breakpoint — the trailing
+  // group is the responsive suffix (padding_tablet, flex_gap_mobile_extra…).
+  const BOX_CONTROL = /^(padding|margin|flex_gap|gap)(_[a-z_]+)?$/;
+
+  // Read off the element's own live control list, never a hardcoded table. Two
+  // things make that necessary rather than tidy:
+  //
+  //  - The responsive suffixes depend on which breakpoints the site has switched
+  //    on. This build carries tablet_extra and mobile_extra; a default install
+  //    does not. Hardcoding the common four would silently miss the others.
+  //  - A container's gap control is `flex_gap` (type "gaps"), while section and
+  //    column markup carries a *different* control literally named `gap` — a
+  //    select holding "default"/"narrow"/"extended". The type gate is what keeps
+  //    that one out: it has no entry in BOX_ZEROS, so it is skipped rather than
+  //    written with a dimensions value.
+  // Both options in one settings object, deliberately. They overlap — padding is
+  // a box control *and* a link-bearing one — and a control is a single value, so
+  // two commands would mean the second overwriting the first's work on the shared
+  // keys. One merged write is also one undo step instead of two.
+  const createSettings = (container, { zero, unlink }) => {
+    const controls = container?.settings?.controls || {};
+    const live = (key) => container?.settings?.get?.(key);
+    const settings = {};
+    let zeroed = 0;
+    let unlinked = 0;
+
+    for (const [key, def] of Object.entries(controls)) {
+      const type = def?.type;
+
+      // The zeroing keeps its own narrower scope: the box controls only.
+      if (zero && BOX_CONTROL.test(key) && BOX_ZEROS[type]) {
+        settings[key] = {
+          ...BOX_ZEROS[type],
+          // Carried, not asserted. With the unlink option off, zeroing a box must
+          // leave the link button exactly where the user left it.
+          isLinked: live(key)?.isLinked ?? def?.default?.isLinked ?? true,
+        };
+        zeroed += 1;
+      }
+
+      if (!unlink || !LINKED_TYPES.has(type)) continue;
+
+      // Whatever this run has already decided for the key, else the control's
+      // own current value — so a control the reset is not touching keeps its
+      // values and only the flag moves.
+      const value = settings[key] ?? live(key) ?? def?.default;
+      if (!value || typeof value !== "object") continue;
+      // Already unlinked and nothing else to write: leave the key out entirely
+      // rather than restating a value the element already holds.
+      if (value.isLinked === false && !settings[key]) continue;
+      settings[key] = { ...value, isLinked: false };
+      unlinked += 1;
+    }
+
+    return { settings, zeroed, unlinked };
+  };
+
+  // What to call the element in the log. A fresh one has no _title, and "widget"
+  // alone does not say which — the widgetType is the useful half.
+  const elementKind = (container) =>
+    container?.model?.get?.("widgetType") ||
+    container?.model?.get?.("elType") ||
+    "element";
+
+  const applyPureReset = async (id, flags) => {
+    let container;
+    try {
+      container = getContainer(id);
+    } catch (_) {
+      // Deleted again before the deferred write landed. Nothing was reset, but
+      // there is also no element left for that to be wrong about, so this is the
+      // one outcome that goes unreported.
+      return;
+    }
+    const kind = elementKind(container);
+    const title = containerTitle(container);
+    const { settings, zeroed, unlinked } = createSettings(container, flags);
+    if (!Object.keys(settings).length) {
+      emit("pure-reset", { id, title, kind, zeroed: 0, unlinked: 0 });
+      return;
+    }
+    try {
+      // Default render: these controls carry selectors, so the model change
+      // alone would leave the preview showing the old box. options.external
+      // stays off, for the reason documented on rename.
+      await runCommand("document/elements/settings", {
+        containers: [container],
+        settings,
+      });
+    } catch (err) {
+      emit("pure-reset", {
+        id,
+        title,
+        kind,
+        error: String(err?.message || err),
+      });
+      return;
+    }
+    emit("pure-reset", { id, title, kind, zeroed, unlinked });
+  };
+
+  const elTypeOf = (model) =>
+    typeof model?.get === "function" ? model.get("elType") : model?.elType;
+
+  // Which of the two options apply to the element being created. Read in
+  // getConditions and again in apply, from the model rather than from a live
+  // lookup — at getConditions time the element does not exist yet.
+  const hookFlagsFor = (model) => {
+    const zero = pureResetEnabled && elTypeOf(model) === "container";
+    const unlink = unlinkNewEnabled;
+    return { zero, unlink, any: zero || unlink };
+  };
+
+  const registerPureResetHook = () => {
+    if (pureResetHook) return false;
+    const After = window.$e?.modules?.hookData?.After;
+    if (
+      typeof After !== "function" ||
+      typeof window.$e?.hooks?.registerDataAfter !== "function"
+    ) {
+      pureResetError = "$e.hooks data-after API is unavailable";
+      return false;
+    }
+
+    class PureContainerReset extends After {
+      getCommand() {
+        return "document/elements/create";
+      }
+      getId() {
+        return "elementor-tools-pure-container-reset--document/elements/create";
+      }
+      getConditions(args) {
+        if (pureResetSuppressed > 0) return false;
+        // Two independent options ride this one hook, with different scopes: the
+        // zeroing is about a container's box and applies to containers only,
+        // while the unlink is about a button every element type has. Either one
+        // being applicable is reason enough to fire.
+        if (!hookFlagsFor(args?.model).any) return false;
+        // Nested containers need no special case: each one is its own create,
+        // so each gets its own hook fire.
+        const trace = window.$e?.commands?.currentTrace || [];
+        return !trace.some((cmd) => COPY_COMMANDS.has(cmd));
+      }
+      apply(args, result) {
+        const ids = createdIds(result);
+        if (!ids.length) return;
+        const flags = hookFlagsFor(args?.model);
+        // The decision is made above, synchronously, while the trace still says
+        // how this container came to exist. Only the *write* is deferred, and it
+        // has to be: running a settings command inline would fire while
+        // Elementor is still finishing the create it is reporting. By the time
+        // this callback runs currentTrace is empty, which is why the copy test
+        // cannot be moved down here.
+        //
+        // It therefore lands as its own undo step. That is accepted rather than
+        // worked around — grouping it with the create would mean holding a
+        // history log open across a deferral.
+        for (const id of ids) {
+          setTimeout(() => {
+            applyPureReset(id, flags).catch(() => {});
+          }, 0);
+        }
+      }
+    }
+
+    try {
+      pureResetHook = new PureContainerReset();
+      window.$e.hooks.registerDataAfter(pureResetHook);
+      pureResetError = null;
+      return true;
+    } catch (err) {
+      pureResetHook = null;
+      pureResetError = String(err?.message || err);
+      return false;
+    }
+  };
+
   const handlers = {
     ping: () => ({ ready: !!(window.$e && window.elementor) }),
+    // The panel's two create-hook checkboxes, pushed in together — one hook
+    // serves both, so one op configures both. The hook is attached on first
+    // contact and then left in place: its own getConditions reads these flags, so
+    // toggling an option costs nothing and cannot leave a half-removed hook
+    // behind. It stays attached when both go off, because getConditions then
+    // refuses everything anyway.
+    "configure-pure-reset": async ({ enabled, unlinkNew }) => {
+      pureResetEnabled = !!enabled;
+      unlinkNewEnabled = !!unlinkNew;
+      const wanted = pureResetEnabled || unlinkNewEnabled;
+      const justRegistered = wanted ? registerPureResetHook() : false;
+      return {
+        enabled: pureResetEnabled,
+        unlinkNew: unlinkNewEnabled,
+        registered: !!pureResetHook,
+        justRegistered,
+        registerError: pureResetError,
+      };
+    },
     copy: async ({ id }) => {
       await runCommand("document/elements/copy", {
         containers: [getContainer(id)],
@@ -521,7 +799,8 @@
         }
         values.push({
           key,
-          value: current[mapped] !== undefined ? current[mapped] : defaults[mapped],
+          value:
+            current[mapped] !== undefined ? current[mapped] : defaults[mapped],
         });
       }
       return {
@@ -637,7 +916,10 @@
           }
         }
       };
-      const lanes = Math.max(1, Math.min(Number(concurrency) || 1, list.length));
+      const lanes = Math.max(
+        1,
+        Math.min(Number(concurrency) || 1, list.length),
+      );
       await Promise.all(Array.from({ length: lanes }, worker));
       return { loaded, failed };
     },
@@ -654,7 +936,13 @@
     //
     // edit:false because a batch would otherwise open the panel once per element
     // and leave the last one selected, which is not what a batch insert means.
-    "create-element": async ({ elType, widgetType, settings, intoId, afterId }) => {
+    "create-element": async ({
+      elType,
+      widgetType,
+      settings,
+      intoId,
+      afterId,
+    }) => {
       if (!elType) throw new Error("elType is required");
       if (elType === "widget") {
         if (!widgetType) throw new Error("widgetType is required for a widget");
@@ -699,11 +987,21 @@
       if (widgetType) model.widgetType = widgetType;
       if (settings) model.settings = settings;
 
-      const result = await runCommand("document/elements/create", {
-        container,
-        model,
-        options: { edit: false, ...(typeof at === "number" ? { at } : {}) },
-      });
+      // Held out of Pure Container Reset: this is the extension creating a
+      // container, not the user, and the one caller wants a plain wrapper. The
+      // hook decides synchronously inside the command, so the counter only has
+      // to span the run itself.
+      pureResetSuppressed++;
+      let result;
+      try {
+        result = await runCommand("document/elements/create", {
+          container,
+          model,
+          options: { edit: false, ...(typeof at === "number" ? { at } : {}) },
+        });
+      } finally {
+        pureResetSuppressed--;
+      }
       const [id] = createdIds(result);
       if (!id) throw new Error("create returned no container id");
       return { id };
@@ -750,7 +1048,11 @@
         title,
         type,
       });
-      const cached = await getTemplateData(source, templateId, withPageSettings);
+      const cached = await getTemplateData(
+        source,
+        templateId,
+        withPageSettings,
+      );
       // import can mutate what it is handed — never pass the cached copy itself.
       const data = clone(cached);
       // Every element gets a fresh id before it goes in, so an inserted copy can
@@ -836,7 +1138,9 @@
       }
       return { selected: null, count: 0 };
     },
-    "describe-tree": async ({ id }) => ({ tree: describeContainer(getContainer(id)) }),
+    "describe-tree": async ({ id }) => ({
+      tree: describeContainer(getContainer(id)),
+    }),
     // Reads the template JSON without importing it — tells apart "the template
     // really has N roots" from "our import produced N".
     "inspect-template": async ({
@@ -988,7 +1292,10 @@
         modified: t.modified ?? t.post_modified ?? null,
         humanDate: t.human_date || null,
         humanModified:
-          t.human_modified_date || t.humanModifiedDate || t.modified_date || null,
+          t.human_modified_date ||
+          t.humanModifiedDate ||
+          t.modified_date ||
+          null,
         // The library hands back the template's own public permalink
         // ("/?elementor_library=<slug>"). It is the panel's View link, and it
         // beats deriving one from the title — a slug is not a slugified title
