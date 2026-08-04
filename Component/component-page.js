@@ -41,6 +41,27 @@
 
   const NEVER_INHERIT = new Set(["_element_id", "_element_cache"]);
 
+  // MIRROR of the counter Tools/page-bridge.js hangs its new-element hook off.
+  // Two page-world scripts share no scope, so the channel between them is a
+  // window property — and it has to exist, because that hook cannot tell one of
+  // our creates from the user pressing "+": measured, both traces are exactly
+  // ["document/elements/create"].
+  //
+  // Every element this file creates comes from a parent component's own JSON, so
+  // it must land carrying that JSON's spacing. Without this, inserting or syncing
+  // an instance had its containers' padding, margin and gap zeroed by Pure
+  // Container Reset the moment they appeared.
+  const SUPPRESS_KEY = "__ElementorToolsSuppressCreateHook";
+  const suppressCreateHook = async (fn) => {
+    if (typeof window[SUPPRESS_KEY] !== "number") window[SUPPRESS_KEY] = 0;
+    window[SUPPRESS_KEY]++;
+    try {
+      return await fn();
+    } finally {
+      window[SUPPRESS_KEY]--;
+    }
+  };
+
   // Elementor keeps global-value and dynamic-tag references in their OWN
   // side-objects, keyed by control name, rather than in the controls they apply
   // to. Setting a container's background from a global colour writes
@@ -871,21 +892,23 @@
       if (existing) {
         return { widgetId: existing.id, created: false };
       }
-      const result = await runCommand("document/elements/create", {
-        container: parent,
-        model: {
-          elType: "widget",
-          widgetType: "html",
-          settings: {
-            html: encodePayload(payload),
-            _title: COMP_WIDGET_TITLE,
-            ...HIDE_FLAGS,
+      const result = await suppressCreateHook(() =>
+        runCommand("document/elements/create", {
+          container: parent,
+          model: {
+            elType: "widget",
+            widgetType: "html",
+            settings: {
+              html: encodePayload(payload),
+              _title: COMP_WIDGET_TITLE,
+              ...HIDE_FLAGS,
+            },
           },
-        },
-        // The default opens the panel for the new element, which would yank the
-        // user away from whatever they were doing to show them an empty widget.
-        options: { edit: false, at: 0 },
-      });
+          // The default opens the panel for the new element, which would yank the
+          // user away from whatever they were doing to show them an empty widget.
+          options: { edit: false, at: 0 },
+        }),
+      );
       const created = Array.isArray(result)
         ? result.flat(Infinity).find((c) => c && c.id)
         : result;
@@ -1015,14 +1038,21 @@
 
       const created = [];
       for (const node of data) {
-        const result = await runCommand("document/elements/create", {
-          container,
-          model: node,
-          options: {
-            edit: false,
-            ...(at === null ? {} : { at: at++ }),
-          },
-        });
+        // Suppressed as a whole: these nodes are the parent component's own
+        // elements and must arrive with the parent's spacing, not with Pure
+        // Container Reset's zeroes. A node with children is already held out by
+        // the hook's own pre-built-content test, but a leaf container is not — and
+        // an instance whose root is a leaf is perfectly ordinary.
+        const result = await suppressCreateHook(() =>
+          runCommand("document/elements/create", {
+            container,
+            model: node,
+            options: {
+              edit: false,
+              ...(at === null ? {} : { at: at++ }),
+            },
+          }),
+        );
         const made = Array.isArray(result)
           ? result.flat(Infinity).find((c) => c && c.id)
           : result;

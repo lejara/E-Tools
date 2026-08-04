@@ -45,9 +45,11 @@
     // hook. A site whose Elementor has no hooks API says so here rather than
     // looking like a checkbox that silently does nothing.
     if (result.justRegistered) {
+      // "containers", not "elements": both options are scoped to the user adding
+      // a container, so a line promising to watch everything would misdescribe it.
       ns.log(
         "info",
-        `Watching new elements — zero spacing: ${enabled ? "on" : "off"}, unlink fields: ${unlinkNew ? "on" : "off"}`,
+        `Watching new containers — zero spacing: ${enabled ? "on" : "off"}, unlink fields: ${unlinkNew ? "on" : "off"}`,
       );
     }
     if (result.registerError) {

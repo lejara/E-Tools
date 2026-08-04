@@ -30,6 +30,7 @@ const contentSearchEl = document.getElementById("content-search");
 const contentStatusEl = document.getElementById("content-status");
 const contentTabsEl = document.getElementById("content-tabs");
 const refreshContentBtn = document.getElementById("refresh-content");
+const scanUsageBtn = document.getElementById("scan-usage");
 const presetsEl = document.getElementById("presets");
 const presetStatusEl = document.getElementById("preset-status");
 const presetNewBtn = document.getElementById("preset-new");
@@ -46,12 +47,15 @@ const { ACTIONS, formatBinding, bindingKey, mergeWithDefaults } =
 const {
   metaLine,
   postMetaLine,
+  statusLabel,
   searchTerms,
   matchesTerms,
   elementorEditUrl,
-  wpAdminEditUrl,
   contentViewUrl,
   parseWorkingDomain,
+  wpAdminEditUrl,
+  USAGE_INDEX_VERSION,
+  buildUsageIndex,
 } = window.__ElementorTemplateFormat;
 
 let hotkeyBindings = mergeWithDefaults(null);
@@ -272,6 +276,176 @@ const openInNewTab = async (url) => {
   await browser.windows.create({ url });
 };
 
+// ---- Template usage index ---------------------------------------------------
+// "Where is this template used?", answered by the template tag: every layer the
+// tools create carries "#<templateId>" in its name, so the question is which
+// documents hold a layer tagged for a given template. Tools/template-index.js
+// does the walking; template-format.js owns the tag rule and the grouping; this
+// holds the cache and the dropdown.
+//
+// It has its OWN scan button rather than riding Refresh Templates, because the
+// two cost wildly different things. Refresh is one call to Elementor's library
+// endpoint; a usage scan has to read every document's `_elementor_data`, since a
+// layer name is not something any listing endpoint returns. Folding that into
+// Refresh would make the list that is already fast feel broken.
+const USAGE_CACHE_KEY = "templateUsageIndex";
+// How many documents' content are asked for per message. The content script
+// batches internally too; this outer chunk exists only so the status line can
+// move — one message covering 400 documents would sit silent for minutes and
+// read as a hang. Same reasoning as the component command centre.
+const USAGE_READ_CHUNK = 30;
+// The key the orphan block's open/closed state is stored under. It is not a
+// template id, and a real one can never collide with it.
+const ORPHAN_KEY = "__orphans";
+
+let usageCache = null; // { version, origin, scannedAt, templateIds, docs: { id: doc } }
+let usageIndex = null; // buildUsageIndex output, or null until a scan has landed
+let usageScanning = false;
+let usageScanStatus = "";
+let usageError = null;
+// Which rows are expanded. Kept across re-renders and tab switches — collapsing
+// everything because the search box was typed into would be its own annoyance.
+const usageOpen = new Set();
+
+const rebuildUsageIndex = () => {
+  usageIndex = usageCache
+    ? buildUsageIndex(Object.values(usageCache.docs || {}), {
+        templateIds: usageCache.templateIds || [],
+      })
+    : null;
+};
+
+const usageRowsFor = (item) =>
+  usageIndex ? usageIndex.byTemplate[String(item.id)] || [] : null;
+
+// A cache from another site describes nothing about this one, and a cache from
+// an older build describes it in a shape this code does not read. Both are
+// discarded rather than repaired — re-earning one costs a single Scan.
+const usableUsageCache = (cache, origin) =>
+  cache &&
+  cache.version === USAGE_INDEX_VERSION &&
+  (!origin || cache.origin === origin)
+    ? cache
+    : null;
+
+const scanUsage = async () => {
+  if (usageScanning) return;
+  usageScanning = true;
+  usageError = null;
+  usageScanStatus = "Asking a WordPress tab for the document list…";
+  scanUsageBtn.disabled = true;
+  scanUsageBtn.textContent = "Scanning…";
+  renderContent();
+
+  const preferOrigin = parseWorkingDomain(workingDomain)?.origin || "";
+  try {
+    const { tab, reply } = await askElementorTab(
+      { __elementorTools: true, type: "usage-list-docs" },
+      { preferOrigin },
+    );
+    if (!reply) throw new Error(NO_TAB);
+    if (!reply.ok) throw new Error(reply.error);
+
+    const docs = reply.docs || [];
+    const origin = reply.origin || "";
+    const reusable = usableUsageCache(usageCache, origin)?.docs || {};
+
+    // Two stamps per document, and the split is load-bearing:
+    //
+    //   modifiedGmt  what the document says right now
+    //   indexedGmt   what it said the last time its content was successfully READ
+    //
+    // One field cannot do both. Stamping the fresh value against a document
+    // whose read FAILED would make the next scan consider it up to date and
+    // never retry it — its usages would silently vanish and stay gone, which is
+    // the worst failure this cache could have.
+    const next = {};
+    const stale = [];
+    for (const doc of docs) {
+      const prev = reusable[doc.id];
+      if (prev && prev.indexedGmt && prev.indexedGmt === doc.modifiedGmt) {
+        // Unchanged content, but take the freshly-listed metadata: a retitled or
+        // republished document has the same layers and a different label.
+        next[doc.id] = {
+          ...doc,
+          usages: prev.usages || [],
+          indexedGmt: prev.indexedGmt,
+        };
+      } else {
+        next[doc.id] = { ...doc, usages: [], indexedGmt: null };
+        stale.push(doc);
+      }
+    }
+
+    const kept = docs.length - stale.length;
+    const warnings = [...(reply.warnings || [])];
+
+    for (let i = 0; i < stale.length; i += USAGE_READ_CHUNK) {
+      const slice = stale.slice(i, i + USAGE_READ_CHUNK);
+      usageScanStatus =
+        `Reading document ${i + 1}–${Math.min(i + USAGE_READ_CHUNK, stale.length)} ` +
+        `of ${stale.length}${kept ? ` (${kept} unchanged)` : ""}…`;
+      renderContent();
+
+      const res = await browser.tabs
+        .sendMessage(tab.id, {
+          __elementorTools: true,
+          type: "usage-read-docs",
+          options: {
+            targets: slice.map((d) => ({
+              id: d.id,
+              restBase: d.restBase,
+              isTemplate: d.isTemplate,
+            })),
+          },
+        })
+        .catch((err) => ({ ok: false, error: String(err?.message || err) }));
+
+      if (!res?.ok) {
+        // Keep whatever landed rather than throwing the run away — a half-built
+        // index still answers most questions, and the status line says it is
+        // partial.
+        warnings.push(`batch at ${i + 1}: ${res?.error}`);
+        continue;
+      }
+      warnings.push(...(res.warnings || []));
+      for (const [id, found] of Object.entries(res.results || {})) {
+        if (!next[id]) continue;
+        if (found.error) {
+          warnings.push(`document ${id}: ${found.error}`);
+          continue;
+        }
+        // indexedGmt is stamped ONLY here, on the success path. Anything that did
+        // not reach this line stays unindexed and is retried next scan.
+        next[id] = {
+          ...next[id],
+          usages: found.usages || [],
+          indexedGmt: next[id].modifiedGmt,
+        };
+      }
+    }
+
+    usageCache = {
+      version: USAGE_INDEX_VERSION,
+      origin,
+      scannedAt: Date.now(),
+      templateIds: reply.templateIds || [],
+      docs: next,
+      warnings,
+    };
+    rebuildUsageIndex();
+    await browser.storage.local.set({ [USAGE_CACHE_KEY]: usageCache });
+  } catch (err) {
+    usageError = err?.message || String(err);
+  } finally {
+    usageScanning = false;
+    usageScanStatus = "";
+    scanUsageBtn.disabled = false;
+    scanUsageBtn.textContent = "Scan Usage";
+    renderContent();
+  }
+};
+
 // A template and a post arrive in two different shapes from two endpoints.
 // This is the one place either becomes a row, so everything downstream —
 // search, sort, the two buttons — sees a single kind of thing.
@@ -328,8 +502,36 @@ const activeItems = () => {
     .sort((a, b) => String(a.title || "").localeCompare(String(b.title || "")));
 };
 
+// What the usage index has to say about itself, for the Templates tab's status
+// line. Never called for the other tabs: usage is a template-shaped question.
+const usageStatusBits = () => {
+  if (usageError) return [`usage scan failed — ${usageError}`];
+  if (!usageIndex) return ["Scan Usage to find where each template is used"];
+  const bits = [
+    `${usageIndex.total} tagged layer(s) in ${usageIndex.docCount} document(s)`,
+  ];
+  // An orphan is a tag naming a template that no longer exists, so it belongs in
+  // the status line whether or not the block below it is expanded.
+  if (usageIndex.orphans.length) {
+    bits.push(`${usageIndex.orphans.length} pointing at a missing template`);
+  }
+  const stamp = usageCache?.scannedAt;
+  if (stamp) bits.push(`scanned ${formatTime(stamp)}`);
+  if (usageCache?.warnings?.length) {
+    bits.push(`${usageCache.warnings.length} scan warning(s)`);
+  }
+  return bits;
+};
+
 const renderContentStatus = (shown, total) => {
   const state = tabState[activeTab];
+  // A scan in progress owns the line outright: it is the thing that is moving,
+  // and the row count underneath it has not changed.
+  if (usageScanning && activeTab === "template") {
+    contentStatusEl.classList.remove("error");
+    contentStatusEl.textContent = usageScanStatus;
+    return;
+  }
   contentStatusEl.classList.toggle("error", !!state.error && !state.loading);
   if (state.loading) {
     contentStatusEl.textContent = `Fetching ${TAB_LABELS[activeTab]}…`;
@@ -345,6 +547,7 @@ const renderContentStatus = (shown, total) => {
   if (state.via) bits.push(`via ${state.via}`);
   if (!workingDomain) bits.push("set a Working Domain to enable Edit");
   if (state.error) bits.push(state.error);
+  if (activeTab === "template") bits.push(...usageStatusBits());
   contentStatusEl.textContent = [...bits, ...state.warnings].join(" · ");
 };
 
@@ -393,6 +596,10 @@ const linkButton = (label, url, { hint, disabledHint }) => {
 const renderTabs = () => {
   // Refresh only ever re-fetches the active tab, so it says which one.
   refreshContentBtn.textContent = `Refresh ${TAB_TITLES[activeTab]}`;
+  // The usage index answers a template-shaped question, so the button that
+  // builds it is only offered where its result is readable. Hidden rather than
+  // disabled: a permanently dead button on two of three tabs reads as broken.
+  scanUsageBtn.hidden = activeTab !== "template";
   for (const btn of contentTabsEl.querySelectorAll(".tab")) {
     const kind = btn.dataset.kind;
     btn.setAttribute("aria-selected", kind === activeTab ? "true" : "false");
@@ -412,6 +619,142 @@ const renderTabs = () => {
       count.textContent = badge;
     }
   }
+};
+
+// The count doubles as the disclosure control, so the number being read is the
+// thing being clicked. Zero stays on screen and goes quiet: "nothing uses this"
+// is an answer worth having, and hiding the pill would make an unused template
+// indistinguishable from one the scan never covered.
+const usesToggle = (item, uses) => {
+  const key = String(item.id);
+  const open = usageOpen.has(key);
+  const btn = document.createElement("button");
+  btn.type = "button";
+  btn.className = "uses-toggle";
+  btn.textContent = uses.length ? `${open ? "▾" : "▸"} ${uses.length}` : "0";
+  btn.disabled = !uses.length;
+  btn.setAttribute("aria-expanded", open ? "true" : "false");
+  btn.title = uses.length
+    ? `${uses.length} tagged layer(s) reference this template`
+    : "No tagged layer references this template — nothing on the site uses it, " +
+      "or a layer was renamed without keeping its #id tag";
+  btn.addEventListener("click", () => {
+    if (open) usageOpen.delete(key);
+    else usageOpen.add(key);
+    renderContent();
+  });
+  return btn;
+};
+
+// One usage: which document holds the tagged layer, and what the layer is
+// called. The document is the answer to "where", so it leads; the layer name is
+// how you find it once you are in there.
+const usageRow = (use) => {
+  const el = document.createElement("div");
+  el.className = "usage";
+
+  const text = document.createElement("div");
+  text.className = "text";
+  const name = document.createElement("span");
+  name.className = "name";
+  name.textContent = use.docTitle || `(untitled #${use.docId})`;
+  text.append(name);
+
+  const bits = [use.typeLabel, statusLabel(use.status)].filter(Boolean);
+  // The root index is what tells two roots of one multi-root template apart, so
+  // it is shown wherever the tag carries one.
+  if (use.root) bits.push(`root ${use.root}`);
+  if (use.name) bits.push(`layer "${use.name}"`);
+  const sub = document.createElement("span");
+  sub.className = "sub";
+  sub.textContent = bits.join(" · ");
+  text.append(sub);
+  el.append(text);
+
+  const actions = document.createElement("div");
+  actions.className = "row-actions";
+  // Every indexed document is Elementor-built — the scan filters on
+  // _elementor_edit_mode — so Edit never has to choose an editor, and the trap
+  // where post.php?action=elementor quietly converts a post it never built
+  // cannot be reached here.
+  actions.append(
+    linkButton("Edit", elementorEditUrl(workingDomain, use.docId), {
+      hint: "Edit in Elementor",
+      disabledHint: "Set a Working Domain to build the Edit link",
+    }),
+    linkButton(
+      "View",
+      contentViewUrl(workingDomain, {
+        id: use.docId,
+        status: use.status,
+        link: use.link,
+        viewable: use.viewable,
+      }),
+      {
+        hint: use.status === "publish" ? "View page" : "Preview draft",
+        disabledHint: workingDomain
+          ? "This document has nothing viewable to open"
+          : "Set a Working Domain to build the View link",
+      },
+    ),
+  );
+  el.append(actions);
+  return el;
+};
+
+const usageList = (uses, { orphans = false } = {}) => {
+  const list = document.createElement("div");
+  list.className = `usages${orphans ? " orphans" : ""}`;
+  list.append(...uses.map(usageRow));
+  return list;
+};
+
+// Tags naming a template that is not on this site, as their own collapsible
+// group. Keyed on a sentinel no real template id can equal.
+const orphanGroup = (orphans) => {
+  const group = document.createElement("div");
+  group.className = "content-row";
+  const row = document.createElement("div");
+  row.className = "template";
+
+  const text = document.createElement("div");
+  text.className = "text";
+  const name = document.createElement("span");
+  name.className = "name";
+  name.textContent = "Tags with no template";
+  const sub = document.createElement("span");
+  sub.className = "sub";
+  sub.textContent =
+    "the template these layers name is not on this site — deleted, or on another one";
+  text.append(name, sub);
+  row.append(text);
+
+  const open = usageOpen.has(ORPHAN_KEY);
+  const btn = document.createElement("button");
+  btn.type = "button";
+  btn.className = "uses-toggle";
+  btn.textContent = `${open ? "▾" : "▸"} ${orphans.length}`;
+  btn.setAttribute("aria-expanded", open ? "true" : "false");
+  btn.title = `${orphans.length} tagged layer(s) pointing at a missing template`;
+  btn.addEventListener("click", () => {
+    if (open) usageOpen.delete(ORPHAN_KEY);
+    else usageOpen.add(ORPHAN_KEY);
+    renderContent();
+  });
+  row.append(btn);
+  group.append(row);
+
+  if (open) {
+    const list = usageList(orphans, { orphans: true });
+    // The id is the only trace of what each one was pointing at, and it is not on
+    // the usage row itself — a missing template has no title to show.
+    for (const [i, el] of [...list.children].entries()) {
+      const sub = el.querySelector(".sub");
+      if (sub) sub.textContent = `#${orphans[i].templateId} · ${sub.textContent}`;
+    }
+    group.append(list);
+  }
+  return group;
 };
 
 const renderContent = () => {
@@ -443,8 +786,13 @@ const renderContent = () => {
   const rows = items
     .filter((item) => matchesTerms(item, terms))
     .map((item) => {
+      // The wrapper is what an expanded row expands inside of, and it carries the
+      // separator so a row and its usage list read as one group.
+      const group = document.createElement("div");
+      group.className = "content-row";
       const row = document.createElement("div");
       row.className = "template";
+      group.append(row);
 
       const text = document.createElement("div");
       text.className = "text";
@@ -475,6 +823,9 @@ const renderContent = () => {
       type.textContent = item.type;
       row.append(type);
 
+      const uses = item.kind === "template" ? usageRowsFor(item) : null;
+      if (uses) row.append(usesToggle(item, uses));
+
       const actions = document.createElement("div");
       actions.className = "row-actions";
       const target = editTarget(item);
@@ -492,8 +843,29 @@ const renderContent = () => {
         }),
       );
       row.append(actions);
-      return row;
+
+      if (uses?.length && usageOpen.has(String(item.id))) {
+        group.append(usageList(uses));
+      }
+      return group;
     });
+
+  // Counted before the orphan block is appended: that block is not one of the
+  // rows the search filtered, and letting it inflate "N of M shown" would make
+  // the count disagree with the list.
+  const shown = rows.length;
+
+  // Orphans belong to no template row, so they get their own group at the end.
+  // Dropping them would be the one genuinely misleading outcome here — a tag
+  // pointing nowhere is a broken link on a real page, and nothing else in the
+  // panel would ever mention it.
+  //
+  // Only with the search box empty. They are not templates, so no search term
+  // can be said to match them, and appending them to a filtered list would
+  // answer a search with rows that do not match it.
+  if (activeTab === "template" && !terms.length && usageIndex?.orphans.length) {
+    rows.push(orphanGroup(usageIndex.orphans));
+  }
 
   if (!rows.length) {
     setContentMessage("Nothing matches that search");
@@ -501,7 +873,7 @@ const renderContent = () => {
     return;
   }
   contentEl.replaceChildren(...rows);
-  renderContentStatus(rows.length, items.length);
+  renderContentStatus(shown, items.length);
 };
 
 const NO_TAB =
@@ -573,6 +945,7 @@ const selectTab = (kind) => {
 contentSearchEl.addEventListener("input", renderContent);
 contentSearchEl.addEventListener("search", renderContent);
 refreshContentBtn.addEventListener("click", () => loadTab(activeTab));
+scanUsageBtn.addEventListener("click", () => scanUsage());
 
 contentTabsEl.addEventListener("click", (e) => {
   const btn = e.target.closest(".tab");
@@ -1199,6 +1572,7 @@ browser.storage.local
     "workingDomain",
     "hotkeyBindings",
     "contentTab",
+    "templateUsageIndex",
     "animationPresets",
     "animationDelayAccumulation",
   ])
@@ -1226,6 +1600,20 @@ browser.storage.local
       : [];
     presetDelayEl.value = state.animationDelayAccumulation ?? "";
     renderPresets();
+    // The usage index renders from cache immediately and only ever rescans on
+    // demand — the walk behind it reads every document on the site, which is not
+    // something a panel should do just because it opened.
+    //
+    // With a Working Domain set, a cache from a different origin is discarded
+    // rather than drawn: showing one site's usage counts against another site's
+    // templates is wrong in the most confusing possible way. With none set there
+    // is nothing to compare, so the cache is trusted and the next scan corrects
+    // it.
+    usageCache = usableUsageCache(
+      state.templateUsageIndex,
+      parseWorkingDomain(workingDomain)?.origin || "",
+    );
+    rebuildUsageIndex();
     if (ALL_KINDS.includes(state.contentTab)) activeTab = state.contentTab;
     contentSearchEl.placeholder = `Search ${TAB_LABELS[activeTab]}…`;
     renderHotkeys();
@@ -1273,6 +1661,15 @@ browser.storage.onChanged.addListener((changes, area) => {
     workingDomain = changes.workingDomain.newValue || "";
     if (document.activeElement !== workingDomainEl) {
       workingDomainEl.value = workingDomain;
+    }
+    // Pointing the panel at another site invalidates the usage index outright.
+    // Nothing about site A's tags is true of site B, and the counts are the one
+    // thing here that would look perfectly plausible while being wrong.
+    const origin = parseWorkingDomain(workingDomain)?.origin || "";
+    if (origin && usageCache && usageCache.origin !== origin) {
+      usageCache = null;
+      usageIndex = null;
+      usageOpen.clear();
     }
     // The Edit and View links are built from it, so they have to be rebuilt
     // with it.

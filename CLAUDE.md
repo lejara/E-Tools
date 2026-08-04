@@ -45,10 +45,11 @@ Browser extension (MV3, Firefox) that adds hotkey-driven tools to Elementor's Wo
     ├── wp-rest.js            # shared wp-admin REST access: wp_rest nonce + authenticated JSON GET
     ├── admin-templates.js    # serves the panel's template list from wp-admin (no editor, no page bridge)
     ├── wp-pages.js           # serves the panel's post list — every post type, with the Elementor flag
+    ├── template-index.js     # the site-wide walk for template usage — types → docs → _elementor_data → #id tags
     └── overlay.js            # draggable in-page HUD (root layer, logs, Edit-in-Elementor link)
 ```
 
-- Load order: `template-format.js` first (`core_utils.js` reads `normalizeName` off it), then `core_utils.js`, then `multi-select.js`, then other tools, then `hotkeys.js`. `wp-rest.js` must precede `admin-templates.js` and `wp-pages.js` — both read `window.__WpRest` and bail without it. `animation-preset-fields.js` must precede `Tools/animation-presets.js`, which reads `window.__AnimationPresetFields` and bails without it.
+- Load order: `template-format.js` first (`core_utils.js` reads `normalizeName` off it), then `core_utils.js`, then `multi-select.js`, then other tools, then `hotkeys.js`. `wp-rest.js` must precede `admin-templates.js`, `wp-pages.js` and `template-index.js` — all three read `window.__WpRest` and bail without it. `template-index.js` also reads `window.__ElementorTemplateFormat` for the tag rule. `animation-preset-fields.js` must precede `Tools/animation-presets.js`, which reads `window.__AnimationPresetFields` and bails without it.
 - Tools share `window.__ElementorTools` inside the editor page; cross-window state uses `browser.storage.local` (`selectedLayer`, `logs`).
 - Hotkeys: `Ctrl+Shift+1` capture root layer · `Ctrl+Shift+2` replace styles · `Ctrl+Shift+3` replace layer · `Ctrl+Shift+4` batch rename · `Ctrl+Shift+5` reselect stored root · `Ctrl+Shift+6` sync template styles · `Ctrl+Shift+7` replace with template · `Ctrl+Shift+8` insert site templates · `Ctrl+Shift+9` decouple templates.
 - Add a tool: drop a file in `Tools/`, append its path to `content_scripts[0].js` in `manifest.json`.
@@ -331,16 +332,26 @@ Targets are sent in batches of `NODE_CHUNK` (20). The page world cannot yield mi
 
 ## Pure container reset
 
-Two panel checkboxes, both **on by default**, riding one `document/elements/create` hook:
+Two panel checkboxes, both **on by default**, riding one `document/elements/create` hook. **Both are scoped to one event: the user adding a new container.**
 
-- **Pure Container Reset** zeroes `padding`, `margin` and `flex_gap` on every new container, at every breakpoint.
-- **Unlink Fields On New Elements** forces the "link values together" button off on every new element — see below.
+- **Pure Container Reset** zeroes `padding`, `margin` and `flex_gap` on the new container, at every breakpoint.
+- **Unlink Fields On New Elements** forces the "link values together" button off on it — see below.
 
 There is no hotkey and no modal for either: they are passive, they react to the editor rather than being invoked, and nothing here touches the network.
 
 This is the only feature in the codebase that **reacts to an Elementor command** instead of issuing one, and that shape is where all of its design decisions come from.
 
-**They are two flags, not one option with a mode**, because their scopes genuinely differ — the reset is about a container's box, the unlink is about a button every element type has. `configure-pure-reset` carries both in one message: one hook serves both, and pushing them separately would leave the page world briefly holding a stale half of the pair. `getConditions` fires if _either_ applies, and `hookFlagsFor(model)` is the single place that decides which.
+**Nothing but a user-added container is ever touched.** Three independent gates say so, and each one closes a hole the others cannot see:
+
+1. **`hookFlagsFor`** — the model must be `elType: "container"` and must arrive with **no children**.
+2. **The trace allowlist** — every command in `$e.commands.currentTrace` must be a user route.
+3. **The suppression counter** — this extension's own creates hold the hook off explicitly.
+
+**Off means off, at both ends.** `getConditions` asks `!pureResetEnabled && !unlinkNewEnabled` **first** and returns before looking at anything else, so a disabled feature costs two booleans and touches nothing — no write, no log line. The write is deferred (below), so `applyPureReset` re-checks both flags against the live values before writing: an option switched off during the deferral does not get a last write in.
+
+**They are two flags, not one option with a mode**, because what they write differs — the reset zeroes the box, the unlink moves a button that sits on 40 controls, `border_radius` included. `configure-pure-reset` carries both in one message: one hook serves both, and pushing them separately would leave the page world briefly holding a stale half of the pair. `getConditions` fires if _either_ applies, and `hookFlagsFor(model)` is the single place that decides which.
+
+**The unlink used to fire on every new element** — a widget's padding carries the same link button, so it looked like free coverage. It was not: every dropped heading took ~30 non-default keys into the saved document plus a log line, from a pair of options a user switches on to tidy up _containers_. Widgets are out of scope now, and `hookFlagsFor` returns early for them.
 
 **Both write in one settings command.** They overlap — `padding` is a box control _and_ a link-bearing one — and a control holds a single value object, so two commands would mean the second overwriting the first's work on the shared keys. Measured on a container with both on: 15 zeroed, 40 unlinked, **40 keys written**, not 55.
 
@@ -348,18 +359,31 @@ This is the only feature in the codebase that **reacts to an Elementor command**
 - **A hook fires in the page world, so a content script cannot be on the other end of one.** `Tools/pure-container-reset.js` therefore owns nothing but the on/off flag: it reads `pureContainerReset` from storage, pushes it through `configure-pure-reset`, and re-pushes on change. The hook itself reads the flag in `getConditions`, so toggling the option never attaches or detaches anything — there is no half-removed hook to get wrong.
 - `undefined` means "never set, use the default" and the default is **on**, the same distinction `skipWord` draws. The default is stated in both `UI/panel.js` and `Tools/pure-container-reset.js`, because the panel loads no content scripts.
 
-### Telling a new container from a copied one
+### Telling a new container from every other kind
 
-**Paste funnels through `document/elements/create`.** Measured on this build: pasting a container fires `create` with `elType: "container"` and `document/elements/paste` sitting in `$e.commands.currentTrace`. So "not when I paste" is answered by the **trace**, via `COPY_COMMANDS` — `paste`, `import`, `duplicate`, `paste-area`, `document/ui/*` and `browser-import`.
+Every route funnels through `document/elements/create`, so `$e.commands.currentTrace` is what tells them apart. Measured on Elementor 4.2.1 / Pro 4.0.4:
 
-That is exact, and the obvious alternative is not. Inferring it from whether the spacing is still at its defaults would zero a _pasted_ container that happened to carry no spacing — precisely the case the exclusion exists to protect.
+| route | trace | children |
+| --- | --- | --- |
+| drag Container out of the Elements panel | `preview/drop`, `…/create` | 0 |
+| the `+` button → a layout preset | `…/create` | 0 |
+| **this extension's own `$e.run`** | `…/create` | varies |
+| paste | `…/paste`, `…/create` | ≥1 |
+| duplicate | `…/duplicate`, `…/create` | ≥1 |
 
+**`USER_CREATE_COMMANDS` is an allowlist, and that direction is the point.** The trace must consist _entirely_ of `document/elements/create` and `preview/drop`; one unrecognised command anywhere in it means this create belongs to some larger operation. The blocklist this replaced (`COPY_COMMANDS`) had to name every command that would ever wrap a create — paste, import, duplicate, the section→container converter, Elementor AI, whatever ships next — and everything it failed to name got its spacing zeroed. An allowlist inverts the failure: an unrecognised route is left alone, which is the only safe default for a destructive write.
+
+Inferring it from whether the spacing is still at its defaults is the other obvious alternative and is worse still — it would zero a _pasted_ container that happened to carry no spacing, precisely the case the exclusion exists to protect.
+
+- **Row three is why the suppression counter is not optional.** Our own creates are byte-identical to the `+` route by trace alone, so the trace can never exclude them.
+- **A model arriving with children is never a user-added container.** Verified on every add route — `c100`, `r100`, and the `50-50` preset, which fires **three separate creates** rather than one nested model — a user's new container is always empty. Paste, duplicate and this extension's subtree inserts all carry children. This is the gate that catches an injection whose trace looks like the `+` button (a tool that forgot to suppress) _before_ anything is zeroed.
 - **Nested containers need no special case.** Each one is its own `create`, so each gets its own hook fire.
-- **`create-element` suppresses itself** with a counter, and the counter wraps the whole command **regardless of `elType`**. `ns.createContainer` builds the wrapper a widget-mode batch insert needs somewhere to put its widgets, and `ns.createTemplateWidget` builds the widgets themselves — both are the extension adding elements, not the user. That second one only started mattering when the unlink option brought widgets into scope; it was already covered. Every _other_ tool here reaches the document through paste or import, which `COPY_COMMANDS` already covers.
+- **The suppression counter lives on `window`** as `__ElementorToolsSuppressCreateHook`, not in `page-bridge.js`'s closure, because `Component/component-page.js` is a **separate page-world script** and shares no scope with it — the same boundary that keeps the template-tag regex out of the bridge. MIRROR: the key name and the `++`/`--` protocol are repeated there. It is a counter and not a boolean because a suppressed run issues several creates and can nest.
+- **Everything this extension injects is held out.** `create-element` (so `ns.createContainer`'s wrapper and `ns.createTemplateWidget`'s widgets), and the component system's `create-comp-widget` and `insert-nodes`. That last one was a real bug: component inserts and syncs build containers from a **parent component's own JSON**, and the hook was zeroing the padding, margin and gap off them the moment they appeared — silently reshaping every instance away from its base. Every _other_ tool reaches the document through paste or import, which the allowlist excludes anyway.
 
 ### The decision is synchronous, the write is not
 
-`getConditions` runs while the trace still says how the container came to exist; `apply` only captures the ids and defers the write with `setTimeout`. Running a settings command inline would fire it while Elementor is still finishing the create it is reporting — and by the time the deferred callback runs, `currentTrace` is empty, which is why the copy test **cannot** be moved down into `apply`.
+`getConditions` runs while the trace still says how the container came to exist; `apply` only captures the ids and defers the write with `setTimeout`. Running a settings command inline would fire it while Elementor is still finishing the create it is reporting — and by the time the deferred callback runs, `currentTrace` is empty, which is why the trace test **cannot** be moved down into `apply`. The _flag_ test is the opposite: it is re-asked in `applyPureReset` precisely because that runs later, so switching an option off is honoured even mid-deferral.
 
 The consequence is that the zeroing lands as **its own undo step**, which is accepted rather than worked around: grouping it with the create would mean holding a history log open across a deferral.
 
@@ -377,13 +401,12 @@ The two shapes differ and are not interchangeable: `dimensions` takes `{top,righ
 Elementor defaults the link button **on** (`isLinked: true`) for both control types that have one. This option flips it off at creation, so a fresh element starts with its sides independently editable.
 
 - **Detection is by control _type_, never by name.** `LINKED_TYPES` is `dimensions` and `gaps` — measured on this build a container has 30 of the first and 10 of the second, and **every one of them holds `isLinked`**, so the button is a property of the type.
-- **That is what makes widgets need no special case.** A widget prefixes some of these controls with an underscore (`_padding` where a container has `padding`), so a name-based rule would need the `resolveControlKey` mapping; a type-based one never sees the difference. Verified on a `heading`: 30 controls unlinked, keys including `_margin_tablet_extra`, with no mapping table involved.
-- **It applies to every new element, not just containers** — a widget's padding has the same button. The zeroing stays containers-only, which is why the two flags cannot be one.
+- **Containers only, like the zeroing.** It fired on every new element once, and the type-based rule is what made that look free — a widget prefixes some of these controls with an underscore (`_padding` where a container has `padding`), so a name-based rule would have needed the `resolveControlKey` mapping while a type-based one never sees the difference. Keep the type rule anyway: it is what would make a future re-widening a one-line change, and it is why `BOX_CONTROL`'s name test and this one cannot be merged.
 - **Values are preserved; only the flag moves.** A control the reset is not zeroing is written back with its own current value and `isLinked: false`, so `border_radius` keeps its sides. A control already unlinked is left out of the payload entirely rather than restated.
 - **`BOX_ZEROS` holds no `isLinked`, deliberately.** It used to assert `true`, which meant zeroing a box quietly _re-linked_ it whatever this option said. The flag is now carried from the live value in one place (`createSettings`), so with the unlink option off, a zeroed container keeps the button exactly where the user left it — verified: `padding.isLinked` stays `true` and `border_radius` never enters the payload.
-- **The cost is real and was chosen.** A flipped `isLinked` is not a default value, so Elementor cannot strip it at save — every new container carries ~40 extra keys in its saved JSON (~30 on a widget). `dimensions` covers `border_width` and `border_radius`, not just padding and margin.
+- **The cost is real and was chosen.** A flipped `isLinked` is not a default value, so Elementor cannot strip it at save — every new container carries ~40 extra keys in its saved JSON. `dimensions` covers `border_width` and `border_radius`, not just padding and margin. Paying it on ~30 keys per _widget_ as well is what tipped the scope back to containers.
 - Stored as `unlinkNewElements`; `undefined` means "never set, use the default" and the default is **on**, the same distinction `skipWord` draws.
-- **The breakpoint flyout honours the same flag** — see "Honouring the unlink option" under Breakpoint flyout. Between them, the two cover the create path and the edit path, so a field that starts unlinked is not quietly re-linked by editing it.
+- **The breakpoint flyout honours the same flag** — see "Honouring the unlink option" under Breakpoint flyout. Between them, the two cover the create path and the edit path, so a field that starts unlinked is not quietly re-linked by editing it. The flyout is deliberately **not** narrowed to containers along with the create hook: it writes only the field the user just edited on the element they chose, so scoping it out of widgets would silently re-link a widget field on every edit — the exact regression that bullet exists to prevent.
 
 ### Reporting
 
@@ -391,9 +414,9 @@ Every write reports to the **log** — no modal, since nothing here touches the 
 
 **This is the bridge's one unsolicited message.** Every other page → content-script message answers a request and carries its `requestId`; the hook fires off an Elementor command instead, so it has nothing to answer on. `emit(event, detail)` posts `{ __ns, __event }` and `pure-container-reset.js` listens for it. `core_utils.js` exports `ns.BRIDGE_NS` so the listener matches on the same namespace the bridge sends on rather than repeating the literal a third time. The existing `callBridge` listener ignores these — they have neither `__ready` nor `__response`.
 
-- **One line per element, not per drop.** A drag that auto-creates a wrapper _and_ an inner container is two creates, so two writes and two lines. Rolling them into one would hide the nested one, which is the part worth being able to see.
-- **The line names what actually happened**, since either option can be off: `container d12e35f: zeroed 15, unlinked 40 field(s)`, or `heading a1b2c3f: unlinked 30 field(s)` when only the unlink applies.
-- **A fresh element has no `_title`**, so the label is the element kind plus the bare id. The kind is the `widgetType` where there is one — "widget" alone does not say which — and a named element gets `container "Hero" (d12e35f)`.
+- **One line per container, not per drop.** A `50-50` preset is three creates, so three writes and three lines — verified. A drag that auto-creates a wrapper counts the wrapper only, since the widget inside it is out of scope now. Rolling them into one would hide the nested ones, which is the part worth being able to see.
+- **The line names what actually happened**, since either option can be off: `container d12e35f: zeroed 15, unlinked 40 field(s)`, or `container d12e35f: zeroed 15 field(s)` when the unlink is off. A silent run means the hook declined — that is the intended reading, and it is why nothing is logged when both options are off.
+- **A fresh element has no `_title`**, so the label is the element kind plus the bare id, and a named one gets `container "Hero" (d12e35f)`. `elementKind` still prefers `widgetType` over `elType`; with the scope on containers that never fires, and it is left in place for the same reason `LINKED_TYPES` is.
 - **Three outcomes, three lines.** A successful write reports its counts; a failed settings command is a warning with the error; **nothing resolved is also a warning** — on a container that means the control names moved in an Elementor upgrade, which must not read as a silent success.
 - **The one silent case** is an element deleted between the hook firing and the deferred write landing. Nothing was written, but there is no element left for that to be wrong about.
 
@@ -611,6 +634,92 @@ Three files split the job, and the split matters:
 - `SKIP_TYPES` drops WordPress's own bookkeeping types and `elementor_library` — the Templates filter already lists that through Elementor's endpoint, which knows about template _type_ in a way `wp/v2` does not.
 - `title.rendered` is HTML and gets decoded through **`DOMParser`, not `innerHTML`**. These are site-supplied strings on every admin page, and `web-ext lint` fails an `innerHTML` assignment outright (`UNSAFE_VAR_ASSIGNMENT`).
 
+### Template usage
+
+Every row on the **Templates** tab carries a usage count that expands into the
+list of documents holding a layer tagged for that template. It answers the
+question the template tag was always able to answer and nothing could ask: *where
+is this template actually used?*
+
+`Tools/template-index.js` is the walk — `/wp/v2/types` → each type's collection →
+`_elementor_data` for the documents that changed — and `template-format.js` owns
+both halves of the rule (`findTemplateTags` reads, `buildUsageIndex` groups),
+next to the tag regex that writes it. `UI/panel.js` holds the cache and draws the
+dropdown.
+
+- **The tag is the whole mechanism.** A layer name carrying `#4821` is an exact
+  link back to template 4821, so a usage is a tag and nothing more. There is
+  deliberately **no name matching** here, unlike `template-sync.js`: a name pass
+  exists there to catch hand-built containers that were never tagged, and
+  guessing at that in a *report* would produce confident wrong answers about
+  where a template lives.
+- **It shares nothing with `Component/`.** That folder answers a different
+  question with a similar walk, and the two are kept apart so deleting
+  `Component/` still removes the component system outright and leaves this
+  working. The duplication is the accepted cost of that rule.
+
+#### Depth 0 is skipped inside a template, always
+
+The one exclusion, and it is unconditional: in an `elementor_library` document
+every depth-0 node is ignored. A template's own roots are named
+`<title> #<id>` by the tools that put them there — `template-insert` on the way
+in, `template-sync` renaming **every** target it touches — so counting them would
+report each template as using itself, on every row, permanently.
+
+It is about **position, not about which template the tag names**. A root tagged
+for some *other* template is still a root of this one, and the next sync re-tags
+it anyway. Children still count at every depth: a template legitimately contains
+a block cut from another template, and that block is nested by definition.
+
+#### Its own scan button, and why it cannot ride Refresh
+
+`Scan Usage` sits beside `Refresh Templates` and is hidden on the other two tabs.
+The two cost wildly different things — Refresh is one call to Elementor's library
+endpoint, a usage scan has to read every document's `_elementor_data`, because a
+layer name is not something any listing endpoint returns. Folding it into Refresh
+would make the list that is already fast feel broken.
+
+Cache-and-diff on two stamps, the same shape and the same reasoning the Command
+Center documents: `modifiedGmt` is what a document says now, `indexedGmt` is what
+it said when its content was last **successfully read**. One field cannot do
+both — stamping the fresh value against a failed read makes the next scan skip it
+forever and its usages vanish silently. Documents with no tags are cached too, or
+they look unread on every scan and are re-fetched forever.
+
+The cache renders instantly on open and only ever rescans on click. Pointing the
+**Working Domain** at another site discards it outright: nothing about site A's
+tags is true of site B, and the counts are the one thing here that would look
+perfectly plausible while being wrong.
+
+#### Zero is an answer, and so is a tag pointing nowhere
+
+- **A template with no uses keeps its pill** and goes quiet rather than losing it.
+  Hiding it would make an unused template indistinguishable from one the scan
+  never covered — and "nothing uses this" is often the reason someone opened the
+  list.
+- **Orphans get their own group at the end**, prefixed with the id they name.
+  A tag naming a template that is not on this site is a broken link on a real
+  page, and nothing else in the panel would ever mention it. Shown only with the
+  search box empty: they are not templates, so no search term can be said to
+  match them.
+- **The known-template set comes from the walk, not from the library endpoint**,
+  and is taken *before* the Elementor filter — narrowing it would report a tag
+  pointing at a perfectly good template as broken. An empty set means the scan
+  never established which ids exist, so nothing is called an orphan on the
+  strength of it.
+- **The root index is shown wherever the tag carries one** (`root 2`), because it
+  is what tells two roots of one multi-root template apart.
+- Every indexed document is Elementor-built (the scan filters on
+  `_elementor_edit_mode`), so a usage row's **Edit** never has to choose an
+  editor and the trap where `post.php?action=elementor` quietly converts a post
+  it never built cannot be reached. **View** is the permalink for a published
+  post and the preview route otherwise, with the `elementor_library`
+  `viewable: false` correction the Command Center also makes.
+
+Known gap, inherited from the tag itself: a layer renamed without keeping its
+`#id` drops out of the index. That is the same trade `template-sync` makes — the
+tag is exact, and a name is hand-typed and drifts.
+
 ### Panel: Run buttons
 
 Every row in the panel's Hotkeys list has a **Run** button beside it, so the tools are reachable without the keyboard. It rides the same `askElementorTab` bridge as the template list — `run-action` → the `runtime.onMessage` listener in `hotkeys.js` → the **same `runners` table the keydown handler uses**. Do not give the buttons their own dispatch: one entry point per action is what stops a button and its key from drifting.
@@ -621,7 +730,7 @@ Every row in the panel's Hotkeys list has a **Run** button beside it, so the too
 
 ### Dual-context files
 
-`template-format.js`, `hotkey-defaults.js` and `animation-preset-fields.js` are loaded **both** as content scripts and by `panel.html`, each assigning one global. `animation-preset-fields.js` is there because the panel authors preset files and the editor applies them: one side writes the comments and validates an import, the other reads the defaults and types, and a second copy of the field table is exactly how the two would drift. That is the mechanism for anything the panel and the editor must agree on — template metadata rendering, the search predicate, `normalizeTemplateList`, and Edit-URL construction all live in `template-format.js` precisely because `panel.js`, `template-insert.js`, `admin-templates.js` and `overlay.js` would otherwise drift. Neither file may touch `location` or the DOM at load time.
+`template-format.js`, `hotkey-defaults.js` and `animation-preset-fields.js` are loaded **both** as content scripts and by `panel.html`, each assigning one global. The template usage index is the newest thing riding this: `findTemplateTags` runs in a content script and `buildUsageIndex` runs in the panel, and both live beside the tag regex they depend on so a reader and a writer cannot drift. `animation-preset-fields.js` is there because the panel authors preset files and the editor applies them: one side writes the comments and validates an import, the other reads the defaults and types, and a second copy of the field table is exactly how the two would drift. That is the mechanism for anything the panel and the editor must agree on — template metadata rendering, the search predicate, `normalizeTemplateList`, and Edit-URL construction all live in `template-format.js` precisely because `panel.js`, `template-insert.js`, `admin-templates.js` and `overlay.js` would otherwise drift. Neither file may touch `location` or the DOM at load time.
 
 **The page world is outside this mechanism.** `page-bridge.js` is injected as a page-world script and cannot read a content-script global, so its `list-templates` op carries its own copy of the field mapping that `normalizeTemplateList` holds — the same boundary that keeps the template-tag regex out of it. Those two are the one sanctioned duplication here; change one, change both. Do not "fix" it by having the bridge reach for the global.
 
@@ -995,6 +1104,14 @@ content-script global**, so it repeats the constants it shares with
 base64 codec, `canon`, and `resolveControlKey`. They are marked `MIRROR`. Change
 one, change both. Same sanctioned duplication as `page-bridge.js` and
 `normalizeTemplateList`.
+
+One `MIRROR` points at `Tools/page-bridge.js` rather than at
+`component-format.js`: `__ElementorToolsSuppressCreateHook`, the counter that
+holds Pure Container Reset off. Two page-world scripts share no scope either, so
+the channel between them is a window property. **Every element this file creates
+must be wrapped in `suppressCreateHook`** — the nodes come from a parent
+component's own JSON and have to land carrying its spacing. Without it, inserting
+or syncing an instance had that spacing zeroed out from under it.
 
 Load order: `component-format.js` first, and the whole folder **after**
 `Tools/wp-rest.js` and `Tools/core_utils.js`.

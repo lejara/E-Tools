@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "Elementor Tools",
-  "version": "2.4.3",
+  "version": "2.4.6",
   "description": "Time is an Element",
   "browser_specific_settings": {
     "gecko": {
@@ -60,6 +60,7 @@
         "Tools/wp-rest.js",
         "Tools/admin-templates.js",
         "Tools/wp-pages.js",
+        "Tools/template-index.js",
         "Component/component-format.js",
         "Component/component-index.js",
         "Component/component-core.js",

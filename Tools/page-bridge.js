@@ -310,32 +310,56 @@
   let pureResetHook = null;
   let pureResetError = null;
 
-  // Every route that produces a container by *copying* an existing one, and the
-  // reason the hook can tell a fresh container from a copied one at all.
+  // What the trace looks like when the *user* adds a container, and nothing else.
   //
-  // All of them funnel through document/elements/create — measured on this
-  // build, a paste fires create with elType "container" and
-  // "document/elements/paste" sitting in $e.commands.currentTrace. So the trace
-  // is the test, and it is exact. The tempting alternative — inferring it from
-  // whether the spacing is still at its defaults — would zero a pasted
-  // container that happened to have no spacing set, which is precisely the case
-  // "don't touch what I pasted" exists to protect.
-  const COPY_COMMANDS = new Set([
-    "document/elements/paste",
-    "document/elements/import",
-    "document/elements/duplicate",
-    "document/elements/paste-area",
-    "document/ui/paste",
-    "document/ui/duplicate",
-    "editor/browser-import/import",
+  // This is an allowlist, and that direction is load-bearing. Measured on this
+  // build (Elementor 4.2.1, Pro 4.0.4) — every route funnels through
+  // document/elements/create, and $e.commands.currentTrace is what tells them
+  // apart:
+  //
+  //   drag Container out of the Elements panel   ["preview/drop", ".../create"]
+  //   the "+" button then a layout preset        [".../create"]
+  //   this extension's own $e.run               [".../create"]   ← identical
+  //   paste                                      [".../paste",     ".../create"]
+  //   duplicate                                  [".../duplicate", ".../create"]
+  //
+  // A blocklist of copy routes has to name every command that will ever wrap a
+  // create — paste, import, duplicate, the section→container converter, Elementor
+  // AI, whatever ships next — and everything it misses gets its spacing zeroed.
+  // An allowlist inverts the failure: an unrecognised route is left alone, which
+  // is the only safe default for a destructive write. The tempting alternative —
+  // inferring it from whether the spacing is still at its defaults — would zero a
+  // pasted container that happened to carry no spacing, which is precisely the
+  // case "don't touch what I pasted" exists to protect.
+  //
+  // Note the third row: our own creates are indistinguishable from the "+" route
+  // by trace alone, which is why the suppression counter below is not optional.
+  const USER_CREATE_COMMANDS = new Set([
+    // A running command is always in its own trace.
+    "document/elements/create",
+    // Dragging out of the Elements panel. This is also the route for dropping a
+    // *widget* onto empty page area, which auto-creates a wrapper container —
+    // that wrapper is the user adding a container and is treated as one.
+    "preview/drop",
   ]);
 
-  // This extension's own creates. createContainer builds the wrapper a
-  // widget-mode batch insert needs somewhere to put its widgets, and that is not
-  // the user adding a container — so it is held out rather than being zeroed as
-  // a side effect of a template run. Every *other* tool here reaches the
-  // document through paste or import, which COPY_COMMANDS already covers.
-  let pureResetSuppressed = 0;
+  // This extension's own creates, held out of the hook: a container this tool
+  // injected is not the user adding one, so it must keep the spacing it was built
+  // with. createContainer builds the wrapper a widget-mode batch insert needs,
+  // createTemplateWidget builds the widgets, and the component system inserts
+  // whole subtrees.
+  //
+  // It lives on `window` rather than in this closure because
+  // Component/component-page.js is a *separate* page-world script and shares no
+  // scope with this one — the same boundary that keeps the template-tag regex out
+  // of this file. MIRROR: the key name and the ++/-- protocol are repeated there.
+  //
+  // A counter, not a boolean: a suppressed run routinely issues several creates
+  // and can nest, and a boolean would be cleared by the inner one while the outer
+  // was still going.
+  const SUPPRESS_KEY = "__ElementorToolsSuppressCreateHook";
+  if (typeof window[SUPPRESS_KEY] !== "number") window[SUPPRESS_KEY] = 0;
+  const isSuppressed = () => window[SUPPRESS_KEY] > 0;
 
   // The zero value for a box control, by control type. A dimensions control and
   // a gaps control take different shapes, and writing one into the other puts
@@ -357,9 +381,10 @@
   // one of them holds isLinked — so the button is a property of the *type*, which
   // is what makes it detectable without naming a single field.
   //
-  // This is why widgets need no special case. A widget prefixes some of these
-  // controls with an underscore (`_padding` where a container has `padding`), and
-  // a name-based rule would need that mapping; a type-based one never sees it.
+  // The type gate is also what keeps this working if the scope ever widens past
+  // containers again: a widget prefixes some of these controls with an underscore
+  // (`_padding` where a container has `padding`), and a name-based rule would need
+  // that mapping while a type-based one never sees it.
   const LINKED_TYPES = new Set(["dimensions", "gaps"]);
 
   // padding, margin and the container's gap, at every breakpoint — the trailing
@@ -427,6 +452,14 @@
     "element";
 
   const applyPureReset = async (id, flags) => {
+    // Off is off at *both* ends of the deferral. The decision was taken
+    // synchronously inside the command (it has to be — see apply), so the flags
+    // are re-checked against the live ones here: an option switched off in the
+    // meantime must not still get a write in.
+    const zero = flags.zero && pureResetEnabled;
+    const unlink = flags.unlink && unlinkNewEnabled;
+    if (!zero && !unlink) return;
+
     let container;
     try {
       container = getContainer(id);
@@ -438,7 +471,10 @@
     }
     const kind = elementKind(container);
     const title = containerTitle(container);
-    const { settings, zeroed, unlinked } = createSettings(container, flags);
+    const { settings, zeroed, unlinked } = createSettings(container, {
+      zero,
+      unlink,
+    });
     if (!Object.keys(settings).length) {
       emit("pure-reset", { id, title, kind, zeroed: 0, unlinked: 0 });
       return;
@@ -466,11 +502,38 @@
   const elTypeOf = (model) =>
     typeof model?.get === "function" ? model.get("elType") : model?.elType;
 
+  // How many children the model being created already carries. Read off the model
+  // rather than the document, because at getConditions time the element does not
+  // exist yet.
+  const modelChildCount = (model) => {
+    const kids =
+      typeof model?.get === "function" ? model.get("elements") : model?.elements;
+    if (Array.isArray(kids)) return kids.length;
+    if (kids && typeof kids.length === "number") return kids.length;
+    return 0;
+  };
+
+  const NO_FLAGS = { zero: false, unlink: false, any: false };
+
   // Which of the two options apply to the element being created. Read in
   // getConditions and again in apply, from the model rather than from a live
   // lookup — at getConditions time the element does not exist yet.
   const hookFlagsFor = (model) => {
-    const zero = pureResetEnabled && elTypeOf(model) === "container";
+    // Containers only, both options. The unlink used to fire on every element
+    // type, on the grounds that a widget's padding carries the same link button —
+    // but that meant every dropped heading took ~30 non-default keys into the
+    // saved document and a log line, from a pair of options the user turned on to
+    // tidy up *containers*. A new container is the whole scope now.
+    if (elTypeOf(model) !== "container") return NO_FLAGS;
+    // Pre-built content is never the user adding a container. Measured: a
+    // user-added container arrives empty on every route — c100, r100, and the
+    // 50-50 preset, which fires three separate creates rather than one nested
+    // model — while paste, duplicate and this extension's own subtree inserts all
+    // arrive with children. So this catches an injection whose trace looks like
+    // the "+" button, including a tool that forgot to suppress, *before*
+    // anything is zeroed.
+    if (modelChildCount(model) > 0) return NO_FLAGS;
+    const zero = pureResetEnabled;
     const unlink = unlinkNewEnabled;
     return { zero, unlink, any: zero || unlink };
   };
@@ -494,16 +557,25 @@
         return "elementor-tools-pure-container-reset--document/elements/create";
       }
       getConditions(args) {
-        if (pureResetSuppressed > 0) return false;
-        // Two independent options ride this one hook, with different scopes: the
-        // zeroing is about a container's box and applies to containers only,
-        // while the unlink is about a button every element type has. Either one
-        // being applicable is reason enough to fire.
+        // Off is off, and it is the first thing asked: with both options off the
+        // hook stays attached but costs two booleans and does nothing at all — no
+        // write, no log line, no element touched.
+        if (!pureResetEnabled && !unlinkNewEnabled) return false;
+        if (isSuppressed()) return false;
+        // Two options ride this one hook and both are scoped to a new container,
+        // so either one being applicable is reason enough to fire.
         if (!hookFlagsFor(args?.model).any) return false;
         // Nested containers need no special case: each one is its own create,
         // so each gets its own hook fire.
+        //
+        // `every`, against the allowlist — one unrecognised command anywhere in
+        // the trace means this create is part of some larger operation rather than
+        // the user adding a blank container. An empty trace should not be
+        // reachable (a running command is in its own trace) but would pass a bare
+        // `every`, so it is refused explicitly.
         const trace = window.$e?.commands?.currentTrace || [];
-        return !trace.some((cmd) => COPY_COMMANDS.has(cmd));
+        if (!trace.length) return false;
+        return trace.every((cmd) => USER_CREATE_COMMANDS.has(cmd));
       }
       apply(args, result) {
         const ids = createdIds(result);
@@ -987,11 +1059,11 @@
       if (widgetType) model.widgetType = widgetType;
       if (settings) model.settings = settings;
 
-      // Held out of Pure Container Reset: this is the extension creating a
-      // container, not the user, and the one caller wants a plain wrapper. The
-      // hook decides synchronously inside the command, so the counter only has
+      // Held out of the new-element hook: this is the extension creating an
+      // element, not the user, and the callers want exactly what they asked for.
+      // The hook decides synchronously inside the command, so the counter only has
       // to span the run itself.
-      pureResetSuppressed++;
+      window[SUPPRESS_KEY]++;
       let result;
       try {
         result = await runCommand("document/elements/create", {
@@ -1000,7 +1072,7 @@
           options: { edit: false, ...(typeof at === "number" ? { at } : {}) },
         });
       } finally {
-        pureResetSuppressed--;
+        window[SUPPRESS_KEY]--;
       }
       const [id] = createdIds(result);
       if (!id) throw new Error("create returned no container id");

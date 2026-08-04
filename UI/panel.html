@@ -121,6 +121,11 @@
         align-items: center;
         justify-content: space-between;
       }
+      .header-actions {
+        display: flex;
+        gap: 4px;
+        flex: 0 0 auto;
+      }
       .templates-search {
         margin-top: 6px;
         width: 100%;
@@ -184,15 +189,20 @@
         color: #555;
         padding: 2px 0;
       }
+      /* The separator moved from the row to the wrapper when the usage dropdown
+         arrived: an expanded row is a row plus its usage list, and a border on
+         the row alone drew a line through the middle of one group. */
+      .content-row {
+        border-bottom: 1px solid #232323;
+      }
+      .content-row:last-child {
+        border-bottom: 0;
+      }
       .template {
         display: flex;
         align-items: flex-start;
         gap: 8px;
         padding: 4px 2px;
-        border-bottom: 1px solid #232323;
-      }
-      .template:last-child {
-        border-bottom: 0;
       }
       .template .text {
         flex: 1 1 auto;
@@ -233,6 +243,77 @@
         flex: 0 0 auto;
         display: flex;
         gap: 4px;
+      }
+      /* The usage count doubles as the disclosure control — there is no separate
+         caret, so the number the user is reading is the thing they click. */
+      .uses-toggle {
+        flex: 0 0 auto;
+        margin-top: 2px;
+        background: #23262e;
+        color: #9db4ff;
+        border: 1px solid #39456b;
+        border-radius: 3px;
+        padding: 1px 6px;
+        font: inherit;
+        font-size: 10px;
+        font-family: ui-monospace, monospace;
+        cursor: pointer;
+        white-space: nowrap;
+      }
+      .uses-toggle:hover:not(:disabled) {
+        background: #2c3140;
+        color: #fff;
+      }
+      /* Zero uses is information, not an absent feature, so the pill stays and
+         goes quiet rather than disappearing. */
+      .uses-toggle:disabled {
+        background: #1c1c1c;
+        border-color: #2f2f2f;
+        color: #666;
+        cursor: default;
+      }
+      .usages {
+        margin: 0 0 5px 8px;
+        padding-left: 8px;
+        border-left: 2px solid #39456b;
+        display: flex;
+        flex-direction: column;
+        gap: 3px;
+      }
+      .usage {
+        display: flex;
+        align-items: flex-start;
+        gap: 8px;
+      }
+      .usage .text {
+        flex: 1 1 auto;
+        min-width: 0;
+        display: flex;
+        flex-direction: column;
+        gap: 1px;
+      }
+      .usage .name {
+        color: #d6d6d6;
+        font-size: 11px;
+        word-break: break-word;
+      }
+      .usage .sub {
+        color: #6f6f6f;
+        font-size: 10px;
+        word-break: break-word;
+      }
+      .usage .row-actions {
+        flex: 0 0 auto;
+        display: flex;
+        gap: 4px;
+      }
+      .usages.orphans {
+        border-left-color: #7a3a3a;
+      }
+      .usages-note {
+        color: #999;
+        font-size: 10px;
+        padding: 2px 0 4px;
       }
       button.edit {
         flex: 0 0 auto;
@@ -493,9 +574,12 @@
     </div>
     <div class="templates-header">
       <h1>Site Content</h1>
-      <button id="refresh-content" class="clear" type="button">
-        Refresh Templates
-      </button>
+      <div class="header-actions">
+        <button id="scan-usage" class="clear" type="button">Scan Usage</button>
+        <button id="refresh-content" class="clear" type="button">
+          Refresh Templates
+        </button>
+      </div>
     </div>
     <div class="content-tabs" id="content-tabs" role="tablist">
       <button

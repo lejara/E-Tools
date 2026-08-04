@@ -141,6 +141,128 @@
       .replace(TEMPLATE_TAG, "")
       .trim();
 
+  /* ------------------------------------------------------- template usage index
+
+     The tag above is the link, so "where is template X used?" is "which layers
+     carry #X". Both halves live here for the same reason the tag helpers do: the
+     writer (template-insert, template-sync, template-decouple) and the reader
+     must not disagree about the shape, and the panel draws what the reader
+     found. Tools/template-index.js does the walking; UI/panel.js does the
+     drawing; neither owns the rule. */
+
+  // Bump when the cached usage index shape changes. A cache written by an older
+  // build is discarded rather than migrated — re-earning it costs one Scan, and
+  // reading a half-understood index would show the user wrong usages. Same
+  // reasoning as INDEX_VERSION in the component system.
+  const USAGE_INDEX_VERSION = 1;
+
+  // Every tagged layer in one document's saved `_elementor_data`.
+  //
+  // This reads raw JSON rather than the live document, which is the only way the
+  // question can be asked at all: a page nobody has open still uses the
+  // template, and that is precisely the case worth knowing about.
+  //
+  // `isTemplate` turns on the one exclusion. Inside a template document every
+  // depth-0 node is skipped, because a template's own roots are named
+  // "<title> #<id>" by the very tools that insert them — template-sync renames
+  // every target it touches — so counting them would report each template as
+  // using itself, on every row, permanently. Children still count: a template
+  // legitimately contains a block cut from another template, and that block is
+  // nested by definition.
+  const findTemplateTags = (elements, { isTemplate = false } = {}) => {
+    const found = [];
+    const walk = (nodes, depth) => {
+      for (const node of Array.isArray(nodes) ? nodes : []) {
+        // The exclusion is about position, not about which template the tag
+        // names. A root tagged for a *different* template is still a root of
+        // this one, and it is re-tagged on the next sync either way.
+        const tag =
+          isTemplate && depth === 0
+            ? null
+            : parseTemplateTag(node?.settings?._title);
+        if (tag) {
+          found.push({
+            nodeId: node.id ?? null,
+            name: node.settings?._title || "",
+            templateId: tag.id,
+            root: tag.root,
+            depth,
+            elType: node.elType || "",
+            widgetType: node.widgetType || null,
+          });
+        }
+        walk(node?.elements, depth + 1);
+      }
+    };
+    walk(elements, 0);
+    return found;
+  };
+
+  // What the panel's dropdown draws: every tagged layer grouped under the
+  // template it names, plus the tags that name nothing.
+  //
+  // `templateIds` is every elementor_library id the scan saw, and it is what
+  // tells a usage from an orphan. It is taken from the walk rather than from the
+  // library endpoint on purpose — the two could disagree, and the walk is the
+  // side that actually read the site. An empty set means the scan never
+  // established which ids exist, so nothing is called an orphan on the strength
+  // of it.
+  const buildUsageIndex = (docs, { templateIds = [] } = {}) => {
+    const known = new Set((templateIds || []).map(String));
+    const byTemplate = {};
+    const orphans = [];
+    let total = 0;
+    let docCount = 0;
+
+    for (const doc of Array.isArray(docs) ? docs : []) {
+      const tags = doc.usages || [];
+      if (tags.length) docCount += 1;
+      for (const tag of tags) {
+        const row = {
+          docId: String(doc.id),
+          docTitle: doc.title || "",
+          typeLabel: doc.typeLabel || doc.typeSlug || "",
+          typeSlug: doc.typeSlug || "",
+          status: doc.status || "",
+          link: doc.link || "",
+          // elementor_library reports viewable:false while its permalink still
+          // renders, the same adjustment the Command Center makes.
+          viewable: doc.isTemplate ? !!doc.link : doc.viewable !== false,
+          isTemplate: !!doc.isTemplate,
+          templateId: String(tag.templateId),
+          root: tag.root,
+          name: tag.name || "",
+          nodeId: tag.nodeId,
+          depth: tag.depth,
+        };
+        total += 1;
+        // A tag naming a template that is not on this site is a broken link
+        // rather than a usage of nothing: the template was deleted and the block
+        // on the page is now orphaned. Reported, never dropped — a tag pointing
+        // nowhere is exactly what someone needs to be told about.
+        if (known.size && !known.has(row.templateId)) {
+          orphans.push(row);
+          continue;
+        }
+        if (!byTemplate[row.templateId]) byTemplate[row.templateId] = [];
+        byTemplate[row.templateId].push(row);
+      }
+    }
+
+    // Templates last: a page using a block is the ordinary answer, a template
+    // holding another template's block is the composition case and reads better
+    // underneath it. Root index orders the rest, so two roots of one template in
+    // one document stay in their own order.
+    const order = (a, b) =>
+      Number(!!a.isTemplate) - Number(!!b.isTemplate) ||
+      String(a.docTitle).localeCompare(String(b.docTitle)) ||
+      (a.root || 0) - (b.root || 0);
+    for (const rows of Object.values(byTemplate)) rows.sort(order);
+    orphans.sort(order);
+
+    return { byTemplate, orphans, total, docCount };
+  };
+
   // Elementor's template-library payload, flattened to the shape every consumer
   // here reads. Field names vary across Elementor versions, so take the first of
   // several candidates and hand back the raw key list so a missing column can be
@@ -231,6 +353,9 @@
     withTemplateTag,
     parseTemplateTag,
     stripTemplateTag,
+    USAGE_INDEX_VERSION,
+    findTemplateTags,
+    buildUsageIndex,
     parseWorkingDomain,
     elementorEditUrl,
     wpAdminEditUrl,
