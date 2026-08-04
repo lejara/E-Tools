@@ -1298,3 +1298,56 @@ browser.storage.onChanged.addListener((changes, area) => {
     presetDelayEl.value = changes.animationDelayAccumulation.newValue ?? "";
   }
 });
+
+/* ------------------------------------------------------------- components */
+
+// The component system lives entirely in Component/ and owns its own window.
+// This panel holds exactly ONE button for it — everything component-shaped
+// (sync, new, insert, detach, the site-wide tree) lives in that window, so this
+// file never grows a second copy of the component UI and deleting Component/
+// still removes the feature outright.
+//
+// It is a window rather than a message to a tab because nothing here needs an
+// editor: the command centre reads the site through a WordPress tab and manages
+// its own cache. Actions that DO need `elementor` are its problem, not this
+// file's.
+const componentOpenBtn = document.getElementById("component-open");
+const componentStatusEl = document.getElementById("component-status");
+
+const COMPONENT_PANEL_URL = browser.runtime.getURL(
+  "Component/component-panel.html",
+);
+
+const showComponentStatus = (text, tone = "") => {
+  if (!componentStatusEl) return;
+  componentStatusEl.textContent = text;
+  componentStatusEl.className = `templates-status${tone ? ` ${tone}` : ""}`;
+};
+
+// Focus the window if it is already up rather than opening a second one — two
+// command centres would keep two copies of the index cache and race each
+// other's writes to it. Same guard background.js uses for this panel.
+componentOpenBtn?.addEventListener("click", async () => {
+  componentOpenBtn.disabled = true;
+  try {
+    const wins = await browser.windows.getAll({ populate: true });
+    for (const w of wins) {
+      if (w.tabs && w.tabs.some((t) => t.url === COMPONENT_PANEL_URL)) {
+        await browser.windows.update(w.id, { focused: true });
+        showComponentStatus("Command Center focused.", "ok");
+        return;
+      }
+    }
+    await browser.windows.create({
+      url: COMPONENT_PANEL_URL,
+      type: "popup",
+      width: 620,
+      height: 860,
+    });
+    showComponentStatus("Command Center opened.", "ok");
+  } catch (err) {
+    showComponentStatus(`Could not open — ${err?.message || err}`, "warn");
+  } finally {
+    componentOpenBtn.disabled = false;
+  }
+});

@@ -571,6 +571,14 @@
       return {
         ok: false,
         ratio,
+        // Carried on the failure path too, and only one caller wants them:
+        // Component/ "Link to Component" shows the divergence and offers to
+        // link anyway, which needs the alignment that was already computed.
+        // Every other caller checks `ok` first and never reads this, so
+        // handing it back cannot change their behaviour — the alternative was
+        // a second LCS implementation, which is exactly the drift this file
+        // exists to prevent.
+        pairs,
         missing,
         extra,
         error:

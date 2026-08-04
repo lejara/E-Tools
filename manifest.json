@@ -60,6 +60,13 @@
         "Tools/wp-rest.js",
         "Tools/admin-templates.js",
         "Tools/wp-pages.js",
+        "Component/component-format.js",
+        "Component/component-index.js",
+        "Component/component-core.js",
+        "Component/component-actions.js",
+        "Component/component-ui.js",
+        "Component/component-navigator.js",
+        "Component/component-hotkeys.js",
         "hotkey-defaults.js",
         "hotkeys.js"
       ],
@@ -72,6 +79,7 @@
       "resources": [
         "Tools/page-bridge.js",
         "Tools/breakpoint-flyout-page.js",
+        "Component/component-page.js",
         "assets/Froggy.gif",
         "assets/Froggy1.png"
       ],

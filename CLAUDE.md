@@ -12,6 +12,17 @@ Browser extension (MV3, Firefox) that adds hotkey-driven tools to Elementor's Wo
 ├── hotkey-defaults.js   # dual-context: ACTIONS table + binding formatting
 ├── template-format.js   # dual-context: template/post metadata, search, list normalization, Edit & View URL building
 ├── animation-preset-fields.js # dual-context: the Motion Effects field table, preset file build/parse/validate
+├── Component/           # component system — self-contained, see "Component system"
+│   ├── component-format.js   # dual-context: schema, base64 codec, canon, validation, staleness, site-index tree
+│   ├── component-index.js    # wp-admin: the site-wide walk — types → docs → _elementor_data → components
+│   ├── component-page.js     # page world: scan, settings, save hooks, override derivation
+│   ├── component-core.js     # transport, template REST, chain walk, resolution
+│   ├── component-actions.js  # New Component · Insert · Link · Sync · Reset · Detach · Rename
+│   ├── component-ui.js       # in-editor overlay + status icons + inline rename
+│   ├── component-navigator.js# blue banner on component roots in the Structure panel
+│   ├── component-panel.html  # the Command Center window (own window, not a panel view)
+│   ├── component-panel.js    # its logic: cache-and-diff scan, tree, search, per-row Edit/View
+│   └── component-hotkeys.js  # Ctrl+Shift+0 sync · Ctrl+Alt+C panel
 ├── UI/                  # window opened from the toolbar icon
 │   ├── panel.html
 │   └── panel.js         # reads browser.storage.local, re-renders on change; site-content list
@@ -653,3 +664,636 @@ API (on `window.__ElementorTools.multiSelect`):
 - `has(id)` → boolean
 - `clear()` — empty the set + strip tints
 - `onChange(cb)` — cb receives a `Set<string>` snapshot; returns an unsubscribe fn
+
+## Component system
+
+A Figma-style component model, living entirely in `Component/`: a **base**
+defines a block, an **instance** is a copy that tracks it, and the difference
+between them is stored as **overrides**. It shares nothing with `Tools/` except
+two read-only globals — `__WpRest` for the nonce and `__ElementorTools` for the
+shared progress modal — so deleting the folder removes the feature outright.
+
+### `-(Comp-Data)-` is the source of truth
+
+Every component, base or instance, carries an HTML widget with that layer name
+as a **direct child of its root container**. Finding components means finding
+those widgets, and the widget's *parent container* is that component's root. The
+scan walks the whole document, not just the top level: a template can merely
+*contain* an instance without being one, which is the ordinary case.
+
+The payload is base64 inside a comment inside a script tag. That is not
+decoration — override values are arbitrary user text, and a raw JSON payload
+containing `*/` closes the comment early while one containing `</script>` closes
+the tag. Either corrupts the document silently; base64's alphabet contains
+neither. `btoa` alone is still wrong: the payload is UTF-8 encoded first, in
+chunks, because `btoa` throws above U+00FF and spreading a large byte array
+blows the call stack.
+
+**The data widget must never render.** It has no visible output, but its wrapper
+is a flex child of the component root, and an Elementor container is
+`display:flex` with a gap — so a zero-height child still consumes a gap row and
+shifts everything below it. Measured on the frontend. All five responsive hide
+switchers are written at creation (`hide_desktop: "hidden-desktop"` and the four
+breakpoint twins); hiding only desktop leaves the gap everywhere else.
+
+### Schema
+
+```js
+{
+  v: 1, id: "cmp_…", name, role: "base" | "instance",
+  templateId,                      // set when this component is itself a template
+  parent: { templateId, componentId } | null,
+  // instance only
+  instanceId: "inst_…",            // several instances share one component id
+  map:        { parentNodeId: instanceNodeId },
+  overrides:  { parentNodeId: { controlKey: value } },
+  structure:  { removed: [], added: [{ nodeId, parentBaseNodeId, afterBaseNodeId }] },
+  syncedAgainst: [{ templateId, modifiedGmt }],
+}
+```
+
+- **Overrides are per concrete control key**, breakpoint variant included
+  (`padding_tablet`), never the family — overriding mobile padding alone has to
+  be expressible. `resolveBase`/`buildFamily` in `breakpoint-flyout-page.js` is
+  the reference for that distinction.
+- **`map` is to the immediate parent only.** Flattened to the root base it goes
+  wrong the moment a middle link changes structure; composing two correct maps
+  does not.
+- **`syncedAgainst` holds the whole chain.** A to B to C is stale if either A or
+  B moved.
+- `_element_id` and `_element_cache` are never inherited — the first would give
+  two instances the same DOM id, the problem `template-decouple.js` already
+  documents. `_title` deliberately *is* inherited: renaming a layer in the base
+  should reach its instances, and an instance renaming one is a legitimate
+  override.
+
+### A parent must always be a template
+
+An instance sitting on a page can never be a parent. Resolving one would mean
+cross-document reads, and editing that page would silently redefine every
+descendant. Saving it as a template promotes it — which is how
+base to instance to instance chains are built, and it keeps every ancestor
+fetchable by id from a single endpoint.
+
+### Value resolution does not recurse
+
+Resolving a parent reads **that template's content directly**. An instance saved
+as a template is already a materialised copy with its overrides baked into its
+elements, so its content *is* its resolved state. Syncing C against B uses B as
+it currently stands; if B is stale against A, you sync B first. That is the
+manual flow working, not a gap.
+
+The chain is still walked, but **only to collect staleness stamps**. The visited
+set there is mandatory rather than defensive — a component that transitively
+contains itself would recurse until the stack gives out.
+
+### Overrides are derived, never tracked
+
+At save time each instance's live values are diffed against its resolved parent
+values, and whatever differs *is* the override set. There is deliberately no
+change-tracking subsystem: nothing accumulates, nothing is lost when a tab
+closes, and the system's own writes cannot feed back into it. The settings hook
+survives only to drive UI decoration, so if it breaks you get a missing marker,
+not wrong data.
+
+Accepted consequence: a field set to the *same* value the parent has reads as
+"not overridden" and will follow the parent later — consistent with how
+`isUnset` treats "equal to default" in the breakpoint code.
+
+**The resolved-value cache is what makes this possible.** Derivation runs inside
+a pre-save hook, which cannot await a network fetch, so the content script
+resolves each instance's parent asynchronously — on editor load and after every
+sync — and pushes the values into the page world to be diffed synchronously.
+
+**A cold cache entry must leave existing overrides alone.** Deriving from
+nothing produces an empty override set and wipes the user's work. It is the most
+destructive thing this system could do; the guard is in `deriveOverrides`.
+
+#### Globals and dynamic tags are not controls
+
+Elementor keeps global-value and dynamic-tag references in their own
+side-objects **keyed by control name**, rather than in the controls they apply
+to. Setting a container's background from a global colour writes
+
+```
+__globals__: { background_color: "globals/colors?id=558d48e" }
+```
+
+and leaves `background_color` itself untouched. `__dynamic__` has the same shape
+and holds dynamic tags.
+
+Neither key is a control — verified live, `controls['__globals__']` is
+`undefined` — so `resolveControlKey` answers `null` and **every path that
+filtered on "is this a control" silently discarded them.** That is a second,
+separate reason a base edit appeared to sync and change nothing: the value was
+reported as `no such control on this element` and dropped. Three places had to
+change:
+
+- **`nodeSettings`** iterates `Object.keys(controls)` and therefore could not
+  see them at all. They are carried explicitly now, read off `toJSON()` (where
+  they do appear). Without this the live side reports no globals, which reads as
+  "the instance has none" and turns every comparison against a parent that has
+  them into a phantom difference.
+- **`apply-node-settings`** writes them whole, and remaps their **contents**
+  rather than the key — a widget spells the same control `_background_color`
+  where a container has `background_color`. Verified live that
+  `document/elements/settings` accepts `__globals__` directly.
+- **`deriveOverrides`** treats them as real settings, so an instance that picks
+  a different global colour records an override instead of having it reverted on
+  the next sync.
+
+Clearing one is a write of `{}`, not a `reset-settings` call: there is no
+control and therefore no default for that command to restore.
+
+Known granularity limit: the whole side-object is one settings key, so an
+instance overriding a single global colour overrides `__globals__` entirely.
+
+#### A stale instance derives nothing
+
+Derivation answers *"what did the user change here?"* by diffing the instance
+against its parent. That only means anything while the parent is still the one
+the instance was built from. Once the base moves ahead, **every field the base
+changed also differs** — and gets recorded as this instance's override, which
+pins it and stops any future sync from delivering it.
+
+Merely *opening* a stale instance was enough to trigger it, because the hook is
+registered on `document/save/auto` and autosave fires on a timer.
+
+So `warmResolved` compares each instance's `syncedAgainst` against the parent
+chain as it stands now, and reports stale instances instead of caching them.
+Page-side they are **evicted** from the resolved map, not just flagged — a
+previous warm may have left usable values there from when the instance was in
+sync, and the flag alone would not stop derivation from using them.
+
+The accepted cost runs the other way: edits made to an instance **while it is
+stale** are not recorded, and a sync will overwrite them. That is recoverable
+and visible — the row is flagged out of date and every skip is logged with the
+component's name. A silently pinned field is neither.
+
+`syncedAgainst` is the baseline rather than any freshness heuristic, because it
+*is* the parent state the instance's current content corresponds to. An empty
+baseline counts as stale: a never-synced instance has nothing meaningful to diff
+against, and refusing to derive is the conservative direction. Ids are compared
+as strings — `templateId` is written as a number in some payloads and a string
+in others, and a raw comparison would flag every instance as permanently stale.
+
+#### Both sides must be normalised against the control defaults
+
+The parent and the instance are read by different code that disagrees about
+which keys exist, and comparing them raw manufactures overrides out of nothing:
+
+- parent — `nodeValuesFromJson` reads raw `_elementor_data`, which **does**
+  carry keys whose value equals the control default
+- instance — `nodeSettings` strips exactly those keys
+
+Measured: a heading whose `title` was `"Add Your Heading Text Here"` on **both**
+sides — stored in the parent, stripped from the instance — compared as
+`undefined` vs `"Add Your Heading Text Here"` and recorded an override of
+`title: null`.
+
+That is not cosmetic. **An override pins its key forever**: `planInstance` skips
+any key present in the override set, so one phantom override silently stops that
+field from ever syncing again. It is exactly why editing a field in a base
+appeared to do nothing in the instance.
+
+So `deriveOverrides` substitutes the element's own control default wherever
+either side is absent, and compares the normalised pair. Verified on the failing
+node: the phantom disappears while a genuine instance edit is still detected.
+
+The old comment on `nodeValuesFromJson` claimed `_elementor_data` holds only
+non-default values. **It does not** — do not reintroduce that assumption.
+
+### Writing comp-data without disturbing the user
+
+```js
+container.settings.set("html", payload);     // no history entry, no hook fire
+elementor.saver.setFlagEditorChange(true);   // still included in the next save
+```
+
+All three properties were measured before the code was written. The dirty flag
+is set **only when the payload actually changed** — setting it unconditionally
+leaves the document permanently dirty and Elementor's autosave never stops.
+
+A `registerUIBefore` hook on `document/save/default` runs before serialisation,
+so a model write inside it lands in that same save — comp-data can never be one
+save behind its content. `document/save/auto` is hooked too, because autosave
+fires on a timer and would otherwise persist stale derived data.
+
+**`new Hook()` does not register.** You must call `$e.hooks.registerUIBefore(…)`
+or `registerDataAfter(…)`. A hook that never fires looks exactly like one whose
+conditions are wrong, which cost two probes to work out.
+
+### Sync
+
+Manual and scoped to the open document — `Ctrl+Shift+0`, or the panel. It maps
+onto `template-sync.js` almost one for one: fetch, scan, checklist, per-target
+rows, summary with Copy details. Base changes reach a page only when someone
+opens it and syncs; published pages stay stale until then. Known property, not a
+gap.
+
+| Case | Rule |
+|---|---|
+| Parent changed a field, no override | take the parent's value |
+| Parent changed a field, override exists | keep the override |
+| Parent added a node | insert it |
+| Parent wrapped an **existing** node | insert the shell, **move** the node in |
+| Instance added a node | never touch |
+| Instance deleted a node the parent changed | instance wins, silently |
+| Parent deleted a node the instance overrode | **conflict — ask** |
+
+Conflicts are collected across every instance during planning and shown as
+**one** checklist before anything is written. Prompting per node would mean a
+prompt storm on a page holding several instances.
+
+#### Plan, then apply — and the order is load-bearing
+
+`planInstance` computes everything with no writes. `applyPlan` then runs:
+
+1. **Deletes** — so a later insert cannot anchor to something about to vanish.
+2. **Inserts** — outermost first; a moved node's new home is often a container
+   this step just created.
+3. **Moves** — resolved against the map only now, because their targets may not
+   have existed before step 2.
+4. **Settings** — chunked at `NODE_CHUNK` (20), since the page world cannot
+   yield mid-op. Same reasoning as `STYLE_CHUNK`.
+
+#### The wrap bug, and why the move step exists
+
+Wrapping an existing node in a new container in the base produced a **duplicate**
+in the instance: the new container was inserted with its whole JSON subtree,
+re-creating a node that already existed, and then `Object.assign(map, idMap)`
+repointed the map at the copy — orphaning the original, which would return on the
+next save as instance-added junk. Observed live: the base heading mapped to the
+new duplicate while the real heading dropped out of the map entirely.
+
+Two things fix it and both are load-bearing:
+
+- Descendants that already exist in the instance are **pruned** from the inserted
+  JSON and **moved** in afterwards. `document/elements/move` preserves the
+  element id, which is what keeps the map valid across the operation.
+- An id-map entry is **never overwritten while it still points at a live
+  element**.
+
+Only the **topmost** already-live node is collected for a move — its subtree
+travels with it, so descending past it would move a node twice. Moves are
+anchored to a **sibling**, not an index: an index taken from the parent template
+is off by one wherever the data widget sits, and drifts again as earlier moves
+land, so the bridge resolves the anchor against live children instead.
+
+### Staleness and icons
+
+One batched request over every ancestor
+(`?include=1,2,3&_fields=id,modified_gmt`) gets the current stamps; a mismatch
+against `syncedAgainst` lights the icon. That endpoint is a **collection**, so
+`_fields` is safe on it — the trap is `/wp/v2/types`, documented above.
+
+Deliberately biased toward **over**-warning. A parent re-saved with no real
+change bumps its stamp and lights the icon; the sync then finds nothing to do
+and refreshes the stamp, clearing it. A no-op sync therefore still writes its
+stamps. A missed stale instance is the failure that actually costs something.
+
+Icons: broken (parent missing, cycle, invalid payload), out of date, has
+overrides, in sync, base. Broken is louder than out-of-date on purpose — a
+deleted parent is a data problem, not a freshness one.
+
+### Reaching a template without opening its editor
+
+- **Read:** `GET /wp-json/wp/v2/elementor_library/<id>?context=edit&_fields=meta._elementor_data`.
+- **Write:** `admin-ajax.php` to `elementor_ajax` to `save_builder` with
+  `editor_post_id`, and **pass the target's real `status`** — hardcoding
+  `publish` publishes drafts.
+
+**Never write `meta._elementor_data` over REST.** The schema says
+`readonly: false` and it returns 200 and persists, but it does **not**
+invalidate Elementor's rendered-HTML cache: a changed marker sat in meta while
+the frontend served old HTML with the CDN on `BYPASS` and `cache: 'reload'`.
+`save_builder` invalidates it and creates a WP revision.
+
+**An open editor clobbers out-of-band writes.** It holds its own in-memory
+model, so a write into a document open elsewhere is invisible to that tab and
+its next save silently reverts it. This is why sync only ever touches the
+document it is running in.
+
+### Element creation facts this relies on
+
+- `document/elements/create` **builds a whole subtree** from nested
+  `model.elements` — no `import` needed.
+- **Ids supplied in the model are honoured**, which is what makes the old-to-new
+  id map returned by an insert trustworthy. That map *is* the instance's
+  `parentNodeId` to `instanceNodeId` map, so node correspondence never needs
+  deriving by name or position. If this ever stops holding, the map has to be
+  rebuilt by walking the created tree.
+- Ids are still regenerated on imported JSON, for the reason `insert-template`
+  documents: re-used ids make two elements answer to one lookup.
+- `options: { edit: false }` — the default opens the panel for the new element.
+
+### Mirrored constants
+
+`component-page.js` is injected into the page world and **cannot read a
+content-script global**, so it repeats the constants it shares with
+`component-format.js` — the widget title, hide flags, `NEVER_INHERIT`, the
+base64 codec, `canon`, and `resolveControlKey`. They are marked `MIRROR`. Change
+one, change both. Same sanctioned duplication as `page-bridge.js` and
+`normalizeTemplateList`.
+
+Load order: `component-format.js` first, and the whole folder **after**
+`Tools/wp-rest.js` and `Tools/core_utils.js`.
+
+### Two surfaces, split by scope
+
+The in-editor overlay (`Ctrl+Alt+C`) is **this document**: what is in front of
+you, and the actions on it. The **Command Center** — its own window, opened by
+the single Components button in `UI/panel.html` — is **the site**: every base,
+with its instances beneath it and their instances beneath them.
+
+It is a window rather than a view inside `UI/panel.html` so the rule that
+deleting `Component/` removes the feature outright still holds; a panel view
+would have put the cache and the tree in `UI/panel.js`. The cost is that
+`askElementorTab` and `openInNewTab` are re-implemented in `component-panel.js`
+— extension pages are scripts, not modules, and nothing in `panel.js` is
+reachable from another page. Both are marked `MIRROR`.
+
+The main panel keeps **one** button, deliberately. Sync, New Component, Insert,
+Link and Detach all moved into the Command Center's "This document" row, which
+dispatches them to the editor tab and reports that the run *started* — same
+contract as `run-action`, and the same reason the responding tab is focused
+afterwards.
+
+Every row carries **Edit** and **View**, the same pair the main panel's content
+list has. Edit never has to choose an editor: the cheap pass filters on
+`elementor === true`, so every indexed document is Elementor-built and the trap
+where `post.php?action=elementor` quietly converts a post it never built cannot
+be reached. View is the permalink for a published post and the preview route
+otherwise — with one adjustment, that `elementor_library` reports
+`viewable: false` while its permalink still renders, so a template with a link
+is treated as viewable rather than given a dead button.
+
+### `post_content` cannot find components — measured, not assumed
+
+The cheap discovery route would have been a single `?search=` for the payload:
+Elementor writes *something* to `post_content`, so if the comp-data `<script>`
+landed there the whole site index would be one request. It does not. Measured
+on the test site:
+
+| probe | result |
+|---|---|
+| `?search=elementor-element` | 0 hits — while the home page renders 287 of them |
+| `?search=gspb_heading-id-gsbp-808d76c` (a unique rendered class) | 0 hits |
+| `?search="Put data entry on autopilot"` (body **text**) | 3 hits |
+
+Text is searchable, markup is not. Whether Elementor stores a text-only
+fallback or a search plugin filters the index, the conclusion is the same: a
+`<script>` holding base64 will never come back from `?search=`. Do not
+re-derive this — cross-page discovery has to read `_elementor_data`.
+
+### The site index: cache and diff, on two stamps
+
+`component-index.js` owns the walk — `/wp/v2/types` → each type's collection →
+`_elementor_data` for the documents that changed. It runs on every `/wp-admin/`
+page, editor included, and is reached two ways: the panel by runtime message,
+the in-editor Insert picker by `window.__ElementorComponentIndex`, because a
+content script *can* share a global with another content script in the same tab
+but **cannot** call its message listener.
+
+That last point is why it owns its own post-type walk instead of reusing
+`list-posts`: only the panel could have driven that reuse, `list-posts` excludes
+`elementor_library` (where every base lives), and it does not return `rest_base`
+— which is most of what the walk is.
+
+**Two stamps per document, and the split is load-bearing:**
+
+- `modifiedGmt` — what the document says now. Feeds `staleness()`, so it must
+  always be the truth.
+- `indexedGmt` — what it said when its content was last **successfully read**.
+  Feeds the diff.
+
+One field cannot do both. Storing the fresh stamp against a document whose read
+*failed* makes the next refresh consider it up to date and never retry it — its
+components vanish from the tree and stay gone. A failed read restores the
+previous entry and is reported, because "could not read" is not "no components".
+
+Documents with **no** components are cached too. Without an entry they look
+unread on every refresh and are re-fetched forever, and they are the majority of
+any real site. Only the slim projection is stored (`slimComponent`) — override
+*counts*, never values, or the cache would hold a copy of the site's content.
+
+Opening the window renders the cache instantly and scans only on **Refresh**,
+which states the one-time cost first. On the test site a cold run is 429 public
+documents plus the template library.
+
+### The tree builds copies, it does not annotate
+
+One component legitimately appears at two places in a chain, so the `nodes`
+entries `buildIndexTree` works from are **shared**. Writing depth, state or a
+truncated child list onto them corrupts the other appearance — clearing
+`children` on a cycle stop wiped the real tree and made the looping components
+disappear from the list entirely. The walk therefore emits a fresh display node
+per visit.
+
+A chain that loops produces **no base**, so nothing reaches either component and
+neither would be drawn at all. Anything the walk never visits is surfaced at top
+level with the loop named. Silently omitting a component from the one screen
+that claims to list every component is worse than drawing it oddly.
+
+Two orphan cases are told apart because they need different fixes: the parent
+template is *gone*, versus the template is still there but *is no longer a
+component* (someone detached it).
+
+### Link an existing container to a component
+
+Select a container, press **Link…**, pick a component, and that container
+becomes an instance of it — with **nothing on the page changing**. Every
+difference is recorded as an override instead.
+
+Insert and link differ in exactly one place: **where the node map comes from.**
+An insert *creates* the elements from the parent's JSON, so
+`document/elements/create` hands the old→new map back for free. A link finds a
+container that was built independently, so the correspondence has to be worked
+out — and that is what `ns.pairTrees` already does for `template-sync` (LCS on
+`type + name`, then type alone). Its pairs are `{sourceId, targetId}`, which
+*is* the map. Nothing about pairing is reimplemented here.
+
+Everything after the map is the ordinary path: comp-data is written,
+`warmResolved` pushes the parent's values, and `refresh-comp-data` derives the
+overrides through the same hook a save uses. So a link cannot disagree with what
+the next save would have written.
+
+- **The parent must be a template**, which the picker enforces by only offering
+  components found in `elementor_library`. The container being linked can be
+  anywhere.
+- **An unmatched parent node is declared `structure.removed`, not left
+  unmapped.** Unmapped means "new in the parent" to `planInstance`, which would
+  insert it on the next sync and rebuild the container into the base. Declaring
+  it removed is what makes linking a snapshot.
+- **Root type mismatch is the one hard refusal.** Below `MIN_MATCH_RATIO` the
+  divergence and both tree shapes are shown with a **Link anyway** button —
+  unlike a bulk sync this is one deliberate act on one chosen container, so the
+  decision is handed over rather than taken. The two cases are told apart by
+  whether `pairTrees` returned a `ratio` at all.
+- **A container holding other components is refused.** Two instances whose maps
+  overlap would both manage the same elements on every sync and nothing
+  downstream can say which wins. The inverse — linking a container that sits
+  *inside* an instance — is only warned about, since the enclosing map may not
+  cover that branch.
+- **Consequence worth stating:** because every difference becomes an override,
+  a freshly linked container starts fully pinned. Later base changes to those
+  fields will not reach it until the override is cleared.
+
+#### Two bugs this surfaced in existing code
+
+Both would have silently defeated the "nothing changes" promise:
+
+- **`deriveStructure` recomputed `removed` from the map alone**, so link-time
+  removals — parent nodes that were never mapped — were dropped on the first
+  save. A never-mapped node cannot be *derived* as removed; there is nothing in
+  the document to observe its absence against. It is a recorded decision and is
+  now carried forward.
+- **`planInstance`'s removed-guard required `instanceNodeId`**, so it only ever
+  caught nodes that were mapped and then deleted. Every link-time removal fell
+  through to the insert branch. The test now happens before the mapping is
+  consulted.
+
+#### `pairTrees` returns `pairs` on the low-ratio failure
+
+One additive field in `Tools/core_utils.js`, and the only change the component
+system makes outside its own folder besides script wiring. The **Link anyway**
+path needs the alignment that was already computed, and the failure return
+dropped it. Every other caller checks `ok` first and never reads the field, so
+handing it back cannot change their behaviour — the alternative was a second LCS
+implementation, which is exactly the drift that file exists to prevent.
+
+### Reset an instance to its base
+
+`resetInstances()` throws away everything that makes an instance differ from its
+base — the overrides, the nodes it added, and its declaration that it does not
+have certain base nodes. Afterwards it is a faithful copy again: still linked,
+still an instance, just with nothing of its own.
+
+It is the destructive counterpart to sync. Sync deliberately **preserves**
+overrides, which means there is otherwise no way to give one back.
+
+- **Clearing the payload happens BEFORE planning**, and that is the whole trick.
+  `planInstance` honours `overrides` and `structure.removed`, so handing it a
+  payload with both emptied makes it write every parent value and re-insert
+  every base node the instance had declared it did not have. No separate
+  reset-specific merge logic exists.
+- **Added nodes are deleted explicitly**, because nothing else would touch them:
+  they are simply unmapped, and `planInstance` never looks at unmapped instance
+  nodes. Only the topmost is collected — the subtree goes with it, and listing
+  descendants separately would hand the same elements to `delete-nodes` twice.
+- **A nested component's subtree is excluded whole.** Those nodes belong to
+  another component; deleting them would destroy something the user did not
+  select. They are kept and reported.
+- **Two confirmations, unlike detach.** The checklist chooses *which*; a second
+  step confirms *what is lost*, with the override and node totals spelled out.
+  Detach needs only one because it destroys no content — a reset deletes
+  elements and discards work.
+
+### Detach
+
+`detachComponents()` deletes the data widget and nothing else — the content is
+already real elements, so there is nothing to unpick. That makes it the exact
+inverse of `newComponent`, and much simpler than `template-decouple.js`, whose
+job is swapping a widget for content that did not previously exist.
+
+It borrows decouple's checklist all the same, because the failure mode is
+identical: rows that read the same, where unticking the wrong one is silent, so
+repeats are numbered in document order. Broken components are offered too —
+an unreadable payload is exactly what someone wants to detach.
+
+Detaching a **base** orphans every instance of it site-wide. The count comes
+from the cached index, **cache-only**: opening a checklist must not turn into a
+multi-minute scan, so a cold cache simply says less.
+
+### Rename reaches only the open document
+
+A component's name is comp-data, so a rename is one model write. The overlay can
+always do it. The Command Center can only do it for a document an editor
+currently has open, and disables the button with a reason otherwise — an
+out-of-band write into a document open elsewhere is silently reverted by that
+document's next save, which is the clobbering documented above. The panel learns
+which document that is by asking the editor tab for `doc-info`.
+
+A base is **seeded** from the template's title at creation and independent
+after. `docInfo` gained `postTitle` for this: the old code used the root
+container's layer name, which a user usually never sets, so every new component
+read as untitled.
+
+### The Structure banner
+
+`component-navigator.js` tints a component root's navigator row **orange** —
+one hue at two strengths: a **base** at 0.3, an **instance** at 0.1. They are
+the same kind of thing at different weights, since a base defines the block and
+an instance merely follows one; a page full of instances at full strength would
+be a wall of orange in which the row that actually defines something does not
+stand out, which is the banner's whole job. A component whose payload will not
+decode is drawn at base strength — its role is precisely what cannot be read,
+and louder is the right default for something broken.
+
+It is read-only decoration, re-applied by a `MutationObserver` on the same churn
+`multi-select.js` handles, and it never writes to the document.
+
+Two row markers sit **next to the expand arrow**: `+` (green) on a node this
+instance added, `*` (amber) on a node carrying overrides. They are mutually
+exclusive — an added node is not mapped, so it cannot also be overridden.
+
+**The `*` marker is currently OFF** (`SHOW_OVERRIDE_MARKER = false`) — it was
+marking rows it should not. Switched off rather than deleted, because the live
+derivation behind it is shared with nothing else and would only have to be
+written again; the op still reports `overridden` and the navigator is the only
+reader, so flipping the flag is the whole re-enable. The `+` marker is
+unaffected and stays on: it comes from the node map rather than from derivation,
+which is the suspect part.
+
+The anchor was measured, not guessed. A row is
+
+```
+.elementor-navigator__item
+  > .elementor-navigator__element__list-toggle   (the arrow)
+  > .elementor-navigator__element__element-type  (the kind icon)
+  > .elementor-navigator__element__title
+```
+
+so a `::before` on the **type icon** lands between the arrow and the icon. That
+element is present on every row — including leaves, where the arrow collapses to
+zero width — and its `::before` computes to `none` on all of them, so nothing of
+Elementor's is displaced. The arrow's own `::after` was the other candidate and
+is worse: on a leaf row it is a zero-width flex item, so giving it content
+shifts the row.
+
+Two static rules rather than `content: attr()`, because `attr()` reads the
+attribute of the element the pseudo belongs to, not an ancestor — a data
+attribute would have to live on the inner icon, which Elementor re-renders. The
+class goes on the row, which is what the retint already keys on.
+
+Both markers come from one `component-markers` op rather than a scan plus a
+subtree read per component: the navigator repaints on every collapse, expand and
+edit, and a round trip per repaint turns a decoration into a performance
+problem. Overrides in that op are derived **live** when the resolved cache is
+warm, so a field changed a moment ago is marked without waiting for a save.
+Unlike `deriveStructure`, the added-node walk does not stop at the first
+unmapped node — that records a subtree once, this marks rows, and a child of an
+added container is just as new as the container.
+
+**Orange rather than blue, and that is the point.** `multi-select.js` tints a
+shift-clicked row `rgba(56,128,255,0.35)`. The first version of this banner was
+blue at 0.3 and was indistinguishable from a selection — the two mean entirely
+different things ("this is a component" versus "you picked this") and routinely
+land on the same row, so they have to differ by hue, not by a 0.05 alpha step.
+Where both apply, selection still wins the cascade: its rule carries
+`!important` and this one does not. The colour is a single named constant
+(`BANNER`).
+
+### Deliberately not done
+
+- **No overridden-field label decoration** yet — the `*Height` bold marker on an
+  overridden control in Elementor's panel. Needs a live "selection → component
+  context" resolver plus the panel MutationObserver.
+- **No sync-one-instance or reset-overrides.** Sync is still all-or-nothing per
+  component, chosen from the checklist.
+- **No cross-page *action*.** The Command Center can find an instance on any
+  page and take you to its editor, but every write still happens in the
+  document that is open — for the reason out-of-band writes are refused.
+- **No navigator row badges.** `multi-select.js` already owns `::after` on those
+  rows, so `::before` needs verifying against Elementor's own styles first. The
+  row background is claimed now; the pseudo-element is not.
