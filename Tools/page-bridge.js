@@ -349,10 +349,16 @@
   // createTemplateWidget builds the widgets, and the component system inserts
   // whole subtrees.
   //
-  // It lives on `window` rather than in this closure because
-  // Component/component-page.js is a *separate* page-world script and shares no
-  // scope with this one — the same boundary that keeps the template-tag regex out
-  // of this file. MIRROR: the key name and the ++/-- protocol are repeated there.
+  // It lives on `window` rather than in this closure because the other end is a
+  // *separate* page-world script and shares no scope with this one — the same
+  // boundary that keeps the template-tag regex out of this file.
+  //
+  // That other end is now in a DIFFERENT EXTENSION: component-page.js in
+  // Elementor Components (../Elementor_Components), which repeats the key name
+  // and the ++/-- protocol as a MIRROR. It still works because the page world is
+  // shared across extensions even though content-script sandboxes are not.
+  // Nothing fails loudly if this drifts — the symptom is component instances
+  // silently losing their spacing. Do not rename the key.
   //
   // A counter, not a boolean: a suppressed run routinely issues several creates
   // and can nest, and a boolean would be cleared by the inner one while the outer

@@ -18,10 +18,12 @@
 //   - list-posts answers one message with the whole result; this one has to be
 //     driven in chunks so the panel's status line can move during a scan
 //
-// It shares nothing with Component/. That folder answers a different question
-// (which components exist and how they descend from each other) with a similar
-// walk, and the two are kept apart so deleting Component/ still removes the
-// component system outright and leaves this working.
+// It shares nothing with the component system's walk. That answers a different
+// question (which components exist and how they descend from each other) with a
+// similar walk, and the two were deliberately kept apart so that removing one
+// left the other working. That rule is what let the component system be lifted
+// into its own extension (Elementor Components, ../Elementor_Components) without
+// touching this file.
 (() => {
   if (!location.pathname.includes("/wp-admin/")) return;
 

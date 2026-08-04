@@ -571,13 +571,17 @@
       return {
         ok: false,
         ratio,
-        // Carried on the failure path too, and only one caller wants them:
-        // Component/ "Link to Component" shows the divergence and offers to
-        // link anyway, which needs the alignment that was already computed.
-        // Every other caller checks `ok` first and never reads this, so
-        // handing it back cannot change their behaviour — the alternative was
-        // a second LCS implementation, which is exactly the drift this file
-        // exists to prevent.
+        // Carried on the failure path too, and no caller in THIS extension
+        // wants them: "Link to Component" does, and that now lives in Elementor
+        // Components (../Elementor_Components), which ships its own verbatim
+        // copy of this file. It shows the divergence and offers to link anyway,
+        // which needs the alignment that was already computed.
+        //
+        // Kept rather than removed, because this file is copied across as a
+        // whole and dropping the field here would silently break that feature on
+        // the next port. Every caller checks `ok` first and never reads it, so
+        // handing it back costs nothing — and the alternative was a second LCS
+        // implementation, which is exactly the drift this file exists to prevent.
         pairs,
         missing,
         extra,
