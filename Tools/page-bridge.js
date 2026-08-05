@@ -150,6 +150,43 @@
     // opacity. Widgets have no overlay section, so this resolves to nothing on
     // them rather than needing to be scoped out.
     "background-overlay": (name) => name.startsWith("background_overlay_"),
+    // "Leave the background alone", whole: every background control there is,
+    // the type chooser included, so colour, gradient, video and slideshow stay
+    // with the page as well. A strict superset of the two groups above — asking
+    // for it alongside them costs nothing, since preserveKeysFor walks each
+    // control once however many groups claim it.
+    //
+    // `overlay_` catches the overlay's blend mode, which is the one control in
+    // that section not named after the background. The overlay's CSS filters are
+    // deliberately left out: `css_filters_*` is an overlay control on a container
+    // but the *image's* own filters on an image widget, and a predicate that sees
+    // only the control name cannot tell those apart. A container's overlay
+    // filters therefore still sync from the template.
+    background: (name) => /^(?:background|overlay)(_|$)/.test(name),
+    // The whole Motion Effects section, which is deliberately the same set
+    // animation-preset-fields.js manages: scrolling effects, mouse effects,
+    // sticky, and the entrance animation with its duration and delay. Name
+    // families rather than a key list, for the usual reason — the entrance
+    // animation and every sticky offset carry a variant per enabled breakpoint.
+    //
+    // **`motion_fx` is anchored, and that matters.** A container also carries a
+    // `background_motion_fx_*` family — the Background section's own scroll
+    // effects, 36 keys of it, measured on this build. An unanchored `includes`
+    // swept those in, so ticking "Keep animations" quietly preserved a slice of
+    // the page's background as well, with no background option ticked. Anchoring
+    // keeps this group to the Advanced tab's section and leaves the background's
+    // motion effects to the `background` group, where they belong: the two groups
+    // are disjoint, and each toggle's label is then true.
+    //
+    // handle_motion_fx_asset_loading is named explicitly — it is Elementor's own
+    // bookkeeping for this section, and a target that keeps its motion effects
+    // should keep its own answer about whether to load their assets. Its
+    // background-prefixed twin is excluded by the same anchor.
+    "motion-effects": (name) =>
+      /^motion_fx/.test(name) ||
+      name === "handle_motion_fx_asset_loading" ||
+      /^sticky(_|$)/.test(name) ||
+      /^animation(_|$)/.test(name),
   };
 
   // Widest first only matters for stripping: mobile_extra must not be read as

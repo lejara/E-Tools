@@ -154,6 +154,45 @@
     return b;
   };
 
+  // ESC and a Cancel button for the two hand-rolled shells here. Same contract
+  // as the shared modal's cancel (core_utils.js): it latches, nothing already in
+  // flight is abandoned, and the run stops at its next boundary. This file does
+  // not use the shared modal — its picker is a genuinely different shape — so the
+  // control is repeated rather than imported.
+  //
+  // detach matters: each shell installs a capturing keydown listener, and the
+  // notice's has to come off before the picker installs its own or one ESC would
+  // reach both.
+  const addCancel = (btnRow) => {
+    let requested = false;
+    let fire = null;
+    const promise = new Promise((r) => (fire = r));
+    const btn = makeBtn("Cancel", false);
+    const request = () => {
+      if (requested) return;
+      requested = true;
+      btn.textContent = "Cancelling…";
+      btn.disabled = true;
+      btn.style.cursor = "default";
+      btn.style.opacity = "0.6";
+      fire();
+    };
+    btn.addEventListener("click", request);
+    btnRow.replaceChildren(btn);
+    const onKey = (e) => {
+      if (e.key !== "Escape") return;
+      e.preventDefault();
+      e.stopPropagation();
+      request();
+    };
+    document.addEventListener("keydown", onKey, true);
+    return {
+      cancelled: () => requested,
+      whenCancelled: () => promise,
+      detach: () => document.removeEventListener("keydown", onKey, true),
+    };
+  };
+
   // Shown before the library fetch so the hotkey never sits silent. Any
   // tool doing a network round trip owes the user this — see CLAUDE.md.
   const openNotice = (message) => {
@@ -186,11 +225,21 @@
     wrap.appendChild(card);
     document.body.appendChild(wrap);
 
-    const close = () => wrap.remove();
+    // The library fetch is exactly where an accidental hotkey is regretted, so
+    // this phase is cancellable too.
+    const cancel = addCancel(btnRow);
+    const close = () => {
+      cancel.detach();
+      wrap.remove();
+    };
     return {
       setStatus: (t) => (status.textContent = t),
+      cancelled: cancel.cancelled,
+      whenCancelled: cancel.whenCancelled,
       // Leaves the modal up with a dismiss button so the failure is readable.
       fail(text) {
+        // Nothing left to cancel, and its key listener would outlive the phase.
+        cancel.detach();
         status.textContent = text;
         status.style.color = STATE_COLORS.error;
         const btn = makeBtn("Close", true);
@@ -542,8 +591,11 @@
     };
 
     const rows = new Map();
+    const cancel = addCancel(btnRow);
     return {
       setStatus: (t) => (status.textContent = t),
+      cancelled: cancel.cancelled,
+      whenCancelled: cancel.whenCancelled,
       addRow(id, label) {
         const row = document.createElement("div");
         row.style.cssText = "padding:2px 0;word-break:break-word;";
@@ -565,6 +617,7 @@
         d.textContent = ` — ${text}`;
       },
       finish(summary, state) {
+        cancel.detach();
         status.textContent = summary;
         status.style.color = STATE_COLORS[state] || "#cfcfcf";
         const close = makeBtn("Close", true);
@@ -575,7 +628,10 @@
           if (e.target === wrap) wrap.remove();
         });
       },
-      close: () => wrap.remove(),
+      close: () => {
+        cancel.detach();
+        wrap.remove();
+      },
     };
   };
 
@@ -590,10 +646,19 @@
       // Read the selection up front: the picker is a full-screen overlay, so it
       // cannot change while the modal is open. A failed read is non-fatal — the
       // option simply isn't offered.
-      const [res, placement] = await Promise.all([
-        ns.listSiteTemplates({ onWait: waitStatus(notice) }),
-        readPlacement(),
-      ]);
+      const fetched = await ns.untilCancelled(
+        Promise.all([
+          ns.listSiteTemplates({ onWait: waitStatus(notice) }),
+          readPlacement(),
+        ]),
+        notice,
+      );
+      if (fetched === ns.CANCELLED) {
+        ns.log("info", "Template insert: cancelled");
+        notice.close();
+        return;
+      }
+      const [res, placement] = fetched;
       if (!res?.ok) {
         ns.log("warn", `Template insert: ${res?.error}`);
         notice.fail(`Could not fetch templates — ${res?.error}`);
@@ -630,18 +695,33 @@
       // Widget mode never reads a template's content — it only writes an id into
       // a setting — so there is nothing to warm, and a preload failure reported
       // on those rows would be describing work the run does not do.
+      // Cancelled before anything landed. Every row says so rather than sitting
+      // on "waiting", and the summary can state plainly that nothing was touched.
+      const cancelledEarly = () => {
+        for (let i = 0; i < picked.length; i++) {
+          modal.setRow(i, "warn", "cancelled — not inserted");
+        }
+        ns.log("info", "Template insert: cancelled");
+        modal.finish("Cancelled — nothing was inserted.", "warn");
+      };
+
       if (!asWidget && picked.length > 1) {
         modal.setStatus(
           `Loading ${picked.length} template(s), ${ns.PREFETCH_CONCURRENCY} at a time…`,
         );
-        const pre = await ns.prefetchTemplates(picked, {
-          onWait: waitStatus(modal),
-        });
+        const pre = await ns.untilCancelled(
+          ns.prefetchTemplates(picked, { onWait: waitStatus(modal) }),
+          modal,
+        );
+        if (pre === ns.CANCELLED) return cancelledEarly();
         for (const f of pre.failed || []) {
           const i = picked.findIndex((t) => String(t.templateId) === f.templateId);
           if (i >= 0) modal.setRow(i, "warn", "preload failed — will retry");
         }
       }
+      // Nothing is in the document yet, so stopping here costs the user nothing
+      // and saves opening a history log around an empty run.
+      if (modal.cancelled()) return cancelledEarly();
 
       // waitLimit 1: both history ops degrade to a no-op already, and history-end
       // runs in a finally after the summary is on screen — a re-arming wait there
@@ -671,7 +751,10 @@
         // one, and a selected widget puts them after it inside its own parent —
         // but the end of the page is the document root, which takes containers
         // only. So build one, inside this run's undo step, and fill it.
-        if (asWidget && !target) {
+        // The cancel check keeps this from leaving an empty wrapper container
+        // behind: the loop below is stopped by the same flag, so nothing would
+        // ever go inside it.
+        if (asWidget && !target && !modal.cancelled()) {
           modal.setStatus("Creating a container to hold the template widgets…");
           const wrapper = await ns.createContainer({
             onWait: waitStatus(modal),
@@ -693,7 +776,7 @@
           }
         }
 
-        for (let i = 0; i < picked.length && !fatal; i++) {
+        for (let i = 0; i < picked.length && !fatal && !modal.cancelled(); i++) {
           const t = picked[i];
           if (asWidget) {
             modal.setStatus(
@@ -755,10 +838,22 @@
         return;
       }
 
+      // Each iteration increments exactly one of the two, so their sum is the
+      // first row the run never reached.
+      const stopped = modal.cancelled();
+      if (stopped) {
+        for (let i = done + failed; i < picked.length; i++) {
+          modal.setRow(i, "warn", "cancelled — not inserted");
+        }
+      }
+
       const verb = asWidget ? "created" : "inserted";
       const summary = `${done} ${verb}, ${failed} failed · ${where}`;
-      ns.log(done ? "info" : "warn", `Template insert: ${summary}`);
-      modal.finish(summary, failed ? "warn" : "ok");
+      const outcome = stopped
+        ? `Cancelled — ${summary}. Ctrl+Z undoes the whole batch.`
+        : summary;
+      ns.log(done ? "info" : "warn", `Template insert: ${outcome}`);
+      modal.finish(outcome, stopped || failed ? "warn" : "ok");
     } catch (err) {
       ns.log("error", `Template insert: ${err?.message || err}`);
     } finally {

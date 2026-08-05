@@ -127,8 +127,20 @@
     const modal = ns.openProgressModal("Decouple Templates", { id: MODAL_ID });
     let logId = null;
     try {
+      // Armed from the first moment: the keypress this exists for is the one the
+      // user regrets while the scan and the title fetch are still running.
+      modal.allowCancel();
+      const cancelledEarly = () => {
+        ns.log("info", "Template decouple: cancelled");
+        modal.finish("Cancelled — nothing was changed.", "warn");
+      };
+
       modal.setStatus("Scanning the page for template widgets…");
-      const scan = await ns.callBridge("list-template-widgets");
+      const scan = await ns.untilCancelled(
+        ns.callBridge("list-template-widgets"),
+        modal,
+      );
+      if (scan === ns.CANCELLED) return cancelledEarly();
       if (!scan?.ok) {
         ns.log("warn", `Template decouple: ${scan?.error}`);
         modal.finish(`Could not read the page — ${scan?.error}`, "error");
@@ -147,9 +159,11 @@
         `Found ${widgets.length} template widget(s). Fetching template titles…`,
       );
       const titleById = new Map();
-      const templatesRes = await ns.listSiteTemplates({
-        onWait: waitNote(modal),
-      });
+      const templatesRes = await ns.untilCancelled(
+        ns.listSiteTemplates({ onWait: waitNote(modal) }),
+        modal,
+      );
+      if (templatesRes === ns.CANCELLED) return cancelledEarly();
       if (templatesRes?.ok) {
         for (const t of templatesRes.templates || []) {
           titleById.set(String(t.templateId), t);
@@ -213,6 +227,9 @@
         modal.close();
         return;
       }
+      // The chooser took the button row and Escape for its own Cancel and does
+      // not hand them back, so the run arms its own again.
+      modal.allowCancel();
       const selected = chosen.items;
       const carryAdvanced = !!chosen.toggles.advanced;
       if (!carryAdvanced) {
@@ -244,13 +261,17 @@
         modal.setStatus(
           `Loading ${groups.size} template(s), ${ns.PREFETCH_CONCURRENCY} at a time…`,
         );
-        const pre = await ns.prefetchTemplates(
-          [...groups.keys()].map((id) => ({
-            templateId: id,
-            source: titleById.get(id)?.source,
-          })),
-          { onWait: waitNote(modal) },
+        const pre = await ns.untilCancelled(
+          ns.prefetchTemplates(
+            [...groups.keys()].map((id) => ({
+              templateId: id,
+              source: titleById.get(id)?.source,
+            })),
+            { onWait: waitNote(modal) },
+          ),
+          modal,
         );
+        if (pre === ns.CANCELLED) return cancelledEarly();
         for (const f of pre.failed || []) {
           const meta = titleById.get(f.templateId);
           modal.note(
@@ -260,6 +281,10 @@
           );
         }
       }
+
+      // Cancelled before anything was written — no history log needed to hold an
+      // empty run.
+      if (modal.cancelled()) return cancelledEarly();
 
       // waitLimit 1: both history ops degrade to a no-op already, and history-end
       // runs in a finally after the summary is on screen — a re-arming wait there
@@ -274,7 +299,12 @@
 
       const tally = { done: 0, failed: 0, nodes: 0, advanced: 0 };
 
+      let started = 0;
       for (const [templateId, members] of groups) {
+        // Stop between templates. Rows are added below, so a group that never
+        // starts gets no row rather than one stuck on "waiting".
+        if (modal.cancelled()) break;
+        started++;
         const meta = titleById.get(templateId);
         const name = meta?.title || `#${templateId}`;
 
@@ -313,6 +343,13 @@
           }
 
           for (const w of members) {
+            // Covers a cancel arriving mid-group and one that arrived while the
+            // insert above was in flight — that had to be awaited, but nothing
+            // here has to happen. The finally still removes the staged copy.
+            if (modal.cancelled()) {
+              modal.setRow(w.id, "warn", "cancelled — left linked");
+              continue;
+            }
             modal.setStatus(`Decoupling "${name}"…`);
             modal.setRow(w.id, "running", "replacing");
             // The index is resolved page-side against the widget's own id, so
@@ -401,7 +438,21 @@
       // Content pulled in from a template can itself hold template widgets.
       // Deliberately not recursed — a second keypress is safer than a walk
       // that could chase a template referencing itself.
-      const after = await ns.callBridge("list-template-widgets");
+      const stopped = modal.cancelled();
+      if (stopped) {
+        modal.note(" ");
+        modal.note(
+          `⚠ cancelled — ${groups.size - started} of ${groups.size} template(s) ` +
+            `were never started. Ctrl+Z undoes everything this run did.`,
+          "warn",
+        );
+      }
+
+      // Nothing decoupled means nothing new can have arrived, so the re-scan is
+      // only worth its round trip once something has actually landed.
+      const after = tally.done
+        ? await ns.callBridge("list-template-widgets")
+        : null;
       const fresh = after?.ok
         ? (after.widgets || []).filter((w) => !knownIds.has(w.id))
         : [];
@@ -429,8 +480,12 @@
         `${tally.done} decoupled (${tally.nodes} node(s)), ${tally.failed} failed` +
         (tally.advanced ? `, ${tally.advanced} advanced setting(s) carried over` : "") +
         (fresh.length ? `, ${fresh.length} nested left alone` : "");
-      ns.log(tally.done ? "info" : "warn", `Template decouple: ${summary}`);
-      modal.finish(summary, tally.failed || fresh.length ? "warn" : "ok");
+      const outcome = stopped ? `Cancelled — ${summary}` : summary;
+      ns.log(tally.done ? "info" : "warn", `Template decouple: ${outcome}`);
+      modal.finish(
+        outcome,
+        stopped || tally.failed || fresh.length ? "warn" : "ok",
+      );
     } catch (err) {
       ns.log("error", `Template decouple: ${err?.message || err}`);
       modal.finish(`Error — ${err?.message || err}`, "error");

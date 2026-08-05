@@ -75,20 +75,22 @@
   // longer each get their own deadline — so the budget scales with the chunk.
   const styleChunkTimeout = (n) => 5000 + n * 400;
 
-  // Style groups the page keeps as its own, when the confirm modal's option is
-  // on. Resolved to actual control keys page-side against each target's live
-  // control list — see PRESERVE_GROUPS in page-bridge.js.
-  const KEEP_BACKGROUND = ["background-image", "background-overlay"];
-
   // The copy → paste-style loop runs page-side now (see apply-style-pairs). A
   // pair used to cost two postMessage round trips, and a sync over a large page
   // is thousands of pairs, so the messaging was most of the run rather than the
   // styling. Failures still come back per pair and still don't stop the block.
-  const applyPairs = async (pairs, preserve, onProgress) => {
+  const applyPairs = async (pairs, preserve, onProgress, isCancelled) => {
     let done = 0;
     let kept = 0;
+    let stopped = false;
     const failures = [];
     for (let i = 0; i < pairs.length; i += STYLE_CHUNK) {
+      // A chunk is already the unit of "still alive", so it is also the natural
+      // place to notice a cancel. The chunk in flight is never abandoned.
+      if (isCancelled?.()) {
+        stopped = true;
+        break;
+      }
       const chunk = pairs.slice(i, i + STYLE_CHUNK);
       onProgress?.(i + 1, pairs.length);
       const res = await ns.callBridge(
@@ -112,7 +114,7 @@
       kept += res.kept || 0;
       for (const f of res.failures || []) failures.push(f);
     }
-    return { done, kept, failures };
+    return { done, kept, failures, stopped };
   };
 
   // Style one page container from one template root. Returns the ids to name
@@ -147,10 +149,11 @@
       return null;
     }
 
-    const { done, kept, failures } = await applyPairs(
+    const { done, kept, failures, stopped } = await applyPairs(
       paired.pairs,
       tally.preserve,
       (i, total) => modal.setRow(rowId, "running", `styling ${i}/${total}`),
+      () => modal.cancelled(),
     );
     const skipped = paired.skipped || [];
     const missing = paired.missing || [];
@@ -158,15 +161,16 @@
     const drifted = missing.length + extra.length;
     tally.applied++;
     tally.nodes += done;
-    tally.keptBackground += kept;
+    tally.keptOwn += kept;
     tally.skippedNodes += skipped.length;
     tally.driftedNodes += drifted;
     tally.touched.add(target.id);
     modal.setRow(
       rowId,
-      failures.length || drifted ? "warn" : "ok",
-      `${done}/${paired.pairs.length} node(s) styled` +
-        (kept ? `, ${kept} background(s) kept` : "") +
+      failures.length || drifted || stopped ? "warn" : "ok",
+      (stopped ? "cancelled — " : "") +
+        `${done}/${paired.pairs.length} node(s) styled` +
+        (kept ? `, ${kept} kept own values` : "") +
         (skipped.length ? `, ${skipped.length} skipped` : "") +
         (drifted ? `, ${drifted} unmatched` : "") +
         (failures.length ? `, ${failures.length} errored` : ""),
@@ -242,14 +246,44 @@
       logName: "Template sync",
       run: applyRootToTarget,
       // Only the styling operation pastes anything to hold back. A replace
-      // swaps the content wholesale, so the page node's background goes with
-      // the rest of it and there is nothing here to offer.
+      // swaps the content wholesale, so the page node's own values go with the
+      // rest of it and there is nothing here to offer.
+      //
+      // `groups` names PRESERVE_GROUPS entries in page-bridge.js, which resolve
+      // to control keys against each target's own live control list; `note` is
+      // what the run logs when the option is on. Add a fourth option by adding a
+      // row here rather than by growing a list at the call site.
+      //
+      // "background" is a superset of the image and overlay groups, so both
+      // being on is not a conflict — preserveKeysFor walks each control once
+      // however many groups claim it.
       toggles: [
         {
           key: "keepBackground",
-          label: "Keep the page's background image & overlay",
-          hint: "The template does not overwrite a page node's own background image (or how it is positioned and sized), nor anything in its Background Overlay section. Background colour and gradient still sync.",
+          label: "Keep background image & overlay",
+          // Each hint describes only its own toggle. This one used to end "colour
+          // and gradient still sync", which stopped being true the moment the
+          // broader option below defaulted to on.
+          hint: "The image, how it is framed, and the overlay.",
           default: true,
+          groups: ["background-image", "background-overlay"],
+          note: "Keeping each page node's own background image and overlay",
+        },
+        {
+          key: "keepAllBackground",
+          label: "Keep all background styles",
+          hint: "Also colour, gradient, video and slideshow.",
+          default: true,
+          groups: ["background"],
+          note: "Keeping each page node's whole background",
+        },
+        {
+          key: "keepAnimations",
+          label: "Keep animations",
+          hint: "Motion effects, sticky and entrance animation.",
+          default: true,
+          groups: ["motion-effects"],
+          note: "Keeping each page node's own motion effects and animations",
         },
       ],
     },
@@ -373,6 +407,11 @@
         return;
       }
 
+      // Cancelled while the insert was in flight. It had to be awaited — an
+      // abandoned insert is an orphan nobody is expecting — but nothing else
+      // needs doing, and the finally below still removes the staging copy.
+      if (modal.cancelled()) return;
+
       const srcTrees = await Promise.all(
         insertedIds.map((id) => ns.callBridge("describe-tree", { id })),
       );
@@ -423,6 +462,7 @@
       }
 
       for (let i = 0; i < srcTrees.length; i++) {
+        if (modal.cancelled()) break;
         const res = srcTrees[i];
         if (!res?.ok) {
           tally.failed++;
@@ -498,6 +538,7 @@
         );
 
         for (const target of targets) {
+          if (modal.cancelled()) break;
           // The checklist is one row per container, so a container the user
           // unticked is simply not acted on — by any root, from any template.
           // This is also the net for a plan/run disagreement: a target the
@@ -542,10 +583,23 @@
     const modal = ns.openProgressModal(op.title, { id: MODAL_ID });
     let logId = null;
     try {
+      // ESC or Cancel from the first moment, because the accidental keypress this
+      // exists for is noticed during the fetch below. Nothing is on the page yet,
+      // so a cancel here is free.
+      modal.allowCancel();
+      // Cancelled before anything was written. Said plainly, because "cancelled"
+      // and "cancelled but it already changed things" are very different facts.
+      const cancelledEarly = () => {
+        ns.log("info", `${op.logName}: cancelled`);
+        modal.finish("Cancelled — nothing was changed.", "warn");
+      };
+
       modal.setStatus("Fetching site templates…");
-      const templatesRes = await ns.listSiteTemplates({
-        onWait: waitNote(modal),
-      });
+      const templatesRes = await ns.untilCancelled(
+        ns.listSiteTemplates({ onWait: waitNote(modal) }),
+        modal,
+      );
+      if (templatesRes === ns.CANCELLED) return cancelledEarly();
       if (!templatesRes?.ok) {
         ns.log("warn", `${op.logName}: ${templatesRes?.error}`);
         modal.finish(`Could not fetch templates — ${templatesRes?.error}`, "error");
@@ -555,7 +609,11 @@
       const { byName, byId, ambiguous } = buildTemplateIndex(all);
 
       modal.setStatus(`Found ${all.length} template(s). Reading page containers…`);
-      const pageRes = await ns.callBridge("list-containers");
+      const pageRes = await ns.untilCancelled(
+        ns.callBridge("list-containers"),
+        modal,
+      );
+      if (pageRes === ns.CANCELLED) return cancelledEarly();
       if (!pageRes?.ok) {
         ns.log("warn", `${op.logName}: ${pageRes?.error}`);
         modal.finish(`Could not read page — ${pageRes?.error}`, "error");
@@ -666,10 +724,14 @@
       modal.setStatus(
         `Reading ${candidates.length} matched template(s), ${ns.PREFETCH_CONCURRENCY} at a time…`,
       );
-      const pre = await ns.prefetchTemplates(candidates, {
-        onWait: waitNote(modal),
-        withRoots: true,
-      });
+      const pre = await ns.untilCancelled(
+        ns.prefetchTemplates(candidates, {
+          onWait: waitNote(modal),
+          withRoots: true,
+        }),
+        modal,
+      );
+      if (pre === ns.CANCELLED) return cancelledEarly();
       const rootsById = new Map(
         (pre.roots || []).map((r) => [String(r.templateId), r.roots || []]),
       );
@@ -797,7 +859,7 @@
           {
             key: "nested",
             label: "Match nested containers",
-            hint: "Search the whole page, not just top-level containers. Nested targets must match the template root's name and type.",
+            hint: "Whole page, not just top level. Root name + type must match.",
             default: false,
           },
           ...(op.toggles || []),
@@ -808,9 +870,16 @@
         modal.close();
         return;
       }
+      // The chooser took the button row and the Escape key for its own Cancel,
+      // so the run has to arm its own again.
+      modal.allowCancel();
       const chosen = choice.items;
       const nested = !!choice.toggles.nested;
-      const preserve = choice.toggles.keepBackground ? KEEP_BACKGROUND : [];
+      // Every ticked option's groups, in one list. Duplicates between overlapping
+      // groups cost nothing page-side, so no attempt is made to fold them.
+      const preserve = (op.toggles || []).flatMap((t) =>
+        choice.toggles[t.key] ? t.groups || [] : [],
+      );
       const plan = buildPlan({ nested });
       const targetIndex = nested
         ? { byName: allByName, byTag: allByTag }
@@ -840,16 +909,21 @@
       if (nested) {
         modal.note(`· Matching nested containers (name + type)`);
       }
-      if (preserve.length) {
-        modal.note(
-          `· Keeping each page node's own background image and overlay`,
-        );
+      // A preserved value is a value the template asked for and did not get, so
+      // each option that is on says so before the run rather than leaving the
+      // result looking like a clean sync.
+      for (const t of op.toggles || []) {
+        if (choice.toggles[t.key] && t.note) modal.note(`· ${t.note}`);
       }
       if (chosen.length < plan.length) {
         modal.note(
           `· ${plan.length - chosen.length} container(s) unticked and skipped`,
         );
       }
+
+      // Cancelled while reading the notes above. Nothing has been written, so
+      // there is no point opening a history log to hold an empty run.
+      if (modal.cancelled()) return cancelledEarly();
 
       // waitLimit 1 on both ends of the history log. Both already degrade to a
       // no-op rather than failing the caller, so re-arming buys nothing — and on
@@ -878,7 +952,7 @@
         skippedNodes: 0,
         driftedNodes: 0,
         skippedReplaced: 0,
-        keptBackground: 0,
+        keptOwn: 0,
         nested,
         preserve,
         firstAncestorIn,
@@ -891,8 +965,22 @@
         pageIds: new Set(everything.map((c) => c.id)),
         isSkipped: await ns.getSkipMatcher(),
       };
+      let attempted = 0;
       for (const template of selected) {
+        if (modal.cancelled()) break;
+        attempted++;
         await syncTemplate(template, targetIndex, modal, tally, op);
+      }
+      // A cancelled run is still one undo step, so say so — the alternative is
+      // the user hunting for which half of it landed.
+      const stopped = modal.cancelled();
+      if (stopped) {
+        modal.note(" ");
+        modal.note(
+          `⚠ cancelled — ${selected.length - attempted} of ${selected.length} ` +
+            `template(s) were never started. Ctrl+Z undoes everything this run did.`,
+          "warn",
+        );
       }
 
       // Multi-root templates are supported, not a problem to be warned about:
@@ -913,7 +1001,9 @@
       // is not, the run destroyed something it was only meant to style or swap —
       // say so loudly with the ids, rather than leaving the user to notice a
       // container missing and have to work out which.
-      const afterRes = await ns.callBridge("list-containers");
+      const afterRes = tally.expected.size
+        ? await ns.callBridge("list-containers")
+        : null;
       if (afterRes?.ok) {
         const present = new Set((afterRes.containers || []).map((c) => c.id));
         const lost = [...tally.expected].filter((id) => !present.has(id));
@@ -935,9 +1025,7 @@
       const summary =
         `${tally.applied} applied (${tally.nodes} node(s)), ` +
         `${tally.failed} failed, ` +
-        (tally.keptBackground
-          ? `${tally.keptBackground} background(s) kept, `
-          : "") +
+        (tally.keptOwn ? `${tally.keptOwn} node(s) kept own values, ` : "") +
         (tally.skippedNodes ? `${tally.skippedNodes} node(s) skipped, ` : "") +
         (tally.driftedNodes ? `${tally.driftedNodes} node(s) unmatched, ` : "") +
         (tally.skippedRoots ? `${tally.skippedRoots} root(s) skipped, ` : "") +
@@ -945,10 +1033,11 @@
           ? `${tally.skippedReplaced} target(s) already replaced, `
           : "") +
         `${untouched} ${nested ? "node(s)" : "container(s)"} untouched`;
-      ns.log(tally.applied ? "info" : "warn", `${op.logName}: ${summary}`);
+      const outcome = stopped ? `Cancelled — ${summary}` : summary;
+      ns.log(tally.applied ? "info" : "warn", `${op.logName}: ${outcome}`);
       modal.finish(
-        summary,
-        tally.failed || tally.skippedRoots ? "warn" : "ok",
+        outcome,
+        stopped || tally.failed || tally.skippedRoots ? "warn" : "ok",
       );
     } catch (err) {
       ns.log("error", `${op.logName}: ${err?.message || err}`);

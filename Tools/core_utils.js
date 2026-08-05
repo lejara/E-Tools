@@ -726,10 +726,50 @@
     };
     document.addEventListener("keydown", keyHandler, true);
 
+    // Cancellation. These runs are a long chain of awaits, and a hotkey pressed
+    // by accident should not have to be waited out — but nothing on this side can
+    // abort an Elementor command that is already in flight, so a cancel is a
+    // *request* the run honours at its next boundary, not a kill.
+    //
+    // It latches, and there is no un-cancel: by the time the user could change
+    // their mind the run is already unwinding.
+    let cancelRequested = false;
+    let cancelBtn = null;
+    let fireCancel = null;
+    const cancelPromise = new Promise((r) => (fireCancel = r));
+    const requestCancel = () => {
+      if (cancelRequested) return;
+      cancelRequested = true;
+      if (cancelBtn) {
+        cancelBtn.textContent = "Cancelling…";
+        cancelBtn.disabled = true;
+        cancelBtn.style.cursor = "default";
+        cancelBtn.style.opacity = "0.6";
+      }
+      api.setStatus("Cancelling — finishing the step already in flight…");
+      api.note("· cancelled — stopping at the next safe point", "warn");
+      fireCancel();
+    };
+
     const api = {
       setStatus(text) {
         status.textContent = text;
       },
+      // Arm ESC and put a Cancel button up. Both, deliberately: ESC alone is
+      // invisible, and a modal with no button at all reads as "you are stuck
+      // with this until it finishes".
+      //
+      // Call it again after choose() — the chooser takes the button row and the
+      // Escape key over for its own Cancel, and hands neither back.
+      allowCancel() {
+        if (cancelRequested) return;
+        cancelBtn = makeBtn("Cancel", false);
+        cancelBtn.addEventListener("click", requestCancel);
+        btnRow.replaceChildren(cancelBtn);
+        onEscape = requestCancel;
+      },
+      cancelled: () => cancelRequested,
+      whenCancelled: () => cancelPromise,
       addRow(rowId, label) {
         const row = document.createElement("div");
         row.style.cssText = "padding:2px 0;word-break:break-word;";
@@ -966,9 +1006,32 @@
     return api;
   };
 
+  // A cancellable await, for a READ. The request itself keeps running either way
+  // — this only decides whether we still care about the answer, which is what
+  // makes ESC feel immediate during a template fetch instead of taking effect
+  // whenever the fetch happens to land, seconds later.
+  //
+  // Reads only, and that restriction is the point: abandoning the wait on a
+  // mutation is exactly what leaves an orphan in the document with nobody
+  // expecting it — see "A timeout is not an answer" in CLAUDE.md. A mutation is
+  // always awaited in full, and the cancel is honoured at the boundary after it.
+  const CANCELLED = Symbol("cancelled");
+  const untilCancelled = (promise, modal) => {
+    if (!modal?.whenCancelled) return promise;
+    if (modal.cancelled()) return Promise.resolve(CANCELLED);
+    // Promise.race attaches to both, so a rejection landing after the cancel won
+    // is still handled here and cannot surface as an unhandled rejection.
+    return Promise.race([
+      promise,
+      modal.whenCancelled().then(() => CANCELLED),
+    ]);
+  };
+
   ns.log = log;
   ns.selectLayerById = selectLayerById;
   ns.openProgressModal = openProgressModal;
+  ns.CANCELLED = CANCELLED;
+  ns.untilCancelled = untilCancelled;
   ns.MODAL_STATE_COLORS = STATE_COLORS;
   ns.callBridge = callBridge;
   // Exposed so a tool listening for the bridge's unsolicited __event messages

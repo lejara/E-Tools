@@ -71,6 +71,20 @@ Build a third tool on this rather than copying it — it was three files' worth 
 
 Tick state is tracked as the set of _unticked_ items keyed on identity, so an item surviving a rebuild keeps its state and newly-qualifying ones arrive ticked. Everything starts ticked in both shapes.
 
+### Cancelling a run
+
+**Every template tool can be stopped with ESC or a Cancel button, at any point.** These runs open with a multi-second library fetch and then keep going for a minute, and the hotkeys sit next to each other — an accidental `Ctrl+Shift+7` must not be something the user has to wait out.
+
+`modal.allowCancel()` arms it; `modal.cancelled()` is the latched flag the run polls. Both a button and ESC, deliberately: ESC alone is invisible, and a modal with no button reads as "you are stuck with this".
+
+- **A cancel is a request honoured at the next boundary, not a kill.** Nothing on the content-script side can abort an Elementor command already in flight, and pretending otherwise is how you get a half-applied paste. So the loops ask between templates, between roots, between targets, and between style chunks — `STYLE_CHUNK` was already the unit of "still alive", which makes it the natural unit of "still wanted".
+- **A read may be abandoned; a mutation may not.** `ns.untilCancelled(promise, modal)` races a read against the cancel and resolves to the `ns.CANCELLED` sentinel, which is what makes ESC feel instant during a fetch instead of taking effect whenever the fetch lands. It is **never** used on a mutation: abandoning the wait on an `insert-template` is exactly what leaves an orphan copy nobody is expecting — the same reasoning as "A timeout is not an answer" below. An insert already in flight is always awaited in full, and the cancel is taken at the boundary after it.
+- **The cleanup still runs.** Every `finally` is on the normal path — the staging copy is deleted, the history log is closed — so a cancelled run is still exactly one undo step. Both tools say so in the log (`Ctrl+Z undoes everything this run did`), because otherwise the user is left guessing which half landed.
+- **`choose()` does not hand the buttons back.** The chooser owns the button row and ESC for its own Cancel, so a run must call `allowCancel()` again after the confirm resolves. ESC _during_ the confirm still cancels the whole thing, as it always did.
+- **"Cancelled" and "cancelled after changing things" are different facts.** A cancel before the first mutation finishes with `Cancelled — nothing was changed.`; after it, the normal summary is kept and prefixed. Rows the run never reached say `cancelled — not inserted` / `left linked` rather than sitting on "waiting" forever.
+- **`template-insert.js` repeats the control** (`addCancel`) rather than importing it, since it drives its own shells. Its listener is detached on `close`/`fail`/`finish` — two capturing ESC handlers alive at once would have one keypress reach both the notice and the picker.
+- A run that never touched the document skips its own verification read (`list-containers` in sync, the nested re-scan in decouple), which would otherwise be a round trip spent confirming that nothing happened.
+
 ## Page bridge
 
 `callBridge(op, payload, { timeout, waitLimit, onWait })` — default timeout is 3s. Ops that hit the network (`insert-template`, `list-templates`, `prefetch-templates`) pass 15s or more.
@@ -115,16 +129,22 @@ That makes it the **inverse of `template-decouple.js`**: decoupling replaces the
 - **Groups are name tests, resolved against the live control list**, never a key table: the responsive suffixes depend on the site's enabled breakpoints and the `hover_` variants double the set. Breakpoint suffixes come off longest-first so `mobile_extra` is not read as `mobile`. A widget's leading underscore is stripped before the test — `resolveControlKey`'s rule in the other direction — which is what makes one group name work on both. Cached per `elType|widgetType`, since a sync asks this once per target per pair.
 - **Default render, and `options.external` stays off**, for the same reasons as `apply-advanced-settings`. Verified the preserved image reaches the preview: the live element computes `background-image: url(PAGE-PHOTO.jpg)` after the restore.
 
-The two groups, measured on a container (Elementor 4.2.1 / Pro 4.0.4, five breakpoints):
+The groups, measured on a container (Elementor 4.2.1 / Pro 4.0.4, five breakpoints):
 
 | group | keys | what it is |
 | --- | --- | --- |
 | `background-image` | 72 (36 × normal/hover) | `background_image` and the seven controls that frame it — `position`, `xpos`, `ypos`, `attachment`, `repeat`, `size`, `bg_width` |
 | `background-overlay` | 181 | the whole `section_background_overlay`, minus its 7 layout controls |
+| `background` | 386 · widget 171 | every `background*` control there is — colour, gradient, video, slideshow, the type chooser, the Background section's own `background_motion_fx_*` — plus `overlay_*`. A strict superset of the two above |
+| `motion-effects` | 72 · widget 72 | the Advanced tab's Motion Effects section — `motion_fx*` · `sticky`, `sticky_*` · `animation`, `animation_*` |
 
 - **The image and its framing travel together.** Keeping a page's portrait shot but taking the template's `cover / center center` reframes it anyway, so the framing is part of "keep the image".
-- **Colour, gradient, video and slideshow are deliberately out**, and so is `background_background` (the type chooser). The template still owns what _kind_ of background this is; the exception is only that the photo is the page's own. The consequence: a template whose background type is not `classic` leaves a preserved image in the model and invisible on screen. That is the honest reading of a template saying "no image background here" — the alternative freezes the type and the template could never change it.
+- **Colour, gradient, video and slideshow are out of `background-image`**, and so is `background_background` (the type chooser). That group says only "the photo is the page's own", and the template still owns what _kind_ of background this is. The consequence: a template whose background type is not `classic` leaves a preserved image in the model and invisible on screen. That is the honest reading of a template saying "no image background here" — the alternative freezes the type and the template could never change it. `background` is the group for "leave the background alone entirely", and it has none of that subtlety by design.
 - **A widget resolves 72 keys and no overlay** — widgets have no overlay section — so the group needs no scoping to containers. Verified: a heading kept `_background_image` and took the source's `_background_color`.
+- **`background` catches `overlay_*` too**, because the overlay's blend mode is the one control in that section not named after the background. The overlay's **CSS filters are deliberately left out**: `css_filters_*` is an overlay control on a container but the *image's own* filters on an image widget, and a predicate that sees only a control name cannot tell those apart. A container's overlay filters therefore still sync.
+- **`motion-effects` is deliberately the same set `animation-preset-fields.js` manages** — scrolling effects, mouse effects, sticky, and the entrance animation with its duration and delay. Name families rather than a key list for the usual reason: the entrance animation and every sticky offset carry a variant per enabled breakpoint. Verified live that all 61 preset keys exist on a container and every one falls in this group; keep them from drifting.
+- **`motion_fx` is anchored (`/^motion_fx/`), and this is the trap.** A container also carries a **`background_motion_fx_*` family** — the Background section's own scroll effects, 36 keys of it. An unanchored `includes("motion_fx")` swept those into `motion-effects`, so "Keep animations" quietly preserved a slice of the page's background with no background option ticked. Anchoring leaves them to `background`, where they belong. Measured after the fix: the two groups share **0** keys. `handle_motion_fx_asset_loading` is named explicitly (a target keeping its motion effects should keep its own answer about loading their assets); its `background_`-prefixed twin is excluded by the same anchor.
+- **Groups may overlap freely.** `preserveKeysFor` walks each control once however many groups claim it, so `background` alongside `background-image` costs nothing and needs no folding at the call site. Verified: `background-image` (72) and `background-overlay` (181) are both proper subsets of `background` (386), and ticking all four resolves 458 keys on a container.
 
 ### A timeout is not an answer
 
@@ -229,13 +249,22 @@ Which containers a template reaches is decided by its roots' names and tags, so 
 - **The list is built from JSON roots; the run works from imported ones.** They agree in every observed case, and if they ever did not the root indexes would have shifted — `#id.2` would name a different block than the row promised. `tally.plannedRoots` compares the two counts per insert and warns, because `allowed` cannot see that kind of wrongness.
 - **Roots that reach nothing are reported only for templates the run never inserts.** A template that *is* inserted reports every one of its roots itself, from the live insert; saying it twice is worse than once. `tally.skippedRoots` is seeded with the first group and incremented by the second, and the two sets cannot overlap by construction.
 
-### Keeping the page's own background
+### Keeping what the page already has
 
-**Keep the page's background image & overlay** is the confirm modal's second toggle, **on by default**. With it on, a synced node keeps its own background image (and how that image is positioned and sized) and its whole Background Overlay section; everything else about the background — colour, gradient, the type chooser — still comes from the template. The mechanics are `preserve` on `apply-style-pairs`, above.
+Three toggles on the styles operation say which of the page node's own values survive a sync. Each one names `PRESERVE_GROUPS` entries, and the mechanics are `preserve` on `apply-style-pairs`, above.
 
-- **It is the styles operation's toggle, not the pipeline's.** `OPS.styles.toggles` is appended to the shared `nested` one, because a replace pastes no styles: the page node's background goes with the rest of its content and there is nothing to hold back. Add a third toggle the same way rather than growing the inline list.
-- **On by default**, unlike `nested`. A template is a layout, and the photo in a hero is the page's — overwriting every page's imagery with the template's placeholder is the behaviour that needed an escape hatch, not the other way round.
-- **Reported per row and in the summary** (`3 background(s) kept`) because a preserved value is a value the template asked for and did not get. Silence there would read as a clean sync.
+| toggle | default | groups |
+| --- | --- | --- |
+| Keep background image & overlay | **on** | `background-image`, `background-overlay` |
+| Keep all background styles | **on** | `background` |
+| Keep animations | **on** | `motion-effects` |
+
+- **The toggle carries its own groups and its own log line.** `OPS.styles.toggles` rows hold `groups` and `note`, and the run collects `preserve` by iterating them. **Add a fourth option by adding a row there**, not by growing a list at the call site — that inline `choice.toggles.keepBackground ? … : []` is what this replaced.
+- **They are the styles operation's toggles, not the pipeline's.** `OPS.styles.toggles` is appended to the shared `nested` one, because a replace pastes no styles: the page node's values go with the rest of its content and there is nothing to hold back.
+- **The two background toggles overlap, and that is fine.** `background` is a strict superset, so ticking both is not a conflict — see the group table above. With the defaults below they _are_ both on, which makes the narrow one redundant until the broad one is unticked; that is what it is there for. "Keep the photo but take the template's colours" is a real intent, and it is why the broad one could not simply replace it.
+- **All three are on by default.** A template is a layout: what a sync is wanted for is structure, spacing and typography, and a page's own imagery and motion are the parts that most often should _not_ be overwritten by whatever the template's author left on those layers. So the defaults leave both alone and the unticking is the deliberate act — the same reasoning the narrow background toggle already shipped with, applied to the other two.
+- **Keep animations covers the whole Motion Effects section**, matching what a saved animation preset writes. Measured live (Elementor Pro, five breakpoints): a plain `paste-style` moved the source's `animation`, `animation_delay`, `motion_fx_motion_fx_scrolling` and `motion_fx_translateY_effect` onto the target, and with this group in `preserve` the target kept all four while still taking the template's `background_color`. `isStyleTransferControl` returns **true** for every key in the group, so none of this is theoretical — a sync overwrote animations before this option existed.
+- **Reported per row and in the summary** (`3 node(s) kept own values`) because a preserved value is a value the template asked for and did not get. Silence there would read as a clean sync. The count is nodes-that-kept-something, not keys.
 
 ### Two operations, one pipeline
 
@@ -271,6 +300,8 @@ Checklist labels are `"<template>" — inside "<parent>"`, which collides readil
 
 `Tools/template-insert.js` (`Ctrl+Shift+8`) is independent of name matching: it lists the whole library in a searchable modal with a checkbox per template, and inserts everything ticked at the end of the page — or at the current selection, and as content or as Template widgets; both are checkboxes, see below. Insertion follows **tick order**, not list order, so the sequence is controllable. The whole batch is one undo step.
 
+Both the library-fetch notice and the progress view take ESC / Cancel (`addCancel`, this file's own copy of the shared modal's control — see "Cancelling a run"), so a batch stops between templates rather than running to the end.
+
 Each row shows the title, then author and last-modified date beneath it, with the template type on the right. Elementor's field names for those vary by version, so `list-templates` tries several candidates (`human_modified_date` → `human_date` → `modified` → `date`) and prefers the server's own preformatted string, which is already in the site's locale and timezone. It also returns `fields` — the raw key list from the first template — so a missing column can be diagnosed without guessing.
 
 Search is multi-term over title, type _and_ author — every whitespace-separated term must appear somewhere, in any order, so `hero prim` finds "TW Hero Primary". `Select shown` ticks everything currently matching; a ticked template hidden by a later search still counts toward the total and the status line says how many are hidden, so the count never looks wrong.
@@ -300,7 +331,7 @@ A second checkbox switches the whole ticked batch from a copy of each template's
 
 ### Progress modal
 
-The run drives a modal (`ElementorTools-template-sync-modal`) that opens immediately, reports each phase, keeps a per-target live status row, and stays open at the end with a summary plus **Copy details**. The confirm step is always shown — there is deliberately no skip-confirm setting.
+The run drives a modal (`ElementorTools-template-sync-modal`) that opens immediately, reports each phase, keeps a per-target live status row, and stays open at the end with a summary plus **Copy details**. The confirm step is always shown — there is deliberately no skip-confirm setting. ESC or Cancel stops the run at its next boundary, at every phase including the opening fetch — see "Cancelling a run".
 
 Confirm is a **checklist** (`modal.choose`), not a yes/no — one row per page container, see above. Every matched container starts ticked, so the default is the full match set and unticking is the deliberate act; `All` / `None` buttons handle long lists, and the primary button is disabled at zero. It resolves to the chosen items in their original order, or `null` on cancel. On resolve it removes only its own rows, so notes logged before the confirm (ambiguous-title warnings) survive into the progress view.
 
