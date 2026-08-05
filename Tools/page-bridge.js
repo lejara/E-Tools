@@ -61,8 +61,8 @@
     children: childContainers(container).map(describeContainer),
   });
 
-  // Controls that structure the Advanced tab rather than hold a value.
-  const ADVANCED_LAYOUT_TYPES = new Set([
+  // Controls that structure a tab rather than hold a value.
+  const LAYOUT_CONTROL_TYPES = new Set([
     "section",
     "tab",
     "tabs",
@@ -95,6 +95,132 @@
     return controls[`_${key}`] ? `_${key}` : null;
   };
 
+  // Key-order-insensitive JSON, for asking whether two control values are the
+  // same thing. Elementor serialises a media or slider object's keys in whatever
+  // order last wrote it, so a plain stringify calls two identical values
+  // different — and here that means writing a value back over the one already
+  // sitting there. Same reasoning as canon() in animation-preset-fields.js;
+  // the page world cannot read that global, so this is its own copy.
+  const canonJSON = (v) => {
+    if (Array.isArray(v)) return `[${v.map(canonJSON).join(",")}]`;
+    if (v && typeof v === "object") {
+      return `{${Object.keys(v)
+        .sort()
+        .map((k) => `${JSON.stringify(k)}:${canonJSON(v[k])}`)
+        .join(",")}}`;
+    }
+    return JSON.stringify(v) ?? "null";
+  };
+
+  // Groups of style controls a caller can ask a sync to leave alone. Each is a
+  // test on the control NAME, never a hardcoded key list, because the responsive
+  // suffixes depend on which breakpoints the site has enabled and the hover
+  // variants double the set — the same reason pure-container-reset reads the
+  // live control list rather than naming padding_tablet and friends.
+  //
+  // Names here are the container spelling. A widget prefixes these with an
+  // underscore (_background_image) and the device suffix comes off the end, both
+  // of which are stripped before the test — resolveControlKey's rule, in the
+  // other direction.
+  const BACKGROUND_IMAGE_FIELDS = new Set([
+    "image",
+    "position",
+    "xpos",
+    "ypos",
+    "attachment",
+    "repeat",
+    "size",
+    "bg_width",
+  ]);
+
+  const PRESERVE_GROUPS = {
+    // The Background section's image field group: the media control plus the
+    // things that decide how that image sits. Colour, gradient, video and
+    // slideshow are deliberately NOT here — a sync still owns those, and the
+    // whole point of the exception is that the photo is the page's own.
+    // The image and its framing travel together: keeping a portrait shot but
+    // taking the template's "cover / center center" reframes it anyway.
+    "background-image": (name) => {
+      const m = /^background_(?:hover_)?([a-z_]+)$/.exec(name);
+      return !!m && BACKGROUND_IMAGE_FIELDS.has(m[1]);
+    },
+    // The whole Background Overlay section — type chooser, colour, image,
+    // opacity, blend mode, hover variants. An overlay is one composed thing and
+    // syncing half of it is how you get the page's colour at the template's
+    // opacity. Widgets have no overlay section, so this resolves to nothing on
+    // them rather than needing to be scoped out.
+    "background-overlay": (name) => name.startsWith("background_overlay_"),
+  };
+
+  // Widest first only matters for stripping: mobile_extra must not be read as
+  // mobile with a stray _extra. Never hardcoded — this site runs tablet_extra
+  // and mobile_extra on top of the usual pair, a default install does not.
+  const deviceSuffixes = () =>
+    (
+      window.elementor?.breakpoints?.getActiveBreakpointsList?.({
+        withDesktop: false,
+      }) || []
+    )
+      .map((d) => `_${d}`)
+      .sort((a, b) => b.length - a.length);
+
+  // Which of this element's controls fall in the named groups. Cached per
+  // element type: the schema is a property of the type, and a style sync asks
+  // this once per target per pair — thousands of times over a large page.
+  const preserveCache = new Map();
+
+  const preserveKeysFor = (container, groups) => {
+    const elType = container.model?.get?.("elType") || "";
+    const widgetType = container.model?.get?.("widgetType") || "";
+    const cacheKey = `${elType}|${widgetType}|${groups.join(",")}`;
+    const hit = preserveCache.get(cacheKey);
+    if (hit) return hit;
+
+    const controls = container.settings?.controls || {};
+    const suffixes = deviceSuffixes();
+    const keys = [];
+    for (const [name, def] of Object.entries(controls)) {
+      if (LAYOUT_CONTROL_TYPES.has(def?.type)) continue;
+      let bare = name.startsWith("_") ? name.slice(1) : name;
+      for (const s of suffixes) {
+        if (bare.length > s.length && bare.endsWith(s)) {
+          bare = bare.slice(0, -s.length);
+          break;
+        }
+      }
+      if (groups.some((g) => PRESERVE_GROUPS[g](bare))) keys.push(name);
+    }
+    preserveCache.set(cacheKey, keys);
+    return keys;
+  };
+
+  // toJSON is a shallow clone, so a nested value object is still the model's
+  // own. Copy it: the snapshot has to survive a command that replaces it.
+  const copyValue = (v) =>
+    v && typeof v === "object" ? JSON.parse(JSON.stringify(v)) : v;
+
+  const snapshotKeys = (container, keys) => {
+    const current = container.settings?.toJSON?.() || {};
+    const defaults = container.settings?.defaults || {};
+    const out = {};
+    for (const k of keys) {
+      out[k] = copyValue(current[k] !== undefined ? current[k] : defaults[k]);
+    }
+    return out;
+  };
+
+  // Only what the write actually moved goes back. Most nodes carry no background
+  // image at all, so on a normal page this is empty for nearly every target and
+  // the restore costs no Elementor command at all.
+  const changedFromSnapshot = (container, saved) => {
+    const current = container.settings?.toJSON?.() || {};
+    const out = {};
+    for (const [k, v] of Object.entries(saved)) {
+      if (canonJSON(current[k]) !== canonJSON(v)) out[k] = v;
+    }
+    return out;
+  };
+
   // The Advanced tab, as data. Only controls the user actually moved off their
   // default are returned: a widget carries ~550 advanced controls and all but a
   // handful are untouched, so the diff against `defaults` is what keeps this
@@ -111,7 +237,7 @@
     const out = [];
     for (const [key, def] of Object.entries(controls)) {
       if ((def?.tab || "") !== "advanced") continue;
-      if (ADVANCED_LAYOUT_TYPES.has(def?.type)) continue;
+      if (LAYOUT_CONTROL_TYPES.has(def?.type)) continue;
       if (NEVER_TRANSFER.has(key)) continue;
       if (JSON.stringify(current[key]) === JSON.stringify(defaults[key])) {
         continue;
@@ -261,6 +387,18 @@
         : [];
     return content;
   };
+
+  // One root described the way describe-tree describes a live node, so a caller
+  // can run the same name/type matching over a template that has not been
+  // inserted yet. `title` is settings._title, the field the navigator shows and
+  // the one template-sync matches roots on.
+  const describeJsonRoot = (el, i) => ({
+    index: i + 1,
+    title: String(el?.settings?._title || "").trim(),
+    elType: el?.elType || null,
+    widgetType: el?.widgetType || null,
+    childCount: Array.isArray(el?.elements) ? el.elements.length : 0,
+  });
 
   // import and paste both return a nested structure that repeats the same
   // container more than once, so a flat map yields duplicate ids for a single
@@ -664,9 +802,21 @@
     // A failing pair is recorded and the batch carries on, exactly as the
     // per-pair loop did — one unstylable node must not abandon the rest of the
     // block. Nothing here is retryable by the caller: see REPLAYABLE_OPS.
-    "apply-style-pairs": async ({ pairs }) => {
+    //
+    // `preserve` names groups from PRESERVE_GROUPS that the target keeps as its
+    // own. It has to be a save-and-put-back rather than a filtered paste,
+    // because paste-style is all-or-nothing: it walks the TARGET's controls and
+    // writes every style-transfer one, using the source's value or the control
+    // default where the source has none. So a background image the source lacks
+    // is not merely left alone by a paste — it is cleared.
+    "apply-style-pairs": async ({ pairs, preserve }) => {
       const list = Array.isArray(pairs) ? pairs : [];
+      const groups = (Array.isArray(preserve) ? preserve : []).filter(
+        (g) => PRESERVE_GROUPS[g],
+      );
       let done = 0;
+      let kept = 0;
+      const keptFields = new Set();
       const failures = [];
       for (const pair of list) {
         const targetIds =
@@ -677,12 +827,31 @@
               : [];
         if (!pair?.sourceId || !targetIds.length) continue;
         try {
+          const targets = targetIds.map(getContainer);
+          // Before the paste, necessarily: after it the old values are gone.
+          const saved = groups.length
+            ? targets.map((t) => snapshotKeys(t, preserveKeysFor(t, groups)))
+            : null;
           await runCommand("document/elements/copy", {
             containers: [getContainer(pair.sourceId)],
           });
           await runCommand("document/elements/paste-style", {
-            containers: targetIds.map(getContainer),
+            containers: targets,
           });
+          for (let i = 0; saved && i < targets.length; i++) {
+            const back = changedFromSnapshot(targets[i], saved[i]);
+            const names = Object.keys(back);
+            if (!names.length) continue;
+            // These controls carry selectors, so the model change alone would
+            // leave the preview showing the pasted image. options.external
+            // still stays off, for the reason documented on rename.
+            await runCommand("document/elements/settings", {
+              containers: [targets[i]],
+              settings: back,
+            });
+            kept++;
+            for (const n of names) keptFields.add(n);
+          }
           done += targetIds.length;
         } catch (err) {
           failures.push(
@@ -692,7 +861,7 @@
           );
         }
       }
-      return { done, failures };
+      return { done, failures, kept, keptFields: keptFields.size };
     },
     paste: async ({ targetId, at }) => {
       const result = await runCommand("document/elements/paste", {
@@ -971,21 +1140,35 @@
     //
     // Every failure is reported rather than thrown — a template that could not be
     // preloaded is simply fetched again by its own insert, so the batch carries on.
-    "prefetch-templates": async ({ items, concurrency = 3 }) => {
+    //
+    // withRoots rides along on the same fetch: template-sync has to know a
+    // template's roots *before* its confirm modal, because the checklist is one
+    // row per page container and which containers a template acts on is decided
+    // by the roots' names and tags. Reading them here rather than in a second op
+    // is the difference between one network pass and two — the JSON is already
+    // in hand, and templateRoots is the same arbiter insert-template uses.
+    "prefetch-templates": async ({ items, concurrency = 3, withRoots }) => {
       const list = Array.isArray(items) ? items : [];
       const loaded = [];
       const failed = [];
+      const roots = [];
       let next = 0;
       const worker = async () => {
         while (next < list.length) {
           const it = list[next++];
           try {
-            await getTemplateData(
+            const data = await getTemplateData(
               it.source || "local",
               it.templateId,
               !!it.withPageSettings,
             );
             loaded.push(String(it.templateId));
+            if (withRoots) {
+              roots.push({
+                templateId: String(it.templateId),
+                roots: templateRoots(data).map(describeJsonRoot),
+              });
+            }
           } catch (err) {
             failed.push({
               templateId: String(it.templateId),
@@ -999,7 +1182,7 @@
         Math.min(Number(concurrency) || 1, list.length),
       );
       await Promise.all(Array.from({ length: lanes }, worker));
-      return { loaded, failed };
+      return { loaded, failed, roots };
     },
     // Build one element from scratch — no template JSON, no import, no network.
     // The Template widget's whole identity is settings.template_id (the same

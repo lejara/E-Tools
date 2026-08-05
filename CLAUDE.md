@@ -103,6 +103,29 @@ That makes it the **inverse of `template-decouple.js`**: decoupling replaces the
 - **A failing pair is recorded and the batch carries on**, which is what the per-pair loop did. One unstylable node must not abandon the rest of the block.
 - Callers pass `waitLimit: 3`. It is a mutation so it is never re-sent, and unlike an insert a called-off wait leaves no orphan behind.
 
+#### Holding a group of style keys back
+
+`preserve` names groups from `PRESERVE_GROUPS` that the **target** keeps as its own. `template-sync.js` is the only caller (`replace-styles.js` passes none and is unchanged).
+
+**It has to be save-and-put-back, not a filtered paste.** `paste-style` is all-or-nothing: it walks the _target's_ controls and writes every style-transfer one, taking the source's value or **the control's default** where the source has none. So a background image the template lacks is not merely left alone by a paste — it is cleared. Verified on this build: a container holding `PAGE-PHOTO.jpg` at `cover / top center` came out of a plain paste holding the template's `TEMPLATE.jpg` at `contain / center center`, overlay included.
+
+- **Snapshot before the paste, diff after it, write back only what moved.** Most nodes carry no background at all, and where neither side has one the diff is empty and the restore costs **no Elementor command** — measured `kept: 0` on a neutral pair. Where a source _does_ carry an image, a bare target correctly ends up with no image rather than inheriting one.
+- **The diff is `canonJSON`, not `JSON.stringify`.** Elementor serialises a media or slider object's keys in whatever order last wrote it, so a plain compare calls two identical values different and writes 253 keys back per node. Same reasoning as `canon()` in `animation-preset-fields.js`; the page world can't read that global, so this is its own copy.
+- **`toJSON()` is a shallow clone**, so a snapshotted value object is still the model's own — `copyValue` deep-copies it, or the "before" and "after" would be the same object.
+- **Groups are name tests, resolved against the live control list**, never a key table: the responsive suffixes depend on the site's enabled breakpoints and the `hover_` variants double the set. Breakpoint suffixes come off longest-first so `mobile_extra` is not read as `mobile`. A widget's leading underscore is stripped before the test — `resolveControlKey`'s rule in the other direction — which is what makes one group name work on both. Cached per `elType|widgetType`, since a sync asks this once per target per pair.
+- **Default render, and `options.external` stays off**, for the same reasons as `apply-advanced-settings`. Verified the preserved image reaches the preview: the live element computes `background-image: url(PAGE-PHOTO.jpg)` after the restore.
+
+The two groups, measured on a container (Elementor 4.2.1 / Pro 4.0.4, five breakpoints):
+
+| group | keys | what it is |
+| --- | --- | --- |
+| `background-image` | 72 (36 × normal/hover) | `background_image` and the seven controls that frame it — `position`, `xpos`, `ypos`, `attachment`, `repeat`, `size`, `bg_width` |
+| `background-overlay` | 181 | the whole `section_background_overlay`, minus its 7 layout controls |
+
+- **The image and its framing travel together.** Keeping a page's portrait shot but taking the template's `cover / center center` reframes it anyway, so the framing is part of "keep the image".
+- **Colour, gradient, video and slideshow are deliberately out**, and so is `background_background` (the type chooser). The template still owns what _kind_ of background this is; the exception is only that the photo is the page's own. The consequence: a template whose background type is not `classic` leaves a preserved image in the model and invisible on screen. That is the honest reading of a template saying "no image background here" — the alternative freezes the type and the template could never change it.
+- **A widget resolves 72 keys and no overlay** — widgets have no overlay section — so the group needs no scoping to containers. Verified: a heading kept `_background_image` and took the source's `_background_color`.
+
 ### A timeout is not an answer
 
 **An expired deadline re-arms; it does not abandon the request.** The bridge is still working in the page world, and for anything network-backed the work lands _after_ the deadline passes — an `insert-template` that "timed out" has still inserted the template. Dropping the pending entry there is exactly what leaves an orphaned copy in the document with nobody expecting it. So the request stays pending and a late response still resolves the original caller; only after `waitLimit` re-arms (10 by default) does `callBridge` give up, and the error then says how long it actually waited.
@@ -185,6 +208,35 @@ Every layer these tools create carries the template's id as a suffix on its laye
 - **Replace + nested needs the ancestor guard.** Replacing a container deletes its descendants, so any later target inside it has a stale id and the bridge would throw. `tally.replaced` plus `firstAncestorIn` (which walks the target's own ancestors and asks the set, rather than testing descendancy once per already-replaced container) skips those with a warning. Styles mode needs no guard — nothing is deleted, so ids stay valid.
 - Known gap: if an _inner_ target is replaced before an outer one from a different template, the inner work is silently discarded. Depth sorting prevents this within a single root's target list, not across templates.
 
+### The confirm list is one row per page container
+
+The checklist lists **targets, not templates** — one row per container the run will touch, in **document order**, labelled `"<template>" → "<container>"`. A multi-root template contributes a row per root (`"TW Hero" root 2 → "Intro block"`), and three containers matching one template are three rows. Ticking is a statement about a container: untick it and no root, from any template, touches it.
+
+It used to be one row per template, which collapsed both of those. Measured over 30 of this site's 120 templates: 7 are multi-root, the largest has **14 roots**, and 6 of the 7 have entirely unnamed roots — so a single "TW Whatever" row was hiding an unreviewable amount.
+
+- **Repeats are numbered `(2 of 3)` in document order.** Three sibling containers named "Card" from one template read identically otherwise, and an ambiguous checklist is worse than none because unticking the wrong row is silent. Same rule, same reason, as `template-decouple.js`.
+- **`resolveTargets` is shared by the checklist and the run**, and that is the whole point: the list promises a set of containers and the run has to act on exactly that set. It reads only `title` and the element type off a root, which is all a JSON root and a live `describe-tree` node have in common — that is what lets the list be built before anything is inserted.
+- **`tally.allowed` gates the run's target loop.** It is also the net for a plan/run disagreement: a container the list never offered is not in the set, so the run can only ever do *less* than it promised, never more. The reverse — the right container reached by the *wrong root* — is what the root-count check below catches.
+- **A template whose every target is unticked is never inserted**, so unticking still saves the whole round trip it used to.
+
+#### Roots have to be known before the confirm
+
+Which containers a template reaches is decided by its roots' names and tags, so the content must be fetched **before** the checklist rather than after it. `prefetch-templates` grew a `withRoots` flag for this: it already fetches the JSON, and `templateRoots` is already the arbiter `insert-template` uses, so reading the roots there is one network pass instead of two. `describeJsonRoot` shapes a root the way `describe-tree` shapes a live node.
+
+- **The price is fetching matched templates the user then unticks.** Still only matched templates — never the library — so the property that a template nothing points at is never fetched still holds.
+- **A failed fetch is no longer merely "slower".** That template contributes no rows, so unlike a plain warm it is reported: `could not read template #N — …. It is not listed below.` Left silent it would read as "nothing matched".
+- **Roots are fetched for the `nested: true` superset**, so flipping the toggle rebuilds the list with no network at all.
+- **The list is built from JSON roots; the run works from imported ones.** They agree in every observed case, and if they ever did not the root indexes would have shifted — `#id.2` would name a different block than the row promised. `tally.plannedRoots` compares the two counts per insert and warns, because `allowed` cannot see that kind of wrongness.
+- **Roots that reach nothing are reported only for templates the run never inserts.** A template that *is* inserted reports every one of its roots itself, from the live insert; saying it twice is worse than once. `tally.skippedRoots` is seeded with the first group and incremented by the second, and the two sets cannot overlap by construction.
+
+### Keeping the page's own background
+
+**Keep the page's background image & overlay** is the confirm modal's second toggle, **on by default**. With it on, a synced node keeps its own background image (and how that image is positioned and sized) and its whole Background Overlay section; everything else about the background — colour, gradient, the type chooser — still comes from the template. The mechanics are `preserve` on `apply-style-pairs`, above.
+
+- **It is the styles operation's toggle, not the pipeline's.** `OPS.styles.toggles` is appended to the shared `nested` one, because a replace pastes no styles: the page node's background goes with the rest of its content and there is nothing to hold back. Add a third toggle the same way rather than growing the inline list.
+- **On by default**, unlike `nested`. A template is a layout, and the photo in a hero is the page's — overwriting every page's imagery with the template's placeholder is the behaviour that needed an escape hatch, not the other way round.
+- **Reported per row and in the summary** (`3 background(s) kept`) because a preserved value is a value the template asked for and did not get. Silence there would read as a clean sync.
+
 ### Two operations, one pipeline
 
 `template-sync.js` runs both `Ctrl+Shift+6` (style) and `Ctrl+Shift+7` (replace) through the same discovery pipeline — list templates, read top containers, match by name, insert once per template, walk roots. They differ only in the per-target action, selected via the `OPS` table:
@@ -250,7 +302,7 @@ A second checkbox switches the whole ticked batch from a copy of each template's
 
 The run drives a modal (`ElementorTools-template-sync-modal`) that opens immediately, reports each phase, keeps a per-target live status row, and stays open at the end with a summary plus **Copy details**. The confirm step is always shown — there is deliberately no skip-confirm setting.
 
-Confirm is a **checklist** (`modal.choose`), not a yes/no. Every matched template starts ticked, so the default is the full match set and unticking is the deliberate act; `All` / `None` buttons handle long lists, and the primary button is disabled at zero. It resolves to the chosen items in their original order, or `null` on cancel. On resolve it removes only its own rows, so notes logged before the confirm (ambiguous-title warnings) survive into the progress view.
+Confirm is a **checklist** (`modal.choose`), not a yes/no — one row per page container, see above. Every matched container starts ticked, so the default is the full match set and unticking is the deliberate act; `All` / `None` buttons handle long lists, and the primary button is disabled at zero. It resolves to the chosen items in their original order, or `null` on cancel. On resolve it removes only its own rows, so notes logged before the confirm (ambiguous-title warnings) survive into the progress view.
 
 Roots whose layer name is empty or a generic Elementor default (`GENERIC_ROOT_NAMES`, currently just `container`) are skipped with a warning rather than guessed at. Templates with more than one root are processed in full, then re-warned in a block at the end of the run so the notice isn't lost in a long log.
 

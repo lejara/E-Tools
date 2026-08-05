@@ -328,9 +328,14 @@
 
   // Non-fatal by design: a template that fails to preload is simply fetched
   // again by its own insert, which reports the failure in the usual place.
+  // withRoots asks the same fetch to also describe each template's top-level
+  // elements. For template-sync that is not an optimisation but the point of the
+  // call: its checklist is one row per page container, and only the roots say
+  // which containers a template reaches. A template that fails to load then goes
+  // unlisted rather than merely unwarmed, so that caller reports the failures.
   const prefetchTemplates = async (
     templates,
-    { concurrency = PREFETCH_CONCURRENCY, onWait } = {},
+    { concurrency = PREFETCH_CONCURRENCY, onWait, withRoots = false } = {},
   ) => {
     const items = (templates || [])
       .filter((t) => t && t.templateId)
@@ -343,13 +348,13 @@
         // to pass it here too, or the warm lands on a key nobody reads.
         withPageSettings: !!t.withPageSettings,
       }));
-    if (!items.length) return { ok: true, loaded: [], failed: [] };
+    if (!items.length) return { ok: true, loaded: [], failed: [], roots: [] };
 
     // Roughly one round trip per batch of `concurrency`, so the budget has to
     // scale with the batch rather than sitting at a single fetch's timeout.
     const result = await callBridge(
       "prefetch-templates",
-      { items, concurrency },
+      { items, concurrency, withRoots },
       {
         timeout: TEMPLATE_TIMEOUT * Math.ceil(items.length / concurrency),
         onWait,

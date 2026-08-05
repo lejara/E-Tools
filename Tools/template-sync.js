@@ -75,19 +75,25 @@
   // longer each get their own deadline — so the budget scales with the chunk.
   const styleChunkTimeout = (n) => 5000 + n * 400;
 
+  // Style groups the page keeps as its own, when the confirm modal's option is
+  // on. Resolved to actual control keys page-side against each target's live
+  // control list — see PRESERVE_GROUPS in page-bridge.js.
+  const KEEP_BACKGROUND = ["background-image", "background-overlay"];
+
   // The copy → paste-style loop runs page-side now (see apply-style-pairs). A
   // pair used to cost two postMessage round trips, and a sync over a large page
   // is thousands of pairs, so the messaging was most of the run rather than the
   // styling. Failures still come back per pair and still don't stop the block.
-  const applyPairs = async (pairs, onProgress) => {
+  const applyPairs = async (pairs, preserve, onProgress) => {
     let done = 0;
+    let kept = 0;
     const failures = [];
     for (let i = 0; i < pairs.length; i += STYLE_CHUNK) {
       const chunk = pairs.slice(i, i + STYLE_CHUNK);
       onProgress?.(i + 1, pairs.length);
       const res = await ns.callBridge(
         "apply-style-pairs",
-        { pairs: chunk },
+        { pairs: chunk, preserve },
         {
           timeout: styleChunkTimeout(chunk.length),
           // A mutation, so it is never re-sent; re-arming only decides how long
@@ -103,9 +109,10 @@
         continue;
       }
       done += res.done || 0;
+      kept += res.kept || 0;
       for (const f of res.failures || []) failures.push(f);
     }
-    return { done, failures };
+    return { done, kept, failures };
   };
 
   // Style one page container from one template root. Returns the ids to name
@@ -140,8 +147,10 @@
       return null;
     }
 
-    const { done, failures } = await applyPairs(paired.pairs, (i, total) =>
-      modal.setRow(rowId, "running", `styling ${i}/${total}`),
+    const { done, kept, failures } = await applyPairs(
+      paired.pairs,
+      tally.preserve,
+      (i, total) => modal.setRow(rowId, "running", `styling ${i}/${total}`),
     );
     const skipped = paired.skipped || [];
     const missing = paired.missing || [];
@@ -149,6 +158,7 @@
     const drifted = missing.length + extra.length;
     tally.applied++;
     tally.nodes += done;
+    tally.keptBackground += kept;
     tally.skippedNodes += skipped.length;
     tally.driftedNodes += drifted;
     tally.touched.add(target.id);
@@ -156,6 +166,7 @@
       rowId,
       failures.length || drifted ? "warn" : "ok",
       `${done}/${paired.pairs.length} node(s) styled` +
+        (kept ? `, ${kept} background(s) kept` : "") +
         (skipped.length ? `, ${skipped.length} skipped` : "") +
         (drifted ? `, ${drifted} unmatched` : "") +
         (failures.length ? `, ${failures.length} errored` : ""),
@@ -227,20 +238,93 @@
       title: "Sync Template Styles",
       button: "Sync",
       prompt: (n) =>
-        `${n} template(s) match a top container. Untick any you want to leave alone.`,
+        `${n} container(s) match a template root. Untick any you want to leave alone.`,
       logName: "Template sync",
       run: applyRootToTarget,
+      // Only the styling operation pastes anything to hold back. A replace
+      // swaps the content wholesale, so the page node's background goes with
+      // the rest of it and there is nothing here to offer.
+      toggles: [
+        {
+          key: "keepBackground",
+          label: "Keep the page's background image & overlay",
+          hint: "The template does not overwrite a page node's own background image (or how it is positioned and sized), nor anything in its Background Overlay section. Background colour and gradient still sync.",
+          default: true,
+        },
+      ],
     },
     replace: {
       title: "Replace With Template",
       button: "Replace",
       prompt: (n) =>
-        `${n} template(s) match a top container. Untick any you want to leave ` +
+        `${n} container(s) match a template root. Untick any you want to leave ` +
         `alone — replacing deletes the container's current content.`,
       logName: "Template replace",
       run: replaceRootIntoTarget,
     },
   };
+
+  // Which page nodes one template root acts on. Both the confirm checklist and
+  // the run itself go through here, and that is the point: the checklist promises
+  // a set of containers and the run has to act on exactly that set. Two copies of
+  // this rule drifting apart would mean a modal that lies.
+  //
+  // It reads `title` and the element type off the root, which is all a JSON root
+  // from prefetch and a live describe-tree node have in common — so the checklist
+  // can be built before anything is inserted.
+  const resolveTargets = ({ templateId, root, rootNo, rootCount, index, nested }) => {
+    const rootName = root.title || "";
+    const usableName =
+      !!rootName && !GENERIC_ROOT_NAMES.has(ns.normalizeName(rootName));
+    const multi = rootCount > 1;
+
+    // The tag first: it is the exact link, and it is what makes an unnamed root
+    // usable at all. A multi-root template looks for its own root index; a
+    // single-root one accepts the bare tag and "#id.1" alike, so a template that
+    // has since lost roots still finds its blocks.
+    const tagKeys = multi
+      ? [templateTagKey(templateId, rootNo)]
+      : [templateTagKey(templateId), templateTagKey(templateId, 1)];
+    let targets = tagKeys.flatMap((k) => index.byTag.get(k) || []);
+    const viaTag = targets.length > 0;
+    // Nothing tagged: match on the root's name, which is what a hand-built
+    // container has.
+    if (!targets.length && usableName) {
+      targets = index.byName.get(ns.normalizeName(rootName)) || [];
+    }
+
+    // Scanning the whole page needs the extra precision of a type check; at top
+    // level the candidate set is tiny and a type clash is more useful reported
+    // as a pairing failure than silently dropped.
+    const want = ns.nodeType(root);
+    let dropped = 0;
+    if (nested) {
+      const before = targets.length;
+      targets = targets.filter((c) => ns.nodeType(c) === want);
+      dropped = before - targets.length;
+      // Outermost first, so an ancestor is replaced before its descendants are
+      // considered (and then skipped as already gone).
+      targets = targets.slice().sort((a, b) => a.depth - b.depth);
+    }
+
+    return {
+      targets,
+      viaTag,
+      dropped,
+      want,
+      usableName,
+      rootName,
+      multi,
+      tagName: `#${tagKeys.join(" / #")}`,
+    };
+  };
+
+  // How a root is named in the log and on a checklist row. A kit's roots all
+  // share the template's title, so the root index is what tells them apart.
+  const rootLabel = (title, rootNo, rootName, multi) =>
+    multi
+      ? `"${title}" root ${rootNo}${rootName ? ` ("${rootName}")` : ""}`
+      : `"${title}"`;
 
   // Insert a template once, treat each of its roots as an independent
   // template keyed on that root's own layer name, then always remove the copy.
@@ -293,6 +377,25 @@
         insertedIds.map((id) => ns.callBridge("describe-tree", { id })),
       );
       const multi = insertedIds.length > 1;
+      // The checklist was built from the template's JSON roots; the run works
+      // from the roots the import actually produced. They are the same list in
+      // every observed case, and if they ever are not the root indexes have
+      // shifted — so "#id.2" now names a different block than the row promised.
+      // The allowed set stops an unlisted container being touched, but nothing
+      // stops the wrong root reaching a listed one, so say it.
+      const planned = tally.plannedRoots.get(String(template.templateId));
+      if (planned && planned.length !== insertedIds.length) {
+        modal.note(
+          `⚠ "${template.title}" — the confirm list was built from ${planned.length} root(s) ` +
+            `but the insert produced ${insertedIds.length}. Root numbering may not line up ` +
+            `with what was listed; check the result and re-run if it looks wrong.`,
+          "warn",
+        );
+        ns.log(
+          "warn",
+          `${op.logName}: "${template.title}" planned ${planned.length} roots, inserted ${insertedIds.length}`,
+        );
+      }
       if (multi) {
         tally.multiRoot.push({
           title: template.title,
@@ -330,48 +433,28 @@
           continue;
         }
         const root = res.tree;
-        const rootName = root.title || "";
-        const label = multi
-          ? `"${template.title}" root ${i + 1}${rootName ? ` ("${rootName}")` : ""}`
-          : `"${template.title}"`;
-        const usableName =
-          !!rootName && !GENERIC_ROOT_NAMES.has(ns.normalizeName(rootName));
-
-        // The tag first: it is the exact link, and it is what makes an unnamed
-        // root usable at all. A multi-root template looks for its own root
-        // index; a single-root one accepts the bare tag and "#id.1" alike, so a
-        // template that has since lost roots still finds its blocks.
         const rootNo = i + 1;
-        const tagKeys = multi
-          ? [templateTagKey(template.templateId, rootNo)]
-          : [
-              templateTagKey(template.templateId),
-              templateTagKey(template.templateId, 1),
-            ];
-        const tagName = `#${tagKeys.join(" / #")}`;
-        let targets = tagKeys.flatMap((k) => targetIndex.byTag.get(k) || []);
-        const viaTag = targets.length > 0;
-        // Nothing tagged: match on the root's name, which is what a hand-built
-        // container has.
-        if (!targets.length && usableName) {
-          targets = targetIndex.byName.get(ns.normalizeName(rootName)) || [];
-        }
-        // Scanning the whole page needs the extra precision of a type check;
-        // at top level the candidate set is tiny and a type clash is more
-        // useful reported as a pairing failure than silently dropped.
-        if (tally.nested) {
-          const want = ns.nodeType(root);
-          const before = targets.length;
-          targets = targets.filter((c) => ns.nodeType(c) === want);
-          const dropped = before - targets.length;
-          if (dropped) {
-            modal.note(
-              `· ${label} — ${dropped} ${viaTag ? "id tag" : "name"} match(es) skipped, not a "${want}"`,
-            );
-          }
-          // Outermost first, so an ancestor is replaced before its descendants
-          // are considered (and then skipped as already gone).
-          targets = targets.slice().sort((a, b) => a.depth - b.depth);
+        const {
+          targets,
+          viaTag,
+          dropped,
+          want,
+          usableName,
+          rootName,
+          tagName,
+        } = resolveTargets({
+          templateId: template.templateId,
+          root,
+          rootNo,
+          rootCount: insertedIds.length,
+          index: targetIndex,
+          nested: tally.nested,
+        });
+        const label = rootLabel(template.title, rootNo, rootName, multi);
+        if (dropped) {
+          modal.note(
+            `· ${label} — ${dropped} ${viaTag ? "id tag" : "name"} match(es) skipped, not a "${want}"`,
+          );
         }
         if (!targets.length) {
           // viaTag with no targets left means the tag did match, but the nested
@@ -415,6 +498,12 @@
         );
 
         for (const target of targets) {
+          // The checklist is one row per container, so a container the user
+          // unticked is simply not acted on — by any root, from any template.
+          // This is also the net for a plan/run disagreement: a target the
+          // checklist never offered is not in the set, so the run can only ever
+          // do less than it promised, never more.
+          if (!tally.allowed.has(target.id)) continue;
           const rowId = `${template.templateId}:${i}:${target.id}`;
           modal.addRow(rowId, `${label} → "${target.title}"`);
           modal.setStatus(`${op.button}: "${target.title}"…`);
@@ -548,7 +637,13 @@
         return queue;
       };
 
-      if (!buildQueue({ nested: true }).length) {
+      // Every template that could be involved under *either* toggle state, so
+      // the roots below are fetched once and flipping the toggle needs no
+      // network. `nested: true` searches the whole page, and its pool contains
+      // the top-level one, so this is the superset.
+      const candidates = buildQueue({ nested: true });
+
+      if (!candidates.length) {
         modal.note(
           `Top containers: ${topLevel.map((c) => `"${c.title || "(unnamed)"}"`).join(", ") || "none"}`,
         );
@@ -561,10 +656,142 @@
         return;
       }
 
-      modal.setStatus(op.prompt(buildQueue({ nested: false }).length));
+      // The checklist is one row per page container, and only a template's roots
+      // say which containers it reaches — so the content has to be in hand before
+      // the confirm, not after it. This is the same prefetch the inserts want
+      // anyway, asked one step earlier and for the whole match set rather than
+      // just the ticked part: the price of listing targets is fetching templates
+      // the user may then untick. Still only matched templates, never the library.
+      // Outside the history log on purpose: nothing here changes the document.
+      modal.setStatus(
+        `Reading ${candidates.length} matched template(s), ${ns.PREFETCH_CONCURRENCY} at a time…`,
+      );
+      const pre = await ns.prefetchTemplates(candidates, {
+        onWait: waitNote(modal),
+        withRoots: true,
+      });
+      const rootsById = new Map(
+        (pre.roots || []).map((r) => [String(r.templateId), r.roots || []]),
+      );
+      // Unlike a plain warm, a failure here is not just slower — that template
+      // contributes no rows, so it has to be said out loud rather than left to
+      // look like "nothing matched".
+      for (const f of pre.failed || []) {
+        modal.note(
+          `⚠ could not read template #${f.templateId} — ${f.error}. It is not listed below.`,
+          "warn",
+        );
+      }
+
+      // Notes about roots that reach nothing. Collected while planning but held
+      // back until the confirm resolves: buildPlan re-runs on every toggle flip,
+      // and the run itself reports the roots that *do* have targets.
+      let planNotes = [];
+
+      // One row per page container, in document order. A container matched by
+      // more than one root — or by two different templates, which is legal —
+      // is still one row: ticking is a statement about the container.
+      const buildPlan = (toggleState) => {
+        const nested = !!toggleState.nested;
+        const index = nested
+          ? { byName: allByName, byTag: allByTag }
+          : { byName: topByName, byTag: topByTag };
+        const notes = [];
+        const byTarget = new Map();
+
+        for (const template of buildQueue({ nested })) {
+          const roots = rootsById.get(String(template.templateId));
+          if (!roots?.length) continue;
+          const multi = roots.length > 1;
+          roots.forEach((root, i) => {
+            const rootNo = i + 1;
+            const { targets, viaTag, usableName, rootName, tagName } =
+              resolveTargets({
+                templateId: template.templateId,
+                root,
+                rootNo,
+                rootCount: roots.length,
+                index,
+                nested,
+              });
+            const label = rootLabel(template.title, rootNo, rootName, multi);
+            if (!targets.length) {
+              const tagPart = viaTag
+                ? `the ${tagName} tag only matched other element types`
+                : `nothing is tagged ${tagName}`;
+              notes.push({
+                templateId: String(template.templateId),
+                level: usableName ? "info" : "warn",
+                text: usableName
+                  ? `· ${label} — ${tagPart}, and no page container named "${rootName}"`
+                  : `⚠ ${label} — root layer is ${rootName ? `named "${rootName}"` : "unnamed"} ` +
+                    `and ${tagPart} on the page, so it matches nothing. ` +
+                    `Name the root inside the template, or insert it once to tag the page. Skipped.`,
+              });
+              return;
+            }
+            for (const target of targets) {
+              let row = byTarget.get(target.id);
+              if (!row) {
+                row = { target, acts: [], label: "" };
+                byTarget.set(target.id, row);
+              }
+              row.acts.push({ template, rootNo, multi });
+            }
+          });
+        }
+
+        planNotes = notes;
+        const order = new Map(everything.map((c, i) => [c.id, i]));
+        const rows = [...byTarget.values()].sort(
+          (a, b) => order.get(a.target.id) - order.get(b.target.id),
+        );
+
+        // "TW Card" → "Card" reads identically for three sibling cards, and an
+        // ambiguous checklist is worse than none because unticking the wrong row
+        // is silent. Number the repeats in document order, as template-decouple
+        // does for the same reason.
+        for (const r of rows) {
+          const froms = [
+            ...new Set(
+              r.acts.map((a) =>
+                a.multi
+                  ? `"${a.template.title}" root ${a.rootNo}`
+                  : `"${a.template.title}"`,
+              ),
+            ),
+          ];
+          r.label = `${froms.join(" + ")} → ${r.target.title ? `"${r.target.title}"` : "(unnamed)"}`;
+        }
+        const total = new Map();
+        for (const r of rows) total.set(r.label, (total.get(r.label) || 0) + 1);
+        const seen = new Map();
+        for (const r of rows) {
+          const n = total.get(r.label);
+          if (n < 2) continue;
+          const k = (seen.get(r.label) || 0) + 1;
+          seen.set(r.label, k);
+          r.label = `${r.label} (${k} of ${n})`;
+        }
+        return rows;
+      };
+
+      if (!buildPlan({ nested: true }).length) {
+        for (const n of planNotes) modal.note(n.text, n.level);
+        modal.finish(
+          `No container matched a template root. ` +
+            `${candidates.length} template(s) matched by title or tag, but none of ` +
+            `their roots resolved to a container on this page.`,
+          "warn",
+        );
+        ns.log("info", `${op.logName}: no root matched a container`);
+        return;
+      }
+
+      modal.setStatus(op.prompt(buildPlan({ nested: false }).length));
       const choice = await modal.choose({
-        buildItems: buildQueue,
-        labelOf: (t) => t.title,
+        buildItems: buildPlan,
+        labelOf: (r) => r.label,
         buttonText: op.button,
         toggles: [
           {
@@ -573,6 +800,7 @@
             hint: "Search the whole page, not just top-level containers. Nested targets must match the template root's name and type.",
             default: false,
           },
+          ...(op.toggles || []),
         ],
       });
       if (!choice) {
@@ -580,38 +808,47 @@
         modal.close();
         return;
       }
-      const selected = choice.items;
+      const chosen = choice.items;
       const nested = !!choice.toggles.nested;
-      const queue = buildQueue({ nested });
+      const preserve = choice.toggles.keepBackground ? KEEP_BACKGROUND : [];
+      const plan = buildPlan({ nested });
       const targetIndex = nested
         ? { byName: allByName, byTag: allByTag }
         : { byName: topByName, byTag: topByTag };
+
+      // The ticked containers, and the templates that reach at least one of
+      // them. A template whose every target was unticked is not inserted at all,
+      // so unticking still saves the whole round trip it used to.
+      const allowed = new Set(chosen.map((r) => r.target.id));
+      const wanted = new Set();
+      for (const r of chosen) for (const a of r.acts) wanted.add(a.template.templateId);
+      const selected = buildQueue({ nested }).filter((t) =>
+        wanted.has(t.templateId),
+      );
+
+      // Now the toggle state is final, so the roots that reach nothing can be
+      // reported — but only for templates the run will never touch. A template
+      // that IS being inserted reports every one of its roots itself, from the
+      // live insert, and saying it twice is worse than saying it once.
+      const runIds = new Set(selected.map((t) => String(t.templateId)));
+      let unlistedRoots = 0;
+      for (const n of planNotes) {
+        if (runIds.has(n.templateId)) continue;
+        modal.note(n.text, n.level);
+        if (n.level === "warn") unlistedRoots++;
+      }
       if (nested) {
         modal.note(`· Matching nested containers (name + type)`);
       }
-      if (selected.length < queue.length) {
+      if (preserve.length) {
         modal.note(
-          `· ${queue.length - selected.length} template(s) unticked and skipped`,
+          `· Keeping each page node's own background image and overlay`,
         );
       }
-
-      // Load every chosen template's content before touching the document, a few
-      // requests at a time. The inserts below still run one at a time — this only
-      // takes the network wait out of the serial loop. Outside the history log on
-      // purpose: nothing here changes the document.
-      if (selected.length > 1) {
-        modal.setStatus(
-          `Loading ${selected.length} template(s), ${ns.PREFETCH_CONCURRENCY} at a time…`,
+      if (chosen.length < plan.length) {
+        modal.note(
+          `· ${plan.length - chosen.length} container(s) unticked and skipped`,
         );
-        const pre = await ns.prefetchTemplates(selected, {
-          onWait: waitNote(modal),
-        });
-        for (const f of pre.failed || []) {
-          modal.note(
-            `· could not preload #${f.templateId} — ${f.error}. Its insert will try again.`,
-            "warn",
-          );
-        }
       }
 
       // waitLimit 1 on both ends of the history log. Both already degrade to a
@@ -631,11 +868,19 @@
         applied: 0,
         failed: 0,
         nodes: 0,
-        skippedRoots: 0,
+        // Seeded with the roots that never made the checklist, which the run
+        // will never mention. The run adds its own, and the two sets cannot
+        // overlap: it only counts templates in `selected`, which are exactly
+        // the ones excluded above.
+        skippedRoots: unlistedRoots,
+        allowed,
+        plannedRoots: rootsById,
         skippedNodes: 0,
         driftedNodes: 0,
         skippedReplaced: 0,
+        keptBackground: 0,
         nested,
+        preserve,
         firstAncestorIn,
         replaced: new Set(),
         multiRoot: [],
@@ -690,6 +935,9 @@
       const summary =
         `${tally.applied} applied (${tally.nodes} node(s)), ` +
         `${tally.failed} failed, ` +
+        (tally.keptBackground
+          ? `${tally.keptBackground} background(s) kept, `
+          : "") +
         (tally.skippedNodes ? `${tally.skippedNodes} node(s) skipped, ` : "") +
         (tally.driftedNodes ? `${tally.driftedNodes} node(s) unmatched, ` : "") +
         (tally.skippedRoots ? `${tally.skippedRoots} root(s) skipped, ` : "") +
