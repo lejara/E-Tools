@@ -76,7 +76,32 @@
   // These windows live in a popup, which cannot hold tabs — a created tab has to
   // be put in a normal browser window rather than left to default to this one.
   // Returns the tab so a caller that intends to drive it (and close it) can.
-  const openTab = async (url, { active = true } = {}) => {
+  const openTab = async (url, { active = true, ownWindow = false, offset = 0 } = {}) => {
+    // `ownWindow` is the automation run's path, and it is about THROTTLING, not
+    // about tidiness. Firefox suspends requestAnimationFrame in hidden tabs and
+    // Elementor builds its preview through rAF, so a background *tab* can simply
+    // never finish loading — which reads as a slow site rather than as a stalled
+    // one. Only the selected tab of a window counts as visible, so N concurrent
+    // editors need N windows: putting them in one window would leave all but the
+    // front one hidden and throttled, which is the situation being escaped.
+    //
+    // Unfocused so the run does not steal the keyboard, but deliberately NOT
+    // minimized — a minimized window is hidden and throttles exactly like a
+    // background tab. Staggered so they cannot land perfectly stacked, since a
+    // fully occluded window can also be marked hidden (the automation browser
+    // turns occlusion tracking off as well; this holds without it).
+    if (ownWindow) {
+      const win = await browser.windows.create({
+        url,
+        focused: false,
+        state: "normal",
+        width: 1280,
+        height: 860,
+        left: 60 + offset * 56,
+        top: 60 + offset * 56,
+      });
+      return win?.tabs?.[0] || null;
+    }
     const wins = await browser.windows.getAll({});
     const normal = wins.filter((w) => w.type === "normal");
     const target = normal.find((w) => w.focused) || normal[0];

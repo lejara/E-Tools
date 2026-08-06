@@ -11,6 +11,11 @@ const DEFAULT_PURE_CONTAINER_RESET = true;
 // default for the same reason: the option exists because the linked default is
 // the wrong one to start from, so shipping it off would be shipping it unused.
 const DEFAULT_UNLINK_NEW_ELEMENTS = true;
+// Mirrors MIN_MATCH_RATIO in Tools/core_utils.js. Stored as a fraction and shown
+// as a percentage — the field is a judgement call a human sets, and "50" reads
+// better there than "0.5". Empty means "never set, use the default", which is
+// why clearing it removes the key rather than writing one.
+const DEFAULT_MIN_MATCH_RATIO = 0.5;
 const titleEl = document.getElementById("title");
 const metaEl = document.getElementById("meta");
 const clearBtn = document.getElementById("clear");
@@ -24,6 +29,7 @@ const pureContainerResetEl = document.getElementById(
 );
 const unlinkNewEl = document.getElementById("opt-unlink-new");
 const skipWordEl = document.getElementById("opt-skip-word");
+const minMatchEl = document.getElementById("opt-min-match");
 const workingDomainEl = document.getElementById("opt-working-domain");
 const contentEl = document.getElementById("content");
 const contentSearchEl = document.getElementById("content-search");
@@ -156,6 +162,35 @@ unlinkNewEl.addEventListener("change", () => {
 
 skipWordEl.addEventListener("change", () => {
   browser.storage.local.set({ skipWord: skipWordEl.value.trim() });
+});
+
+const showMinMatch = (stored) => {
+  minMatchEl.value =
+    typeof stored === "number" && stored >= 0 && stored <= 1
+      ? String(Math.round(stored * 100))
+      : "";
+};
+// Set from the mirrored constant rather than trusted to the markup, so the
+// number the user sees as "the default" cannot drift from the one in force.
+minMatchEl.placeholder = String(Math.round(DEFAULT_MIN_MATCH_RATIO * 100));
+
+minMatchEl.addEventListener("change", () => {
+  const raw = minMatchEl.value.trim();
+  if (!raw) {
+    // Removed, not set to undefined: the reader tells "never set" from "set to
+    // something unusable" and both fall back, but only an absent key leaves the
+    // field showing its placeholder.
+    browser.storage.local.remove("minMatchRatio");
+    return;
+  }
+  const pct = Math.min(100, Math.max(0, Math.round(Number(raw))));
+  if (!Number.isFinite(pct)) {
+    showMinMatch(undefined);
+    browser.storage.local.remove("minMatchRatio");
+    return;
+  }
+  minMatchEl.value = String(pct);
+  browser.storage.local.set({ minMatchRatio: pct / 100 });
 });
 
 workingDomainEl.addEventListener("change", () => {
@@ -1511,6 +1546,7 @@ browser.storage.local
     "pureContainerReset",
     "unlinkNewElements",
     "skipWord",
+    "minMatchRatio",
     "workingDomain",
     "hotkeyBindings",
     "contentTab",
@@ -1534,6 +1570,7 @@ browser.storage.local
         : !!state.unlinkNewElements;
     skipWordEl.value =
       state.skipWord === undefined ? DEFAULT_SKIP_WORD : state.skipWord;
+    showMinMatch(state.minMatchRatio);
     workingDomain = state.workingDomain || "";
     workingDomainEl.value = workingDomain;
     hotkeyBindings = mergeWithDefaults(state.hotkeyBindings || null);
@@ -1598,6 +1635,9 @@ browser.storage.onChanged.addListener((changes, area) => {
       changes.skipWord.newValue === undefined
         ? DEFAULT_SKIP_WORD
         : changes.skipWord.newValue;
+  }
+  if (changes.minMatchRatio && document.activeElement !== minMatchEl) {
+    showMinMatch(changes.minMatchRatio.newValue);
   }
   if (changes.workingDomain) {
     workingDomain = changes.workingDomain.newValue || "";

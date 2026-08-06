@@ -1,6 +1,7 @@
 # Elementor Tool
 
 Typical flow each release: npm run bump → npm run sign → install the .xpi from about:addons.
+Automation runs go in their own browser: `npm run auto` — see "Firefox throttles what it cannot see".
 Browser extension (MV3, Firefox) that adds hotkey-driven tools to Elementor's WordPress editor.
 
 ## Structure: UI -> Tools
@@ -34,7 +35,7 @@ Browser extension (MV3, Firefox) that adds hotkey-driven tools to Elementor's Wo
     ├── replace-styles.js     # copies source layer styles onto same-named descendants of root
     ├── replace-layer.js      # replaces same-named descendants of root with a copy of source layer
     ├── batch-rename.js       # renames every multi-selected layer to one name (inline modal)
-    ├── template-sync.js      # name-matches top containers to site templates; styles them, or replaces them outright
+    ├── template-sync.js      # tag-matches page containers to site templates; styles them, or replaces them outright
     ├── template-insert.js    # multi-select picker over the template library, inserts the ticked templates
     ├── template-decouple.js  # swaps Elementor Template widgets for a copy of the template's own content
     ├── animation-presets.js  # applies a saved Motion Effects preset to the selection, with delay accumulation
@@ -78,7 +79,9 @@ Build a third tool on this rather than copying it — it was three files' worth 
 - `choose(items, labelOf, buttonText)` → `items[] | null` — a plain checklist (`template-decouple.js`).
 - `choose({ buildItems, labelOf, buttonText, toggles })` → `{ items, toggles } | null` — adds option checkboxes above the list. `buildItems(toggleState)` is a **callback, not an array**, because a toggle can change which items even qualify, so flipping one rebuilds the list rather than filtering it (`template-sync.js`).
 
-Tick state is tracked as the set of _unticked_ items keyed on identity, so an item surviving a rebuild keeps its state and newly-qualifying ones arrive ticked. Everything starts ticked in both shapes.
+Tick state is tracked as the set of _unticked_ items, so an item surviving a rebuild keeps its state and newly-qualifying ones arrive ticked. Everything starts ticked in both shapes.
+
+**`keyOf` is what makes "survives a rebuild" true, and its absence was a silent bug.** The set is keyed on object identity by default, so a `buildItems` that constructs fresh objects each call — which any builder computing labels or grouping rows *must* — re-ticked everything the user had unticked, on **every** toggle flip, including toggles that do not change the row set at all. `template-sync.js` passes `keyOf: (r) => r.target.id`. Identity remains the default only so the legacy array form, which never rebuilds, is unaffected.
 
 ### Cancelling a run
 
@@ -214,36 +217,52 @@ Preload failure is non-fatal by design — that template's own insert fetches it
 
 ## Template tag
 
-Every layer these tools create carries the template's id as a suffix on its layer name — `TW Hero #4821` — and, when the template has more than one root, **which root it is**: `TW Hero #4821.2`. Written by `template-insert`, `template-sync` (both ops) and `template-decouple`; read by `template-sync` as its **first** matching pass. Helpers live in `template-format.js`: `templateTagKey` · `withTemplateTag` · `parseTemplateTag` · `stripTemplateTag`.
+Every layer these tools create carries the template's id as a suffix on its layer name — `TW Hero #4821` — and, when the template has more than one root, **which root it is**: `TW Hero #4821.2`. Written by `template-insert`, `template-sync`'s **replace** op and `template-decouple`; it is the **only** thing `template-sync` and Edge Presets match on. Helpers live in `template-format.js`: `templateTagKey` · `withTemplateTag` · `parseTemplateTag` · `stripTemplateTag`.
 
 - **Why the layer name.** It is the only per-layer field readable on every Elementor version, and it stays visible in the navigator — the link is never invisible state the user can't see or fix.
-- **Id first, name second.** The tag is exact; a name is hand-typed and drifts. A renamed layer still resolves to the template it came from, and name matching only has to answer for layers that were never tagged (hand-built containers).
+- **The tag, and nothing but the tag.** It is exact; a name is hand-typed and drifts. A renamed layer still resolves to the template it came from — and a layer whose tag was deleted resolves to nothing, deliberately, because guessing from a name in a tool that writes to live pages produces confident wrong results.
+- **A style sync no longer writes it.** Matching is tag-only, so a container a sync touches already carries one; the rename only ever overwrote the user's layer name with the library title. A **replace** still writes it and must — see "What a run writes".
 - **The root index is what makes multi-root templates work.** It is 1-based, matching how the tools label roots, and it is a _position_ — re-saving a template with its roots reordered re-points the tags. That is inherent to identifying a root by where it sits; there is nothing else stable to key on.
 - **One place builds tag strings** (`templateTagKey`) and the same key is what the page-node index is keyed on, so a writer and a reader cannot disagree about the shape.
-- **Name matching strips the tag** before comparing (`stripTemplateTag`). Without that, tagging a layer would break the very name match that found it — `TW Hero #4821.2` still matches a root named `TW Hero`.
+- **`stripTemplateTag` has no caller in `template-sync` any more.** It existed so tagging a layer would not break the name match that found it; with the name pass gone, its remaining users are `withTemplateTag` and the panel. Keep it exported — the tag helpers are one dual-context set.
 - **`withTemplateTag` rewrites its own tag and appends anything else.** Same key ⇒ unchanged, so naming twice is idempotent. A tag for the _same template_ is replaced in place (`#4821.1` → `#4821.3` when a root moves). Any other trailing `#n` is treated as part of a hand-typed name and kept: `Card #2` + 4821 → `Card #2 #4821`.
 - **A bare `#id` on a multi-root template is reported, not guessed.** It predates the template having several roots, so nothing says which root it holds — and guessing would style, or destroy, the wrong block. The modal lists the offending layers and says to add `.1`…`.N` or re-insert. A _single_-root template accepts `#id` and `#id.1` interchangeably, so a template that has since lost roots still finds its blocks.
-- Only roots are tagged, so tree pairing is unaffected at the root. A tagged layer nested _inside_ a synced block (tagged by an earlier run) misses `pairTrees`' `type + name` pass and aligns on the type-only pass instead — degraded, not broken, which is what that second pass exists for.
+- Only roots are tagged, so tree pairing is unaffected at the root. A tagged layer nested _inside_ a synced block (tagged by an earlier run) misses `pairTrees`' `type + name` pass and aligns on the type-only pass instead — degraded, not broken, which is what that second pass exists for. Now that a style sync writes no names, this can only arise from an insert or a decouple.
 
 ## Template sync
 
-`Tools/template-sync.js` — one click, no layer selection required. Lists site templates, reads the document's top-level containers, and for each container whose name matches a template title: inserts the template, pairs the two trees, copies styles node-by-node, then deletes the inserted copy in a `finally`.
+`Tools/template-sync.js` — one click, no layer selection required. Lists site templates, reads the document's containers, and for each container carrying a template's `#id` tag: inserts the template, pairs the two trees, copies styles node-by-node, then deletes the inserted copy in a `finally`.
 
-- **Top-container names** come from the model (`settings._title`), not the navigator DOM — the navigator does not need to be open. A container that was never renamed reports `""` and simply never matches.
-- **Matching is two-pass: tag, then name.** A page node carrying `#<templateId>` resolves to that template exactly (`byId`, which cannot collide); only an untagged node falls through to the name. Both passes run at the queue level (which templates get fetched — the id part alone) and at the target level (which containers a root acts on — the full key, root index included).
-- **Name matching** is trimmed, whitespace-collapsed, case-insensitive, and ignores any id tag. A title that resolves to two or more templates is dropped as ambiguous rather than guessed.
-- **Every touched target is renamed** to `<template title> #<tag>` afterwards, through the shared `nameTargets`. For a replace that is the only thing keeping the link: the paste brings the template's own root name with it, so without this the container's identity — tag included — would be gone and the next run could not find it. The name is **always** the library title, never the root's or the container's own name; roots of a kit therefore share a name, and the root index in the tag is what distinguishes them. Matching still consults the root's name (below), so hand-built untagged containers keep working.
+### Matching is by id tag, and by nothing else
+
+A page node's layer name is read for exactly one thing: the `#<templateId>[.<root>]` tag on the end of it. There is **no name-matching pass**, at either level.
+
+There used to be one — a template whose _title_ matched a container's name entered the queue, and a root whose _own name_ matched a container claimed it — to catch containers built by hand and never tagged. It is gone. A tag is exact; a name is hand-typed and drifts; and guessing in something that writes to a live page produces confident wrong results. Do not reintroduce it.
+
+- **An untagged container is invisible to this tool.** That is the point, not a gap. The on-ramp is `template-insert` (tags what it creates), `template-decouple` (tags what it decouples), a replace (below), or typing `#<id>` on the end of a layer name by hand.
+- **This is the rule the rest of the toolset already followed.** `template-decouple` matches on `settings.template_id`; Edge Presets match on the tag alone; `template-insert` matches nothing. Sync was the last name-matcher.
+- **Titles no longer collide**, so there is no ambiguity to report — `byId` is keyed on the template's own id and cannot have two entries. The `byName` index, the `ambiguous` set and `GENERIC_ROOT_NAMES` all went with the name pass.
+- **A root's own layer name now only labels the modal.** It decides nothing, so an unnamed root is perfectly usable and is no longer warned about.
+- **Layer names come from the model** (`settings._title`), not the navigator DOM — the navigator does not need to be open.
+
+### What a run writes
+
+- **The styles operation writes styles and nothing else.** No rename, no structural change to the page's own tree: unaligned nodes are reported and left alone. The one transient exception is the staging copy, inserted at the end of the page and deleted in the same `finally`, inside the same undo step.
+- **A replace renames; a style sync does not.** `op.rename` in `OPS` is the switch. A replace pastes the template root's own `_title` over the target, tag included, so without the rename the block would drop out of the very index it was found by and could never be matched again. A style sync has nothing to establish — tag-only matching means the container it touched was already tagged.
+- The rename is still `<template title> #<tag>`, always the library title, never the root's or the container's own name. Roots of a kit therefore share a name, and the root index in the tag is what distinguishes them.
 - **Tree pairing** (`ns.pairTrees`) aligns rather than marching in lockstep — see below.
-- **Multi-root templates are normal, and each root is its own template.** Elementor saves whatever was selected, so a template's JSON often holds several top-level elements. Every root is handled independently — by its `#id.N` tag first, then by _that root's_ layer name — so one saved template can act as a kit of blocks, named or not. A root with no name falls back to the template's own title, which keeps ordinary single-root templates working unchanged. Do not reintroduce a single-root requirement, and do not warn about kits: `tally.multiRoot` is reported as information, and does not colour the run's outcome.
-- **Two-level matching.** A template enters the queue when a page node carries its id or its _title_ matches one; the _tags and root names_ inside it then decide what each root actually styles. A root can therefore target a container other than the one that pulled its template in. A template nothing points at is never fetched — that keeps the run to one insert per matched template instead of fetching the whole library.
+- **Multi-root templates are normal, and each root is its own template.** Elementor saves whatever was selected, so a template's JSON often holds several top-level elements. Every root is handled independently, by its `#id.N` tag — so one saved template can act as a kit of blocks, named or not. Do not reintroduce a single-root requirement, and do not warn about kits: `tally.multiRoot` is reported as information, and does not colour the run's outcome.
+- **Two-level matching.** A template enters the queue when a page node carries its id; the _root indexes_ in those tags then decide which container each of its roots acts on. A root can therefore target a container other than the one that pulled its template in. A template nothing points at is never fetched — that keeps the run to one insert per matched template instead of fetching the whole library.
+- **One container is claimed by at most one root.** A container carries one tag, and a tag names one template and one root index. The `self` branch of the replace guard is therefore unreachable and kept only as a guard; `row.acts` is a list for the allowlist's sake, not because it can hold two.
 - The whole run is one undo step, and `copy` clobbers Elementor's clipboard (same as the other tools).
 
 ### Nested matching
 
-**Match nested containers** is a toggle in the confirm modal, off by default. Off, only top-level containers (`depth === 0`) can be targets. On, the whole page is searched, so a `TW Card` template styles every `TW Card` nested anywhere in the document.
+**Match nested containers** is a toggle in the confirm modal, off by default. Off, only top-level containers (`depth === 0`) can be targets. On, the whole page is searched, so a template's tag is honoured wherever it is nested.
 
-- Nested candidates must match the template root's **name and type**. Top-level matching stays name-only on purpose: the candidate set there is tiny, and a type clash is more useful surfaced as a pairing failure than silently dropped.
-- The toggle changes which _templates_ qualify, not just which targets — a template whose title matches only a nested node is invisible when the toggle is off. That is why `choose` rebuilds its list from `buildQueue(toggleState)`.
+- Nested candidates must match the template root's **tag and element type**. Top-level matching stays tag-only on purpose: the candidate set there is tiny, and a type clash is more useful surfaced as a pairing failure than silently dropped.
+- **The modal opens on nested when the top level has no rows.** Landing on "Nothing matches" with the fix one checkbox away reads as a dead end; the toggle is off by default because scanning the whole page is the broader act, not because an empty top-level plan is a meaningful answer.
+- The toggle changes which _templates_ qualify, not just which targets — a template tagged only on a nested node is invisible when the toggle is off. That is why `choose` rebuilds its list from `buildQueue(toggleState)`.
 - Nested targets are processed **outermost first** (sorted by `depth`).
 - **Replace + nested needs the ancestor guard.** Replacing a container deletes its descendants, so any later target inside it has a stale id and the bridge would throw. `tally.replaced` plus `firstAncestorIn` (which walks the target's own ancestors and asks the set, rather than testing descendancy once per already-replaced container) skips those with a warning. Styles mode needs no guard — nothing is deleted, so ids stay valid.
 - Known gap: if an _inner_ target is replaced before an outer one from a different template, the inner work is silently discarded. Depth sorting prevents this within a single root's target list, not across templates.
@@ -525,14 +544,18 @@ mismatch **skips** — it never writes and never tries to repair the path.
 ### Matching an instance is tag-only
 
 An untagged block is invisible to Edge Presets even if its name matches a template
-title. That is deliberately narrower than `template-sync`, which falls back to a
-name pass to catch hand-built containers: a name is hand-typed and drifts, and
-guessing in something that *writes* would produce confident wrong results.
+title: a name is hand-typed and drifts, and guessing in something that *writes*
+would produce confident wrong results.
 
-- **It composes with the sync, in that order.** `template-sync` renames and tags
-  **every** target it touches, so in a sync-then-edge run the sync tags the block and
-  the preset then finds it in the same pass. The Automation window's reversed order
-  gives that up — the tag is not written yet — which is why choosing it warns.
+- **`template-sync` now follows the same rule**, so this is no longer the narrower
+  of the two. It used to fall back to a name pass and to tag every target it
+  touched, which meant a sync-then-edge run could adopt a hand-built container and
+  the preset would find it in the same pass. That is gone in both directions: the
+  styles op writes no names, so **neither half of an automation run tags anything**,
+  and a block that is not already tagged is invisible to both. The phase-order
+  warning in the Automation window is now only about the style paste overwriting a
+  preset's style-transfer fields — the tag is no longer at stake, because a sync
+  never writes one.
 - **Root index is honoured.** A preset captured from `#4821.1` applies only to
   `#4821.1` instances. A bare `#4821` matches root 1 only — the same rule
   `template-sync` already follows, since a single-root template accepts `#4821` and
@@ -743,19 +766,43 @@ missing.
   - The iframe is same-origin, so its load state is a real signal rather than an
     inference. It is created dynamically, so the *top* document reaching
     `complete` proves nothing and is not used.
-  - **Settling is the load-bearing part.** The rendered depth-0 count must agree
-    with itself across consecutive polls: once when non-empty, **three times when
-    zero** — because "zero" is also what an unbuilt preview looks like, and only
-    time tells those apart.
-  - `list-containers` also returns `topLevelExpected` from `elementor.elements.length`
-    (the document model), and the rendered count must match it. **That check alone
-    was not enough** and shipping it was the second bug: `elementor.elements` fills
-    in *with* the preview, not before it, so early on both counts are 0 and agree.
-    It is kept because it is precise once the model is populated; the settling
-    check is what covers the window where it is not.
+  - **The saved document config is the ground truth, and settling is now the
+    backstop.** `list-containers` returns `saved: { top, total, via }` from
+    `savedElementCounts()` — the element tree the editor booted with, read off the
+    server response *before* a single view is built. That is the one count that is
+    already correct at the moment the question is worth asking.
+  - **It compares TOTAL elements, not the top level.** A page whose top containers
+    exist while their descendants are still rendering passes any depth-0 test and
+    then breaks nested matching, which the top-level check cannot see at all.
+  - `saved.via` names which candidate answered (`documents.getCurrent().config.elements`,
+    then `config.document.elements`), the same shape and reason as `isTemplateVia`.
+    `via: null` means unreadable, and the blind settle below carries it instead.
+  - **`UNDERCOUNT_GRACE` is the escape hatch, and it must stay.** The 1:1
+    correspondence between saved elements and walked containers holds on this
+    build, but a future Elementor rendering one fewer node would otherwise turn
+    every run into a 120s timeout. A count that has **stopped growing** has
+    finished building, whatever the arithmetic says — so eight still polls accept
+    it and the run *reports* the shortfall rather than swallowing it.
+  - `topLevelExpected` from `elementor.elements.length` (the document model) is
+    kept as an independent second gate. **That check alone was not enough** and
+    shipping it was the second bug: `elementor.elements` fills in *with* the
+    preview, not before it, so early on both counts are 0 and agree.
+  - **Settling was the third bug, and it was the live one.** With `expected` at 0
+    or `null` during a boot, the model gate was skipped **entirely** and the only
+    thing left was `SETTLE_EMPTY` — three polls at 800ms. **2.4 seconds decided
+    whether a page was empty**, which is nowhere near a large page's boot, so a
+    still-building editor passed for an empty one and the page was skipped in
+    silence. Settling now only decides the empty case, and only `SETTLE_EMPTY_BLIND`
+    (12) when `saved.via` is null; with the config readable it is a formality.
   - The timeout is 120s: three Elementor editors booting at once on a slow site is
     routinely tens of seconds, and failing early would report a working site as
     broken.
+- **The document that answered must be the one that was asked for.** `runOne`
+  compares `ready.doc.id` against `job.id` and fails the row otherwise. The id came
+  back on every readiness reply and was being thrown away, so a redirect, a session
+  bouncing through wp-login, or a URL that resolved elsewhere would sync **and
+  save** the wrong page — with every phase reporting a clean result about a
+  document nobody selected.
 - **Every branch of `runTemplateOperation` must return a value.** One bare `return;`
   survived on the "no template matches" path, and an automation run cannot tell
   `undefined` from "the tool is not loaded in this tab" — which is exactly what it
@@ -769,6 +816,55 @@ missing.
   thing* and **is** saved: carrying on past individual failures is what the sync is
   designed to do, and discarding the rest of its work would make one bad container
   cost the whole page.
+
+### Firefox throttles what it cannot see
+
+A run opens editors nobody is looking at, and Firefox treats those as free to slow
+down: background tabs get `setTimeout` clamped to ≥1s, and **hidden tabs have
+`requestAnimationFrame` suspended outright**. Elementor builds its preview through
+rAF, so a hidden editor does not merely load slowly — it can never finish. From the
+window that looks identical to a slow site.
+
+Two halves, because neither is sufficient alone:
+
+- **One unfocused window per editor, not a background tab.** `openTab`'s
+  `ownWindow` option. Only the *selected* tab of a window counts as visible, so N
+  concurrent editors need N windows — sharing one would leave all but the front one
+  hidden, which is the situation being escaped. Unfocused so the run does not steal
+  the keyboard, and deliberately **not minimized**: a minimized window is hidden and
+  throttles exactly like a background tab. Staggered by `index % concurrency` so
+  they cannot land perfectly stacked, since a fully occluded window can be marked
+  hidden too.
+- **`npm run auto`** launches a second Firefox through `web-ext` with the throttling
+  prefs off (`scripts/automation-browser.js`). Prefs are browser-level and **cannot
+  be set from inside an extension**, which is the whole reason this script exists.
+  It also turns off Windows occlusion tracking, which is what makes the staggering
+  above a belt rather than the only defence.
+
+Notes on that script:
+
+- **It is a separate browser, and the profile lives outside the repo.** The repo is
+  in OneDrive and a Firefox profile is a directory of live sqlite files; syncing one
+  invites corruption and a permanent upload loop. It goes under `LOCALAPPDATA`.
+- **`--keep-profile-changes` against a dedicated profile**, so the WordPress login,
+  the Edge Presets and the working domain survive between runs. That flag would be
+  reckless against a real profile; it is correct here because the directory exists
+  for nothing else.
+- The extension id is fixed in `browser_specific_settings`, so `storage.local`
+  is stable across launches rather than a fresh sandbox each time.
+- **A Playwright/geckodriver runner was reconsidered here and refused again.**
+  Everything it would buy is the prefs, which `web-ext` already sets; against that
+  it costs a second harness, a hand-seeded profile, and a pinned extension UUID
+  just to reach the Automation page — Playwright does not support installing
+  Firefox add-ons. Same conclusion as the original decision at the top of this
+  section, reached from a different direction.
+
+**The run reports which it was.** The readiness reply carries `env`
+(`hidden`, `visibilityState`, `frameMs`) from a one-shot rAF probe, cached per tab.
+`frameMs: null` means no frame ever arrived — the signature of a suspended tab
+rather than a slow site — and `throttleNote` turns that into a log line naming
+`npm run auto`. The probe is self-selecting: an unthrottled tab answers in ~16ms,
+and only the tab worth learning about pays the full 1.2s window.
 
 ### The allowlist gates both halves
 
@@ -824,15 +920,17 @@ silently to "off".
     accessor; the sync toggles grey out on `!phases.includes("sync")` and the
     opening row state comes from `phases[0]`. The old `mode === "edge"` tests would
     each have needed a new case for every mode added.
-  - **Sync-then-edge is the default, and the reverse warns once per run.** Two
-    things change and neither shows up as a failure — an instance the presets could
-    not see is simply not in their count, which reads exactly like a clean run:
-    Edge Presets match on the `#id.N` tag **alone** and the sync is what writes it,
-    so a container this run's sync was about to adopt is still untagged; and a
-    style-transfer field a preset writes is overwritten by the paste that follows.
-    The non-style fields presets exist for survive either order, which is what makes
-    edge-first usable at all — for presets landing on a document an earlier run
-    already synced.
+  - **Sync-then-edge is the default, and the reverse warns once per run.** One
+    thing changes and it does not show up as a failure: a style-transfer field a
+    preset writes is overwritten by the paste that follows, silently, because a
+    preset that wrote its value and lost it still counts as applied. The non-style
+    fields presets exist for survive either order, which is what makes edge-first
+    usable at all.
+    - It used to be **two** things, and the second is gone: the sync tagged every
+      target it touched, so running the presets first meant they could not see a
+      container the sync was about to adopt. Neither half writes a tag now — both
+      match on one — so the two phases see exactly the same set of instances
+      whichever order they run in.
   - **The report carries `phases` beside `mode`**, because the mode key alone does
     not say which half ran first and a report read months later has to.
 - **States.** Run: `idle → running → cancelling → finished | cancelled | error`.
@@ -1325,16 +1423,39 @@ Every row in the panel's Hotkeys list has a **Run** button beside it, so the too
 
 `ns.pairTrees` diffs the two trees rather than requiring identical shapes, so an inserted or deleted layer no longer fails a whole container.
 
-At each level the children are aligned by LCS in two passes: first on `type + name` (high confidence), then the remaining gaps on type alone, so a _renamed_ layer still aligns while an _inserted_ one becomes a gap. Aligned children recurse; unaligned ones are reported as `missing` (in the template, not on the page) or `extra` (on the page, not in the template) and are simply not styled.
+At each level the children are aligned by LCS in **three passes of decreasing confidence**, and each pair carries which pass produced it:
+
+| pass | key | what it recovers |
+| --- | --- | --- |
+| `strict` | `type + name`, in order | an identity match |
+| `loose` | `type` alone, within a gap | a renamed layer |
+| `moved` | `type + name`, ignoring order | a reordered layer |
+
+Aligned children recurse; unaligned ones are reported as `missing` (in the template, not on the page) or `extra` (on the page, not in the template) and are simply not styled.
+
+**Pass 3 is why a reordered child is no longer lost.** LCS is order-preserving by construction, so two siblings that swapped places used to come out as one `missing` plus one `extra` and neither got styled. The move pass only pairs leftovers whose strict key is unique on **both** sides _and_ carries a real name: an unnamed container's strict key degenerates to its bare type, and pairing two of those across a level would be a guess about position rather than a recovery of identity. There is a unit test for exactly that case.
+
+### The gate is the template's coverage, not the larger tree's
 
 Two hard failures remain:
 
 - **Root type mismatch** — nothing below it is interpretable.
-- **`MIN_MATCH_RATIO`** (0.5) — below half the nodes aligning, the two trees are not the same block, and styling the overlap would do more harm than refusing.
+- **`templateCoverage < minRatio`** — `pairs / srcNodes`, default `MIN_MATCH_RATIO` (0.5), overridable per site from the panel's **Minimum Template Match (%)** field via `ns.getMatchThreshold()`.
 
-The ratio is `pairs / max(srcNodes, tgtNodes)` after subtracting **whole skipped subtrees from each side independently**. Counting a skipped branch's descendants would let the skip word push a container under the threshold — the opposite of what marking a branch means. There is a regression test for this in the session history; if you touch the ratio maths, re-check that a large skipped subtree leaves the ratio at 1.00.
+The denominator used to be `max(srcNodes, tgtNodes)`, and that was wrong in one common, expensive way: a page block holding the whole template faithfully _plus_ twenty layers somebody added scored 10/30 and was **refused outright**, even though all ten template nodes had found homes and nothing was ambiguous. Extra content on the page is not evidence that the block is wrong.
 
-Known characteristic: a _reordered_ child reads as one `missing` plus one `extra` and is not styled. That is inherent to LCS and is the honest answer — a moved node cannot be distinguished from a delete plus an insert.
+So the two questions are kept apart:
+
+- `templateCoverage` = `pairs / srcNodes` — "did the template apply?" **This is the only gate.**
+- `pageCoverage` = `pairs / tgtNodes` — "how much of the page did we touch?" Reported, never refused. Below `LOW_PAGE_COVERAGE` (0.5) the result carries `lowPageCoverage` and the row goes amber with the counts, because a template landing on a block ten times its size is what a tag on the wrong container looks like — and it is the one shape that would otherwise read as a clean sync.
+
+Both are computed after subtracting **whole skipped subtrees from each side independently**. Counting a skipped branch's descendants would let the skip word push a container under the threshold — the opposite of what marking a branch means. If you touch the ratio maths, re-check that a large skipped subtree leaves the ratio at 1.00; the unit test covers it.
+
+### What it reports back
+
+- **`how` — `{strict, loose, moved}`.** A row reading `40/40 node(s) styled` reads identically whether every node matched on its name or all forty were positional guesses on unnamed containers, and those are very different results to trust. The run surfaces `N of M node(s) aligned by position, not by name` per target and sums it into `tally.looseNodes`. The root pair is not counted — it is the match, established before the walk starts.
+- **`divergence` — the worst level, not the leaves.** Every level with unaligned children is recorded; the one with the most is formatted as `root > [1] "Content": template has 3 child(ren), page has 1, 1 aligned`. It names the single layer to open, where a flat list of leaf paths names what fell out of it. Path steps carry the target's own layer name for the same reason — a bare `[2]` is an index into a tree the user cannot see from the modal.
+- **`rootSkipped`.** The root itself carrying the skip word returns `ok: true` with no pairs, rather than being walked. This was a bug: the walk skips such a node and returns, which for the root means zero pairs against a denominator floored at 1 — a 0% ratio, reported as "too different to be the same block". Marking a container `skip` is exactly how you hold it back, so that read was precisely backwards. `applyRootToTarget` now reports it the same way the replace operation always did.
 
 **The low-ratio failure also returns `pairs`, and no caller here reads it.** It is for "Link to Component" in **Elementor Components**, which ships a verbatim copy of `core_utils.js` and needs the already-computed alignment to offer "Link anyway". Leave the field in: every caller checks `ok` first so it costs nothing, and removing it would silently break that feature the next time this file is ported across.
 
@@ -1345,6 +1466,8 @@ Any layer whose name contains the skip word is never restyled. Default `skip`, c
 `ns.getSkipMatcher()` returns the predicate. It is honoured by **both** style-replacing tools: `template-sync.js` and `replace-styles.js` (simple and deep modes).
 
 A skipped node yields no style pair **and exempts its whole subtree from structural comparison** — marking a branch `skip` means that branch is allowed to have diverged from the template, which is the point. Without that exemption a diverged branch would fail the whole container and the feature would be useless.
+
+**A replace checks the whole subtree; a style sync checks node by node.** That asymmetry is not an inconsistency, it is the difference between the two operations. A style sync touches one node at a time and `pairTrees` exempts the marked branch, so the target's own name is all it has to test. A replace **deletes the target's entire subtree**, so a skip-marked layer anywhere inside it is destroyed — checking only the target's own name silently threw away the exact branches the skip word exists to protect. `tally.firstSkippedDescendant` walks the children map built from the run's own `list-containers` read (no extra round trip), and a match skips the target with the offending layer named, counted as `skippedProtected`.
 
 ## Multi-select subsystem
 

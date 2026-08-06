@@ -7,12 +7,8 @@
 
   let running = false;
 
-  const {
-    templateTagKey,
-    withTemplateTag,
-    parseTemplateTag,
-    stripTemplateTag,
-  } = window.__ElementorTemplateFormat;
+  const { templateTagKey, withTemplateTag, parseTemplateTag } =
+    window.__ElementorTemplateFormat;
 
   /* ----------------------------------------------------------------- core */
 
@@ -25,37 +21,22 @@
       "warn",
     );
 
-  // Elementor's default label for a never-renamed layer. A root carrying one
-  // of these has no identity to match on, so it is skipped rather than guessed at.
-  const GENERIC_ROOT_NAMES = new Set(["container"]);
-
-  // Title collisions make the match ambiguous — there is no safe way to guess
-  // which template the user meant, so those names are dropped from the map.
-  // byId never collides: it is keyed on the template's own id, which is what
-  // the id tag on a page layer resolves against.
+  // Matching is by id tag and nothing else — see resolveTargets. byId cannot
+  // collide: it is keyed on the template's own id, which is exactly what the tag
+  // on a page layer resolves against, so there is no ambiguity to report and no
+  // title index to build.
   const buildTemplateIndex = (templates) => {
-    const byName = new Map();
     const byId = new Map();
-    const ambiguous = new Set();
-    for (const t of templates) {
-      byId.set(String(t.templateId), t);
-      const key = ns.normalizeName(t.title);
-      if (!key) continue;
-      if (byName.has(key)) {
-        ambiguous.add(key);
-        continue;
-      }
-      byName.set(key, t);
-    }
-    for (const key of ambiguous) byName.delete(key);
-    return { byName, byId, ambiguous };
+    for (const t of templates) byId.set(String(t.templateId), t);
+    return { byId };
   };
 
-  // Stamp the block's identity onto the page after the operation: the name that
-  // matched (or the template's title) plus the template id tag. Replace pastes
-  // the template's own root name over the page's, which would otherwise lose
-  // the link outright; styling keeps the target but not necessarily a name that
-  // says where the styles came from.
+  // Stamp the template's title and id tag onto whatever now represents the
+  // block. REPLACE ONLY — see OPS. A replace pastes the template's own root
+  // name over the page's, taking the tag with it, so without this the block
+  // falls out of the very index it was found by and can never be matched again.
+  // The styles operation writes no name at all: it only ever acts on blocks that
+  // are already tagged, so there is nothing there for a rename to establish.
   const nameTargets = async (ids, title, modal) => {
     if (!ids?.length || !title) return;
     const res = await ns.callBridge("rename", { ids, title });
@@ -136,11 +117,26 @@
 
     const paired = ns.pairTrees(root, tgtRes.tree, {
       isSkipped: tally.isSkipped,
+      minRatio: tally.minRatio,
     });
+
+    // The container carries the skip word. Not a failed match — a deliberate
+    // one, reported the same way the replace operation reports it.
+    if (paired.rootSkipped) {
+      tally.skippedNodes++;
+      modal.setRow(rowId, "warn", "carries the skip word — left alone");
+      return null;
+    }
+
     if (!paired.ok) {
       tally.failed++;
       modal.setRow(rowId, "error", paired.error);
       ns.log("warn", `Template sync: "${target.title}" — ${paired.error}`);
+      // The level that actually diverged, first: it names the one layer to open,
+      // where the leaf paths below only name what fell out of it.
+      if (paired.divergence) {
+        modal.note(`    diverges at ${paired.divergence}`, "warn");
+      }
       for (const m of (paired.missing || []).slice(0, 6)) {
         modal.note(`    missing from page: ${m}`, "warn");
       }
@@ -153,7 +149,6 @@
       modal.note(
         `    page:     ${ns.summarizeTree(tgtRes.tree)} (${ns.countNodes(tgtRes.tree)} nodes)`,
       );
-      ns.log("warn", `Template sync: "${target.title}" — ${paired.error}`);
       return null;
     }
 
@@ -167,15 +162,25 @@
     const missing = paired.missing || [];
     const extra = paired.extra || [];
     const drifted = missing.length + extra.length;
+    // How much of this match was identity and how much was position. A run
+    // saying "40/40 node(s) styled" reads the same whether every node matched on
+    // its name or all forty were positional guesses on unnamed containers, and
+    // those are very different results to trust.
+    const how = paired.how || { strict: 0, loose: 0, moved: 0 };
+    const soft = how.loose + how.moved;
     tally.applied++;
     tally.nodes += done;
     tally.keptOwn += kept;
     tally.skippedNodes += skipped.length;
     tally.driftedNodes += drifted;
+    tally.looseNodes += soft;
+    if (paired.lowPageCoverage) tally.lowCoverage++;
     tally.touched.add(target.id);
     modal.setRow(
       rowId,
-      failures.length || drifted || stopped ? "warn" : "ok",
+      failures.length || drifted || stopped || paired.lowPageCoverage
+        ? "warn"
+        : "ok",
       (stopped ? "cancelled — " : "") +
         `${done}/${paired.pairs.length} node(s) styled` +
         (kept ? `, ${kept} kept own values` : "") +
@@ -183,13 +188,31 @@
         (drifted ? `, ${drifted} unmatched` : "") +
         (failures.length ? `, ${failures.length} errored` : ""),
     );
+    if (soft) {
+      modal.note(
+        `    ${soft} of ${paired.pairs.length} node(s) aligned by position, not by name` +
+          (how.moved ? ` (${how.moved} reordered)` : ""),
+      );
+    }
+    // The template applied in full, onto a block much larger than itself. Not a
+    // failure — but it is what a tag on the wrong container looks like, and it
+    // is the one shape that would otherwise read as a clean sync.
+    if (paired.lowPageCoverage) {
+      modal.note(
+        `    only ${paired.pairs.length} of ${ns.countNodes(tgtRes.tree)} page node(s) ` +
+          `matched — check this is the right container`,
+        "warn",
+      );
+    }
+    if (paired.divergence) modal.note(`    diverges at ${paired.divergence}`);
     for (const s of skipped) modal.note(`    skipped "${s}"`);
     for (const m of missing) modal.note(`    missing from page: ${m}`, "warn");
     for (const e of extra) modal.note(`    extra on page: ${e}`, "warn");
     for (const f of failures) modal.note(`    ${f}`, "warn");
     ns.log(
       "info",
-      `Template sync: "${target.title}" — ${done}/${paired.pairs.length} node(s)`,
+      `Template sync: "${target.title}" — ${done}/${paired.pairs.length} node(s)` +
+        (soft ? `, ${soft} by position` : ""),
     );
     return [target.id];
   };
@@ -204,9 +227,34 @@
       return null;
     }
 
-    // Already replaced, so this id is stale and the bridge would throw. Either
-    // this exact node (two templates can match one container — by name from one
-    // and by id tag from another) or an ancestor, whose replace deleted it.
+    // A replace deletes the target's whole subtree, so a skip-marked layer
+    // ANYWHERE inside it is destroyed. Checking only the target's own name —
+    // which is all the styles operation needs, because a paste-style touches
+    // one node at a time and pairTrees exempts the branch — silently threw away
+    // the exact branches the skip word exists to protect.
+    const protectedChild = tally.firstSkippedDescendant(target.id);
+    if (protectedChild) {
+      tally.skippedProtected++;
+      modal.setRow(
+        rowId,
+        "warn",
+        `contains "${protectedChild.title}", which carries the skip word — ` +
+          `replacing would delete it, so nothing was changed`,
+      );
+      ns.log(
+        "warn",
+        `Template replace: "${target.title}" holds skip-marked ` +
+          `"${protectedChild.title}" — left alone`,
+      );
+      return null;
+    }
+
+    // Already replaced, so this id is stale and the bridge would throw. In
+    // practice that means an ancestor, whose replace deleted it. The `self` case
+    // is unreachable under tag-only matching — a container carries one tag, so
+    // exactly one template root can ever claim it — and is kept as the guard it
+    // was: it costs a set lookup, and the alternative to being wrong here is
+    // handing the bridge a deleted id.
     const self = tally.replaced.has(target.id);
     const deadAncestor =
       !self && tally.firstAncestorIn(target.id, tally.replaced);
@@ -253,6 +301,11 @@
         `${n} container(s) match a template root. Untick any you want to leave alone.`,
       logName: "Template sync",
       run: applyRootToTarget,
+      // No rename. Matching is tag-only, so a container this operation touches
+      // already carries its tag — there is nothing for a rename to establish,
+      // and overwriting the user's layer name with the library title every run
+      // was the only thing it actually did.
+      rename: false,
       // Only the styling operation pastes anything to hold back. A replace
       // swaps the content wholesale, so the page node's own values go with the
       // rest of it and there is nothing here to offer.
@@ -303,6 +356,11 @@
         `alone — replacing deletes the container's current content.`,
       logName: "Template replace",
       run: replaceRootIntoTarget,
+      // Unavoidable here, unlike the styles operation: the paste brings the
+      // template root's own _title with it, tag included, so a replaced block
+      // that is not renamed drops out of the index it was found by and can
+      // never be matched again.
+      rename: true,
     },
   };
 
@@ -314,26 +372,27 @@
   // It reads `title` and the element type off the root, which is all a JSON root
   // from prefetch and a live describe-tree node have in common — so the checklist
   // can be built before anything is inserted.
+  //
+  // MATCHING IS BY ID TAG AND NOTHING ELSE. There used to be a fallback pass on
+  // the root's layer name, to catch containers built by hand and never tagged.
+  // It is gone: a tag is exact and a name is hand-typed and drifts, and guessing
+  // in something that *writes to a live page* produces confident wrong results.
+  // The root's own name survives here only as a label for the modal.
+  //
+  // This is the rule template-decouple (settings.template_id) and Edge Presets
+  // (the tag alone) already followed. An untagged container is now invisible to
+  // every tool here, which is what makes a match mean something.
   const resolveTargets = ({ templateId, root, rootNo, rootCount, index, nested }) => {
     const rootName = root.title || "";
-    const usableName =
-      !!rootName && !GENERIC_ROOT_NAMES.has(ns.normalizeName(rootName));
     const multi = rootCount > 1;
 
-    // The tag first: it is the exact link, and it is what makes an unnamed root
-    // usable at all. A multi-root template looks for its own root index; a
-    // single-root one accepts the bare tag and "#id.1" alike, so a template that
-    // has since lost roots still finds its blocks.
+    // A multi-root template looks for its own root index; a single-root one
+    // accepts the bare tag and "#id.1" alike, so a template that has since lost
+    // roots still finds its blocks.
     const tagKeys = multi
       ? [templateTagKey(templateId, rootNo)]
       : [templateTagKey(templateId), templateTagKey(templateId, 1)];
     let targets = tagKeys.flatMap((k) => index.byTag.get(k) || []);
-    const viaTag = targets.length > 0;
-    // Nothing tagged: match on the root's name, which is what a hand-built
-    // container has.
-    if (!targets.length && usableName) {
-      targets = index.byName.get(ns.normalizeName(rootName)) || [];
-    }
 
     // Scanning the whole page needs the extra precision of a type check; at top
     // level the candidate set is tiny and a type clash is more useful reported
@@ -351,10 +410,8 @@
 
     return {
       targets,
-      viaTag,
       dropped,
       want,
-      usableName,
       rootName,
       multi,
       tagName: `#${tagKeys.join(" / #")}`,
@@ -367,6 +424,17 @@
     multi
       ? `"${title}" root ${rootNo}${rootName ? ` ("${rootName}")` : ""}`
       : `"${title}"`;
+
+  // Why a root reached nothing. There are only two answers now that matching is
+  // tag-only, and the fix differs: a tag that matched other element types is a
+  // mislabelled layer, an absent tag is a block that was never inserted from
+  // this template. The old "name the root inside the template" advice is gone
+  // with the name pass — a root's own name no longer decides anything.
+  const rootMissText = (tagName, dropped) =>
+    dropped
+      ? `the ${tagName} tag only matched other element types on this page.`
+      : `nothing on this page is tagged ${tagName} — insert the template once, ` +
+        `or add the tag to the layer's name by hand.`;
 
   // Insert a template once, treat each of its roots as an independent
   // template keyed on that root's own layer name, then always remove the copy.
@@ -495,15 +563,7 @@
         }
         const root = res.tree;
         const rootNo = i + 1;
-        const {
-          targets,
-          viaTag,
-          dropped,
-          want,
-          usableName,
-          rootName,
-          tagName,
-        } = resolveTargets({
+        const { targets, dropped, want, rootName, tagName } = resolveTargets({
           templateId: template.templateId,
           root,
           rootNo,
@@ -514,44 +574,27 @@
         const label = rootLabel(template.title, rootNo, rootName, multi);
         if (dropped) {
           modal.note(
-            `· ${label} — ${dropped} ${viaTag ? "id tag" : "name"} match(es) skipped, not a "${want}"`,
+            `· ${label} — ${dropped} tag match(es) skipped, not a "${want}"`,
           );
         }
         if (!targets.length) {
-          // viaTag with no targets left means the tag did match, but the nested
-          // type check dropped every one of them.
-          const tagPart = viaTag
-            ? `the ${tagName} tag only matched other element types`
-            : `nothing is tagged ${tagName}`;
-          if (!usableName) {
-            tally.skippedRoots++;
-            modal.note(
-              `⚠ ${label} — root layer is ${rootName ? `named "${rootName}"` : "unnamed"} ` +
-                `and ${tagPart} on the page, so it matches nothing. ` +
-                `Name the root inside the template, or insert it once to tag the page. Skipped.`,
-              "warn",
-            );
-            ns.log(
-              "warn",
-              `${op.logName}: "${template.title}" root ${rootNo} matched nothing — skipped`,
-            );
-          } else {
-            modal.note(
-              `· ${label} — ${tagPart}, and no page container named "${rootName}"`,
-            );
-          }
+          tally.skippedRoots++;
+          modal.note(
+            `⚠ ${label} — ${rootMissText(tagName, dropped)} Skipped.`,
+            "warn",
+          );
+          ns.log(
+            "warn",
+            `${op.logName}: "${template.title}" root ${rootNo} matched nothing — skipped`,
+          );
           continue;
         }
-        if (viaTag) {
-          modal.note(`· ${label} — matched by tag ${tagName}`);
-        }
+        modal.note(`· ${label} — matched by tag ${tagName}`);
 
-        // What the block is called once the operation is done: always the
-        // template's title from the library, plus the tag. Roots of a kit end up
-        // sharing a name, which is fine — the root index in the tag is the
-        // identity, and it is what the next run matches on first. The root's own
-        // name still decides *matching* above, for containers that were built by
-        // hand and never tagged.
+        // What the block is called once a REPLACE is done — see nameTargets. The
+        // library title plus the tag: roots of a kit end up sharing a name, which
+        // is fine, because the root index in the tag is the identity and the tag
+        // is the only thing the next run matches on.
         const identity = withTemplateTag(
           template.title,
           template.templateId,
@@ -573,7 +616,7 @@
           // Whatever the operation hands back is the block as it now stands, so
           // it is also exactly what must still exist when the run is over.
           for (const id of nameIds || []) tally.expected.add(id);
-          await nameTargets(nameIds, identity, modal);
+          if (op.rename) await nameTargets(nameIds, identity, modal);
         }
       }
     } finally {
@@ -638,7 +681,7 @@
         return { ok: false, error: String(templatesRes?.error || "fetch failed") };
       }
       const all = templatesRes.templates || [];
-      const { byName, byId, ambiguous } = buildTemplateIndex(all);
+      const { byId } = buildTemplateIndex(all);
 
       modal.setStatus(`Found ${all.length} template(s). Reading page containers…`);
       const pageRes = await ns.untilCancelled(
@@ -654,23 +697,12 @@
       const everything = pageRes.containers || [];
       const topLevel = everything.filter((c) => c.depth === 0);
 
-      // Two indexes: shallow is the default, deep is opt-in from the confirm
-      // modal. A root looks up its targets in whichever is active.
-      // The id tag is stripped before keying, so tagging a layer never breaks
-      // the name match that found it in the first place.
-      const indexByName = (nodes) => {
-        const map = new Map();
-        for (const c of nodes) {
-          const key = ns.normalizeName(stripTemplateTag(c.title));
-          if (!key) continue;
-          if (!map.has(key)) map.set(key, []);
-          map.get(key).push(c);
-        }
-        return map;
-      };
-      // The same nodes keyed on their whole tag — "4821" or "4821.2" — so a
-      // lookup names one template *and* one of its roots. This is the pass that
-      // runs first; a name only has to answer for untagged layers.
+      // Nodes keyed on their whole tag — "4821" or "4821.2" — so a lookup names
+      // one template *and* one of its roots. This is the only index there is:
+      // matching is tag-only, so a layer with no tag is not a candidate for
+      // anything. Two of them because shallow is the default and deep is opt-in
+      // from the confirm modal; a root looks up its targets in whichever is
+      // active.
       const indexByTag = (nodes) => {
         const map = new Map();
         for (const c of nodes) {
@@ -681,12 +713,27 @@
         }
         return map;
       };
-      const topByName = indexByName(topLevel);
-      const allByName = indexByName(everything);
       const topByTag = indexByTag(topLevel);
       const allByTag = indexByTag(everything);
 
       const parentOf = new Map(everything.map((c) => [c.id, c.parentId]));
+      const childrenOf = new Map();
+      for (const c of everything) {
+        if (!childrenOf.has(c.parentId)) childrenOf.set(c.parentId, []);
+        childrenOf.get(c.parentId).push(c);
+      }
+      // The first skip-marked layer anywhere under `id`. Only the replace
+      // operation asks: it deletes the whole subtree, so a protected branch
+      // inside a matched container is destroyed rather than merely restyled.
+      const firstSkippedDescendant = (id, isSkipped) => {
+        const stack = [...(childrenOf.get(id) || [])];
+        while (stack.length) {
+          const node = stack.pop();
+          if (isSkipped(node.title)) return node;
+          for (const kid of childrenOf.get(node.id) || []) stack.push(kid);
+        }
+        return null;
+      };
       // Walk the node's own ancestors and ask the set, rather than asking "is
       // this a descendant of X?" once per already-replaced container. Same
       // answer, one pass up the tree instead of one pass per member of a set
@@ -700,25 +747,16 @@
         return null;
       };
 
-      for (const key of ambiguous) {
-        ns.log("warn", `${op.logName}: "${key}" matches multiple templates — skipped`);
-        modal.note(`⚠ "${key}" matches multiple templates — skipped`, "warn");
-      }
-
-      // A template is considered when a page node carries its id tag, or
-      // failing that when its title matches a page node's name. Id first: the
-      // tag is exact, so a layer whose name was edited by hand still resolves
-      // to the template it came from, and a name only has to answer for layers
-      // that were never tagged.
-      // Root-level names then decide what each root inside it actually styles.
+      // A template is considered when a page node carries its id tag. Nothing
+      // else brings one into the queue — a title that happens to match a layer
+      // name is not evidence, and a tag is. The tags *inside* it then decide
+      // which containers each of its roots actually acts on.
       const buildQueue = ({ nested }) => {
         const pool = nested ? everything : topLevel;
         const queue = [];
         const seen = new Set();
         for (const c of pool) {
-          const t =
-            byId.get(parseTemplateTag(c.title)?.id) ||
-            byName.get(ns.normalizeName(stripTemplateTag(c.title)));
+          const t = byId.get(parseTemplateTag(c.title)?.id);
           if (t && !seen.has(t.templateId)) {
             seen.add(t.templateId);
             queue.push(t);
@@ -734,12 +772,24 @@
       const candidates = buildQueue({ nested: true });
 
       if (!candidates.length) {
+        // Say what was looked for, because "no matches" under tag-only matching
+        // most often means the blocks were never tagged rather than that the
+        // page holds nothing from a template. The tag count is the diagnosis.
+        const tagged = everything.filter((c) => parseTemplateTag(c.title)).length;
         modal.note(
           `Top containers: ${topLevel.map((c) => `"${c.title || "(unnamed)"}"`).join(", ") || "none"}`,
         );
+        modal.note(
+          tagged
+            ? `· ${tagged} layer(s) carry a #id tag, but none names a template on this site.`
+            : `· No layer on this page carries a #id tag. A block is matched by the ` +
+              `tag its name ends with — insert a template once, or add "#<id>" by hand.`,
+          "warn",
+        );
         modal.finish(
           `No matches. ${topLevel.length} top container(s), ` +
-            `${everything.length} node(s) in total, ${all.length} template(s).`,
+            `${everything.length} node(s) in total, ${tagged} tagged, ` +
+            `${all.length} template(s).`,
           "warn",
         );
         ns.log("info", `${op.logName}: no template matches`);
@@ -796,9 +846,7 @@
       // is still one row: ticking is a statement about the container.
       const buildPlan = (toggleState) => {
         const nested = !!toggleState.nested;
-        const index = nested
-          ? { byName: allByName, byTag: allByTag }
-          : { byName: topByName, byTag: topByTag };
+        const index = nested ? { byTag: allByTag } : { byTag: topByTag };
         const notes = [];
         const byTarget = new Map();
 
@@ -808,28 +856,20 @@
           const multi = roots.length > 1;
           roots.forEach((root, i) => {
             const rootNo = i + 1;
-            const { targets, viaTag, usableName, rootName, tagName } =
-              resolveTargets({
-                templateId: template.templateId,
-                root,
-                rootNo,
-                rootCount: roots.length,
-                index,
-                nested,
-              });
+            const { targets, dropped, rootName, tagName } = resolveTargets({
+              templateId: template.templateId,
+              root,
+              rootNo,
+              rootCount: roots.length,
+              index,
+              nested,
+            });
             const label = rootLabel(template.title, rootNo, rootName, multi);
             if (!targets.length) {
-              const tagPart = viaTag
-                ? `the ${tagName} tag only matched other element types`
-                : `nothing is tagged ${tagName}`;
               notes.push({
                 templateId: String(template.templateId),
-                level: usableName ? "info" : "warn",
-                text: usableName
-                  ? `· ${label} — ${tagPart}, and no page container named "${rootName}"`
-                  : `⚠ ${label} — root layer is ${rootName ? `named "${rootName}"` : "unnamed"} ` +
-                    `and ${tagPart} on the page, so it matches nothing. ` +
-                    `Name the root inside the template, or insert it once to tag the page. Skipped.`,
+                level: "warn",
+                text: `⚠ ${label} — ${rootMissText(tagName, dropped)} Skipped.`,
               });
               return;
             }
@@ -911,7 +951,7 @@
         {
           key: "nested",
           label: "Match nested containers",
-          hint: "Whole page, not just top level. Root name + type must match.",
+          hint: "Whole page, not just top level. Tag + element type must match.",
           default: false,
         },
         ...(op.toggles || []),
@@ -946,10 +986,26 @@
           return { ok: true, applied: 0, failed: 0, targets: 0, summary: why };
         }
       } else {
-        modal.setStatus(op.prompt(buildPlan({ nested: false }).length));
+        // Open on whichever pool actually has rows. Landing on "Nothing matches"
+        // with the fix one checkbox away reads as a dead end, and the toggle is
+        // only off by default because scanning the whole page is the broader act
+        // — not because an empty top-level plan is a meaningful answer.
+        if (!buildPlan({ nested: false }).length) {
+          toggleRows[0].default = true;
+          modal.note(
+            `· nothing matched at the top level, so nested matching is on`,
+          );
+        }
+        modal.setStatus(
+          op.prompt(buildPlan({ nested: !!toggleRows[0].default }).length),
+        );
         const choice = await modal.choose({
           buildItems: buildPlan,
           labelOf: (r) => r.label,
+          // A container's id, not the row object: buildPlan constructs fresh
+          // rows on every toggle flip, so identity-keyed tick state silently
+          // re-ticked everything the user had unticked each time one moved.
+          keyOf: (r) => r.target.id,
           buttonText: op.button,
           toggles: toggleRows,
         });
@@ -971,9 +1027,7 @@
         toggleState[t.key] ? t.groups || [] : [],
       );
       const plan = buildPlan({ nested });
-      const targetIndex = nested
-        ? { byName: allByName, byTag: allByTag }
-        : { byName: topByName, byTag: topByTag };
+      const targetIndex = nested ? { byTag: allByTag } : { byTag: topByTag };
 
       // The ticked containers, and the templates that reach at least one of
       // them. A template whose every target was unticked is not inserted at all,
@@ -982,9 +1036,9 @@
       const wanted = new Set();
       for (const r of chosen) {
         for (const a of r.acts) {
-          // One ticked container can be reached by several templates — by id tag
-          // from one and by name from another. Under an allowlist only the
-          // allowed ones are inserted for it.
+          // A row carries every root that claims its container — one, under
+          // tag-only matching, but the shape is what gates it: under an
+          // allowlist only the allowed templates are inserted for a row.
           if (allow.size && !allow.has(String(a.template.templateId))) continue;
           wanted.add(a.template.templateId);
         }
@@ -1005,7 +1059,7 @@
         if (n.level === "warn") unlistedRoots++;
       }
       if (nested) {
-        modal.note(`· Matching nested containers (name + type)`);
+        modal.note(`· Matching nested containers (tag + element type)`);
       }
       // A preserved value is a value the template asked for and did not get, so
       // each option that is on says so before the run rather than leaving the
@@ -1016,6 +1070,16 @@
       if (chosen.length < plan.length) {
         modal.note(
           `· ${plan.length - chosen.length} container(s) unticked and skipped`,
+        );
+      }
+
+      // Both are panel settings, read once per run rather than per target.
+      const isSkipped = await ns.getSkipMatcher();
+      const minRatio = await ns.getMatchThreshold();
+      if (minRatio !== ns.MIN_MATCH_RATIO) {
+        modal.note(
+          `· refusing a block below ${Math.round(minRatio * 100)}% template match ` +
+            `(default ${Math.round(ns.MIN_MATCH_RATIO * 100)}%)`,
         );
       }
 
@@ -1050,9 +1114,15 @@
         skippedNodes: 0,
         driftedNodes: 0,
         skippedReplaced: 0,
+        skippedProtected: 0,
+        // Pairs that aligned on position rather than on a name, summed over the
+        // run. The number a "40/40 styled" line cannot carry on its own.
+        looseNodes: 0,
+        lowCoverage: 0,
         keptOwn: 0,
         nested,
         preserve,
+        minRatio,
         firstAncestorIn,
         replaced: new Set(),
         multiRoot: [],
@@ -1061,7 +1131,8 @@
         // Snapshot of what was on the page before any insert, for the collision
         // guard in syncTemplate.
         pageIds: new Set(everything.map((c) => c.id)),
-        isSkipped: await ns.getSkipMatcher(),
+        isSkipped,
+        firstSkippedDescendant: (id) => firstSkippedDescendant(id, isSkipped),
       };
       let attempted = 0;
       for (const template of selected) {
@@ -1126,7 +1197,16 @@
         (tally.keptOwn ? `${tally.keptOwn} node(s) kept own values, ` : "") +
         (tally.skippedNodes ? `${tally.skippedNodes} node(s) skipped, ` : "") +
         (tally.driftedNodes ? `${tally.driftedNodes} node(s) unmatched, ` : "") +
+        (tally.looseNodes
+          ? `${tally.looseNodes} node(s) aligned by position, `
+          : "") +
+        (tally.lowCoverage
+          ? `${tally.lowCoverage} container(s) much larger than their template, `
+          : "") +
         (tally.skippedRoots ? `${tally.skippedRoots} root(s) skipped, ` : "") +
+        (tally.skippedProtected
+          ? `${tally.skippedProtected} target(s) protected by the skip word, `
+          : "") +
         (tally.skippedReplaced
           ? `${tally.skippedReplaced} target(s) already replaced, `
           : "") +

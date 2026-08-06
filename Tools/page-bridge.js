@@ -792,6 +792,57 @@
     }
   };
 
+  // How many elements the SAVED DOCUMENT holds — top-level and in total — read
+  // from the config the editor booted with rather than from anything rendered.
+  //
+  // This is the ground truth `list-containers` was missing. `elementor.elements`
+  // is a *model that fills in with the preview*, so early in a boot it is empty
+  // and agrees with an empty render: an automation run then reads zero containers,
+  // concludes the page holds no templates, and skips it. The document config comes
+  // straight off the server response before a single view is built, so it is
+  // populated at the moment the question is worth asking.
+  //
+  // Two candidates, tried in order, with `via` reporting which one answered — the
+  // same shape as isTemplateVia in describe-document, and for the same reason: a
+  // wrong answer here is diagnosable rather than mysterious. Both unreadable means
+  // `via: null`, and a caller degrades to not checking rather than to never being
+  // ready.
+  const savedElementCounts = () => {
+    const candidates = [
+      [
+        "documents.getCurrent().config.elements",
+        () => window.elementor?.documents?.getCurrent?.()?.config?.elements,
+      ],
+      [
+        "config.document.elements",
+        () => window.elementor?.config?.document?.elements,
+      ],
+    ];
+    for (const [via, get] of candidates) {
+      let els = null;
+      try {
+        els = get();
+      } catch (_) {
+        continue;
+      }
+      if (!Array.isArray(els)) continue;
+      // Total counts every element at every depth, because the rendered walk does
+      // too — top-level agreement alone says nothing about whether a page's
+      // descendants have been built, which is exactly what nested matching needs.
+      let total = 0;
+      const walk = (list) => {
+        for (const el of list) {
+          if (!el || typeof el !== "object") continue;
+          total += 1;
+          if (Array.isArray(el.elements)) walk(el.elements);
+        }
+      };
+      walk(els);
+      return { top: els.length, total, via };
+    }
+    return { top: null, total: null, via: null };
+  };
+
   const handlers = {
     ping: () => ({ ready: !!(window.$e && window.elementor) }),
     // The panel's two create-hook checkboxes, pushed in together — one hook
@@ -1545,6 +1596,11 @@
       return {
         containers: out,
         topLevelExpected: window.elementor?.elements?.length ?? null,
+        // The authoritative expectation, and the one a caller should gate on
+        // first — see savedElementCounts. `topLevelExpected` above is kept as a
+        // second, independent signal: it is precise once the model is populated,
+        // it just cannot be trusted to say "empty" before then.
+        saved: savedElementCounts(),
       };
     },
     // Collapses the whole sync (potentially hundreds of $e.run calls) into a

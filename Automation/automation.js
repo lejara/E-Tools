@@ -63,12 +63,14 @@
   // Sync-then-edge is the default because the sync is the half that pastes the
   // template's own values over the page's. The reverse is offered for the case
   // where the presets are meant to land on a document an earlier run already
-  // synced, and it costs two things that `startRun` warns about once per run:
-  //   · Edge Presets match instances on the `#id.N` tag ALONE, and the sync is what
-  //     writes that tag. Run first, the presets cannot see a hand-built container
-  //     the sync was about to adopt.
+  // synced, and it costs one thing that `startRun` warns about once per run:
   //   · Any style-transfer field a preset writes is overwritten by the paste that
   //     follows it. The non-style fields presets exist for are untouched.
+  //
+  // It used to cost a second thing — the sync tagged every target it touched, so
+  // presets running first could not see a container the sync was about to adopt.
+  // Both halves match on the `#id.N` tag now and neither writes one, so the two
+  // phases see the same set of instances in either order.
   const MODES = {
     both: { label: "Sync → Edge Presets", phases: ["sync", "edge"] },
     "edge-first": { label: "Edge Presets → Sync", phases: ["edge", "sync"] },
@@ -1074,9 +1076,33 @@
     renderProgress();
   };
 
+  // A tab Firefox has suspended looks exactly like a slow site from out here, so
+  // the report has to be able to tell the two apart rather than leaving it to be
+  // guessed at across a hundred pages. Said only when it is the likely story — a
+  // visible tab that merely took a while is just a slow page.
+  const throttleNote = (env) => {
+    if (!env) return null;
+    if (env.frameMs === null) {
+      return (
+        `this editor rendered NO frames (${env.visibilityState}) — Firefox suspends ` +
+        `requestAnimationFrame in hidden windows, so the preview could never finish ` +
+        `building. Run from the automation browser: npm run auto`
+      );
+    }
+    if (env.hidden) {
+      return (
+        `this editor was hidden (first frame ${env.frameMs}ms) — Firefox throttles ` +
+        `background timers, so everything here runs slowly. Run from the automation ` +
+        `browser: npm run auto`
+      );
+    }
+    return null;
+  };
+
   const waitForEditor = async (tabId) => {
     const deadline = Date.now() + READY_TIMEOUT;
     let last = "no answer yet";
+    let lastEnv = null;
     while (Date.now() < deadline) {
       if (cancelRequested) return { ready: false, why: "cancelled" };
       try {
@@ -1086,13 +1112,20 @@
         });
         if (reply?.ready) return reply;
         if (reply?.why) last = reply.why;
+        // Carried out of the loop so a timeout can say WHY it timed out — a
+        // throttled window is the one cause that is invisible from here.
+        if (reply?.env) lastEnv = reply.env;
       } catch (_) {
         // The content script is not in place yet, or the tab is still navigating.
         last = "content script not loaded yet";
       }
       await new Promise((r) => setTimeout(r, READY_POLL));
     }
-    return { ready: false, why: `timed out after ${READY_TIMEOUT / 1000}s — ${last}` };
+    return {
+      ready: false,
+      why: `timed out after ${READY_TIMEOUT / 1000}s — ${last}`,
+      env: lastEnv,
+    };
   };
 
   const runOne = async (job, index) => {
@@ -1106,13 +1139,23 @@
     setProgress(index, "opening");
     let tab = null;
     try {
-      // Opened in the background: three editors stealing focus in turn would make
-      // the browser unusable for the length of the run.
-      tab = await openTab(url, { active: false });
+      // One unfocused WINDOW per editor, not a background tab. A background tab is
+      // hidden, and Firefox suspends requestAnimationFrame in hidden tabs — which
+      // Elementor's preview needs to build at all. Unfocused keeps the run from
+      // stealing the keyboard; see openTab for why they cannot share one window.
+      tab = await openTab(url, { ownWindow: true, offset: index % concurrency });
     } catch (err) {
       setProgress(index, "failed", "could not open a tab");
       say("error", `"${job.title}" (#${job.id}) — could not open a tab: ${err}`);
       return { ...job, state: "failed", error: String(err) };
+    }
+    // windows.create can answer without a tab. Caught here rather than at the
+    // openTabs.add below, where it would throw an unhelpful TypeError into the
+    // catch that reports save failures.
+    if (!tab?.id) {
+      setProgress(index, "failed", "the editor window opened with no tab");
+      say("error", `"${job.title}" (#${job.id}) — the editor window opened with no tab`);
+      return { ...job, state: "failed", error: "no tab" };
     }
     openTabs.add(tab.id);
 
@@ -1126,11 +1169,40 @@
           cancelled ? "warn" : "error",
           `"${job.title}" (#${job.id}) — ${ready.why}`,
         );
+        const throttled = throttleNote(ready.env);
+        if (throttled && !cancelled) say("warn", `"${job.title}" — ${throttled}`);
         return {
           ...job,
           state: cancelled ? "cancelled" : "failed",
           error: ready.why,
         };
+      }
+
+      // The editor that answered has to be the document this job asked for. The
+      // id comes back on every readiness reply and was being thrown away — so a
+      // redirect, an expired session bouncing through wp-login, or a URL that
+      // resolved elsewhere would have this run sync AND SAVE the wrong page.
+      // Nothing downstream could notice: every phase would report a clean result
+      // about a document nobody selected.
+      const opened = String(ready.doc?.id ?? "");
+      if (opened !== String(job.id)) {
+        const why = `opened document #${opened || "unknown"} — expected #${job.id}, left untouched`;
+        setProgress(index, "failed", why);
+        say("error", `"${job.title}" (#${job.id}) — ${why}`);
+        return { ...job, state: "failed", error: why };
+      }
+
+      // A page that finished building short of what its saved data says is worth
+      // one line: it is the readiness probe accepting a document it could not
+      // fully account for, and a sync that then misses a block would otherwise
+      // read as a clean run. See UNDERCOUNT_GRACE in automation-agent.js.
+      if (ready.undercount) {
+        say(
+          "warn",
+          `"${job.title}" (#${job.id}) — rendered ${ready.undercount.rendered} of ` +
+            `${ready.undercount.saved} saved elements and stopped growing; proceeding, ` +
+            `but anything missing was not matched`,
+        );
       }
 
       // The agent reports per page, not per phase, so this row shows the phase the
@@ -1302,17 +1374,16 @@
         `mode "${MODES[mode]?.label || mode}", ${concurrency} editor(s) at once` +
         (review ? " · REVIEW: nothing will be saved, tabs stay open" : ""),
     );
-    // Said once here rather than left to be discovered across a hundred pages.
-    // Neither consequence shows up as a failure — an instance the presets could not
-    // see is simply not in their count, which reads exactly like a clean run.
+    // Said once here rather than left to be discovered across a hundred pages. It
+    // does not show up as a failure — a preset that wrote its value and had it
+    // pasted over still counts as applied, which reads exactly like a clean run.
     if (phases[0] === "edge" && phases.includes("sync")) {
       say(
         "warn",
-        "Edge Presets run BEFORE the sync in this order. Presets match instances on " +
-          "the #id tag alone and the sync is what writes that tag, so a container " +
-          "this run's sync is about to adopt is still untagged and its presets will " +
-          "not reach it. Any style field a preset writes is also overwritten by the " +
-          "paste that follows.",
+        "Edge Presets run BEFORE the sync in this order, so any STYLE field a preset " +
+          "writes is overwritten by the paste that follows it — silently, since the " +
+          "preset still counts as applied. The non-style fields presets exist for are " +
+          "untouched, which is what makes this order usable.",
       );
     }
 
