@@ -1142,7 +1142,12 @@
     menu = null;
   };
 
-  const showMenu = (x, y, info, row) => {
+  // The shell both menus share — the field menu on a panel row and the
+  // structural menu on a navigator layer. Extracted rather than copied because
+  // the outside-click and Escape handling has to be identical: two menus with
+  // subtly different dismissal is the kind of thing nobody notices until one of
+  // them is stuck on screen.
+  const buildMenu = (x, y, labelText) => {
     closeMenu();
 
     const root = document.createElement("div");
@@ -1150,12 +1155,7 @@
 
     const label = document.createElement("div");
     label.className = `${MENU_CLASS}__label`;
-    label.textContent =
-      info.scope === "section"
-        ? `${info.label} · section, ${info.keys.length} fields`
-        : info.responsive
-          ? `${info.label} · ${info.entries.length} breakpoints`
-          : info.label;
+    label.textContent = labelText;
     root.appendChild(label);
 
     const note = document.createElement("div");
@@ -1178,6 +1178,36 @@
       });
       root.appendChild(btn);
     };
+
+    const finish = () => {
+      document.body.appendChild(root);
+      place(root, new DOMRect(x, y, 0, 0));
+
+      const onOutside = (e) => {
+        if (!root.contains(e.target)) closeMenu();
+      };
+      const onKey = (e) => {
+        if (e.key === "Escape") {
+          e.stopPropagation();
+          closeMenu();
+        }
+      };
+      document.addEventListener("mousedown", onOutside, true);
+      document.addEventListener("keydown", onKey, true);
+      menu = { root, onOutside, onKey };
+    };
+
+    return { item, finish };
+  };
+
+  const showMenu = (x, y, info, row) => {
+    const labelText =
+      info.scope === "section"
+        ? `${info.label} · section, ${info.keys.length} fields`
+        : info.responsive
+          ? `${info.label} · ${info.entries.length} breakpoints`
+          : info.label;
+    const { item, finish } = buildMenu(x, y, labelText);
 
     const copyText =
       info.scope === "section"
@@ -1203,22 +1233,159 @@
       item(`Capture into "${edgeArmed.name}"`, () => doCapture(info, row));
     }
 
-    document.body.appendChild(root);
-    place(root, new DOMRect(x, y, 0, 0));
-
-    const onOutside = (e) => {
-      if (!root.contains(e.target)) closeMenu();
-    };
-    const onKey = (e) => {
-      if (e.key === "Escape") {
-        e.stopPropagation();
-        closeMenu();
-      }
-    };
-    document.addEventListener("mousedown", onOutside, true);
-    document.addEventListener("keydown", onKey, true);
-    menu = { root, onOutside, onKey };
+    finish();
   };
+
+  // ------------------------------------------------ structural capture (nav)
+
+  // A structural edit addresses the node's PARENT plus the child index, not the
+  // node itself. Derived from edgeAddress rather than walking again: the last
+  // step of a node's path IS its index within its parent, so the parent address
+  // is that path with the last step removed.
+  const navAddress = (container) => {
+    const addr = edgeAddress(container);
+    if (addr.error) return addr;
+    if (!addr.path.length) {
+      // A template root's parent is the document container, which has no
+      // address on a page — the page's own roots live somewhere else entirely.
+      // Refuse rather than capture something that can never resolve.
+      return {
+        error:
+          "this is a template root — structural edits address a node inside a root",
+      };
+    }
+    const parent = container.parent;
+    return {
+      root: addr.root,
+      path: addr.path.slice(0, -1),
+      index: addr.path[addr.path.length - 1],
+      parentElType: parent?.model?.get?.("elType") || null,
+      parentWidgetType: parent?.model?.get?.("widgetType") || null,
+      parentLabel: parent?.settings?.get?.("_title") || "",
+      childElType: addr.elType,
+      childWidgetType: addr.widgetType,
+      childLabel: addr.label,
+    };
+  };
+
+  // The element as element JSON, the shape document/elements/create takes and
+  // the shape a template's own saved content has.
+  //
+  // `remove: ['default']` is what Elementor itself persists — the settings model
+  // always carries every control, so without it a single button would snapshot
+  // ~550 keys of defaults into the preset file.
+  const snapshotNode = (container) => {
+    const model = container.model;
+    const out = { id: container.id, elType: model?.get?.("elType") || null };
+    const widgetType = model?.get?.("widgetType");
+    if (widgetType) out.widgetType = widgetType;
+    let settings;
+    try {
+      settings = container.settings?.toJSON?.({ remove: ["default"] });
+    } catch (_) {
+      settings = null;
+    }
+    out.settings = settings || container.settings?.toJSON?.() || {};
+    const kids = container.children;
+    const list = Array.isArray(kids)
+      ? kids
+      : kids && typeof kids.length === "number"
+        ? Array.from(kids)
+        : [];
+    out.elements = list.map(snapshotNode);
+    return out;
+  };
+
+  // Every gate the field capture applies, for the same reasons — see doCapture.
+  // The unsaved check matters more here: an add snapshots a whole subtree, so an
+  // unsaved template produces a preset that plants content the template does not
+  // actually have.
+  const structuralGate = () => {
+    if (!edgeArmed) return "No edge preset selected";
+    if (!edgeDoc?.isTemplate) return "Open the template's own editor to capture";
+    if (
+      edgeArmed.templateId &&
+      String(edgeArmed.templateId) !== String(edgeDoc.id)
+    ) {
+      return `"${edgeArmed.name}" is bound to template #${edgeArmed.templateId}`;
+    }
+    if (window.elementor?.saver?.isEditorChanged?.() !== false) {
+      return "Unsaved changes — update the template first";
+    }
+    return null;
+  };
+
+  const doStructural = async (op, container) => {
+    const blocked = structuralGate();
+    if (blocked) return { ok: false, error: blocked };
+
+    const address = navAddress(container);
+    if (address.error) return { ok: false, error: address.error };
+
+    const edit = { op, ...address };
+    if (op === "add") {
+      edit.node = snapshotNode(container);
+    }
+    if (op === "rename") {
+      if (!address.childLabel) {
+        return {
+          ok: false,
+          error: "this layer has no name — name it in the template first",
+        };
+      }
+      edit.title = address.childLabel;
+    }
+
+    const res = await askContentScript("edge-structural", {
+      presetId: edgeArmed.id,
+      templateId: edgeDoc.id,
+      templateTitle: edgeDoc.title || "",
+      edit,
+    });
+    if (!res.ok) return { ok: false, error: res.error || "Capture failed" };
+    return { ok: true, note: res.note };
+  };
+
+  const NAV_ELEMENT = ".elementor-navigator__element[data-id]";
+
+  const showNavMenu = (x, y, container) => {
+    const name =
+      container.settings?.get?.("_title") ||
+      container.model?.get?.("widgetType") ||
+      container.model?.get?.("elType") ||
+      "layer";
+    const { item, finish } = buildMenu(x, y, `${name} → "${edgeArmed.name}"`);
+    item("Add this node", () => doStructural("add", container));
+    item("Rename node", () => doStructural("rename", container));
+    item("Remove node", () => doStructural("remove", container));
+    finish();
+  };
+
+  // Only intercepted while a preset is armed. Elementor has its own navigator
+  // context menu (Edit, Duplicate, Delete…) and taking it away permanently to
+  // serve a feature nobody is currently using would be a bad trade — arming a
+  // preset is the explicit act that says "I am authoring right now".
+  document.addEventListener(
+    "contextmenu",
+    (e) => {
+      if (!edgeArmed) return;
+      const row = e.target.closest?.(NAV_ELEMENT);
+      if (!row) return;
+      const id = row.getAttribute("data-id");
+      if (!id) return;
+      let container = null;
+      try {
+        container = window.elementor?.getContainer?.(id) || null;
+      } catch (_) {
+        container = null;
+      }
+      if (!container) return;
+      e.preventDefault();
+      e.stopPropagation();
+      showNavMenu(e.clientX, e.clientY, container);
+    },
+    true,
+  );
 
   // ------------------------------------------------------------------ rows
 

@@ -1,5 +1,6 @@
 // The editor half of the Automation tool. One message runs one page, start to
-// finish: sync, then edge presets, then save.
+// finish: the phases the window asked for, in the order it asked for them, then
+// the save. The save is always last — see below.
 //
 // It is a content script, so it lives inside the editor tab the Automation window
 // opened and can simply await each phase. The alternative — the window driving
@@ -130,32 +131,51 @@
     };
   };
 
-  const runPage = async ({
-    mode = "both",
-    templateIds = null,
-    toggles = null,
-    presetIds = null,
-    titles = null,
-  } = {}) => {
-    const report = { mode, sync: null, edge: null, save: null };
-
-    if (mode === "sync" || mode === "both") {
+  // The two phases a page can run, and nothing about the order they run in — the
+  // window owns that and sends it, so the sequence has exactly one definition (see
+  // MODES in automation.js) rather than a copy here to drift from it.
+  //
+  // `missing` is what a phase reports when its tool is not loaded in this tab. It
+  // has to be its own message per phase: an automation run cannot tell `undefined`
+  // from "no matches", and a wrong diagnosis once sent an investigation in the
+  // wrong direction for a whole run.
+  const PHASES = {
+    sync: {
+      missing: "template sync is not available in this tab",
       // Awaited in full. The allowlist and the toggles stand in for the confirm
       // checklist the interactive path shows — see runTemplateOperation's `auto`.
-      report.sync = (await ns.syncTemplateStyles?.({ templateIds, toggles })) || {
-        ok: false,
-        error: "template sync is not available in this tab",
-      };
+      run: ({ templateIds, toggles }) =>
+        ns.syncTemplateStyles?.({ templateIds, toggles }),
+    },
+    edge: {
+      missing: "edge presets are not available in this tab",
+      run: ({ presetIds, templateIds, titles }) =>
+        ns.applyEdgePresets?.({ presetIds, templateIds, titles }),
+    },
+  };
+
+  const runPage = async (args = {}) => {
+    const { mode = "both", review = false } = args;
+    // Unknown names are dropped and a repeat is taken once. There is deliberately
+    // NO fallback order: guessing one for a page whose phase list arrived empty
+    // would mean running — and writing — something the window never asked for, so
+    // an empty list is reported instead. Same direction as an unrecognised Edge
+    // Preset condition, which never passes.
+    const phases = (Array.isArray(args.phases) ? args.phases : []).filter(
+      (p, i, all) => Object.hasOwn(PHASES, p) && all.indexOf(p) === i,
+    );
+    // Thrown rather than reported as a phase or save result: nothing was attempted,
+    // so this is a bad request and belongs on the listener's error channel, where
+    // the window shows it as the failure it is instead of as a broken save.
+    if (!phases.length) {
+      throw new Error("nothing to run — no recognised phases were requested");
     }
 
-    // Runs after the sync, always. The sync pastes the template's own values, so
-    // an edge preset applied first would simply be overwritten.
-    if (mode === "edge" || mode === "both") {
-      report.edge = (await ns.applyEdgePresets?.({
-        presetIds,
-        templateIds,
-        titles,
-      })) || { ok: false, error: "edge presets are not available in this tab" };
+    const report = { mode, phases, review, sync: null, edge: null, save: null };
+
+    for (const name of phases) {
+      const phase = PHASES[name];
+      report[name] = (await phase.run(args)) || { ok: false, error: phase.missing };
     }
 
     // A phase that failed OUTRIGHT — not one that merely counted failures — leaves
@@ -171,16 +191,32 @@
     // A sync reporting `failed: 3` is a different thing and IS saved — carrying on
     // past individual failures is what the sync is designed to do, and throwing the
     // rest of its work away would make one bad container cost the whole page.
-    const hardFailure =
-      (report.sync && !report.sync.ok && report.sync) ||
-      (report.edge && !report.edge.ok && report.edge) ||
-      null;
+    // Walked in run order, so with both phases broken the one reported is the one
+    // that failed first.
+    const hardFailure = phases.map((p) => report[p]).find((r) => r && !r.ok) || null;
     if (hardFailure) {
       report.save = {
         ok: false,
         saved: false,
         skipped: true,
         error: "not saved — a phase failed, so the page was left untouched",
+      };
+      return report;
+    }
+
+    // Review mode: the edits stay in the editor and the window leaves the tab
+    // open so a human can look at them and publish. Nothing here is persisted,
+    // which is the whole point — a structural edit that removes content is the
+    // one thing in this tool that an automated run cannot undo afterwards,
+    // because the tab is normally closed the moment the save lands.
+    //
+    // The cost is real and was chosen: a browser crash loses the entire run.
+    if (review) {
+      report.save = {
+        ok: true,
+        saved: false,
+        review: true,
+        why: "left open for review — publish from the editor tab",
       };
       return report;
     }

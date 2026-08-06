@@ -56,15 +56,18 @@
       } else if (data.op === "paste") {
         const stored = await browser.storage.local.get(KEY);
         reply({ ok: true, data: stored?.[KEY] ?? null });
-      } else if (data.op === "edge-capture") {
+      } else if (data.op === "edge-capture" || data.op === "edge-structural") {
         // Delegated, not implemented here: preset storage belongs to
         // edge-presets.js. Read off the namespace at call time so the manifest
         // order between the two files does not matter.
-        const capture = window.__ElementorTools?.captureEdgeField;
-        if (!capture) {
+        const fn =
+          data.op === "edge-capture"
+            ? window.__ElementorTools?.captureEdgeField
+            : window.__ElementorTools?.captureEdgeStructural;
+        if (!fn) {
           reply({ ok: false, error: "Edge presets are not loaded" });
         } else {
-          reply(await capture(data.payload || {}));
+          reply(await fn(data.payload || {}));
         }
       } else {
         reply({ ok: false, error: `Unknown op: ${data.op}` });

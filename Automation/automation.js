@@ -30,6 +30,12 @@
   const READY_TIMEOUT = 120000;
   const READY_POLL = 800;
 
+  // Review mode leaves every tab open, so the run's document count IS the number
+  // of editors that end up on screen. Sixty Elementor editors will bring the
+  // browser to its knees and nobody is going to review sixty pages by hand
+  // anyway, so the run is refused rather than started and regretted.
+  const REVIEW_MAX_DOCS = 20;
+
   // Storage keys. workingDomain is deliberately the SAME key the panel uses: it
   // names the site being worked on, and two windows disagreeing about that is the
   // one setting that must never happen.
@@ -49,6 +55,26 @@
     { key: "keepAnimations", label: "Keep animations", default: true },
     { key: "nested", label: "Match nested containers", default: false },
   ];
+
+  // What "Run" means, as an ORDERED list of phases. The list *is* the order: the
+  // window sends it to the agent, which runs the phases it is given and encodes no
+  // order of its own, so there is one definition and the two cannot disagree.
+  //
+  // Sync-then-edge is the default because the sync is the half that pastes the
+  // template's own values over the page's. The reverse is offered for the case
+  // where the presets are meant to land on a document an earlier run already
+  // synced, and it costs two things that `startRun` warns about once per run:
+  //   · Edge Presets match instances on the `#id.N` tag ALONE, and the sync is what
+  //     writes that tag. Run first, the presets cannot see a hand-built container
+  //     the sync was about to adopt.
+  //   · Any style-transfer field a preset writes is overwritten by the paste that
+  //     follows it. The non-style fields presets exist for are untouched.
+  const MODES = {
+    both: { label: "Sync → Edge Presets", phases: ["sync", "edge"] },
+    "edge-first": { label: "Edge Presets → Sync", phases: ["edge", "sync"] },
+    sync: { label: "Template sync only", phases: ["sync"] },
+    edge: { label: "Edge Presets only", phases: ["edge"] },
+  };
 
   const TAB_REQUESTS = {
     template: { type: "list-templates" },
@@ -76,7 +102,16 @@
 
   let toggles = Object.fromEntries(SYNC_TOGGLES.map((t) => [t.key, t.default]));
   let mode = "both";
+  // Everything that needs to know what runs asks in terms of phases, not by
+  // comparing `mode` against a string — which is what kept the old `mode === "edge"`
+  // tests from having to grow a case each time a mode was added.
+  const phasesFor = (m = mode) => MODES[m]?.phases || MODES.both.phases;
   let concurrency = 3;
+  // Leave every editor open and unsaved so a human can look before publishing.
+  // The safety valve for structural edits, whose removals a normal run makes
+  // unrecoverable — the tab is closed the moment the save lands, so the history
+  // log goes with it.
+  let review = false;
 
   let presets = [];
   let armedId = null;
@@ -271,10 +306,24 @@
     }…`;
   };
 
+  const renderModes = () => {
+    const sel = $("run-mode");
+    sel.textContent = "";
+    for (const [value, m] of Object.entries(MODES)) {
+      const opt = document.createElement("option");
+      opt.value = value;
+      opt.textContent = m.label;
+      sel.appendChild(opt);
+    }
+    sel.value = mode;
+  };
+
   const renderToggles = () => {
     const host = $("sync-toggles");
     host.textContent = "";
-    const disabled = mode === "edge";
+    // Gated on whether a sync phase runs at all, not on which mode is selected —
+    // the two orders that include one both want these live.
+    const disabled = !phasesFor().includes("sync");
     for (const t of SYNC_TOGGLES) {
       const label = el("label", "toggle");
       const box = document.createElement("input");
@@ -300,6 +349,9 @@
     edge: "edge presets",
     saving: "saving",
     done: "done",
+    // Distinct from `done` on purpose: nothing has been written to the server,
+    // so a run of these is work that still needs a human.
+    review: "awaiting review",
     skipped: "skipped",
     failed: "failed",
     cancelled: "cancelled",
@@ -307,6 +359,7 @@
 
   const STATE_PILL = {
     done: "is-ok",
+    review: "is-warn",
     failed: "is-error",
     cancelled: "is-warn",
     skipped: "",
@@ -385,7 +438,7 @@
             preset.templateId
               ? `template ${preset.templateTitle || `#${preset.templateId}`}`
               : "not yet bound to a template"
-          } · ${counts.fields} field(s)`,
+          } · ${counts.fields} field(s)${counts.edits ? " · 1 structural edit" : ""}`,
         ),
       );
       const off = el("button", "clear", "Stop capturing");
@@ -394,6 +447,276 @@
       inner.appendChild(off);
     }
     host.appendChild(inner);
+  };
+
+  // ------------------------------------------------- structural edit editor
+
+  const CMP_LABEL = {
+    "==": "is exactly",
+    "!=": "is not",
+    ">=": "is at least",
+    "<=": "is at most",
+  };
+
+  const mkSelect = (options, value, onChange) => {
+    const s = document.createElement("select");
+    s.className = "text-input";
+    for (const [v, label] of options) {
+      const o = document.createElement("option");
+      o.value = v;
+      o.textContent = label;
+      s.appendChild(o);
+    }
+    s.value = value;
+    s.addEventListener("change", () => onChange(s.value));
+    return s;
+  };
+
+  const mkInput = (type, value, placeholder) => {
+    const i = document.createElement("input");
+    i.className = "text-input";
+    i.type = type;
+    i.value = value ?? "";
+    if (placeholder) i.placeholder = placeholder;
+    if (type === "number") i.min = "0";
+    return i;
+  };
+
+  const patchEdit = async (preset, editId, patch) => {
+    const res = F.updateEdit(preset, editId, patch);
+    if (!res.ok) {
+      say("error", `"${preset.name}": ${res.error}`);
+      return;
+    }
+    await savePresets(
+      presets.map((p) => (p.id === preset.id ? res.preset : p)),
+    );
+  };
+
+  // The inputs for one condition kind. Driven off CONDITION_KINDS' `fields` so a
+  // kind added to the schema shows up here rather than silently going unbuildable.
+  const conditionInputs = (kind) => {
+    const row = el("div", "cond-inputs");
+    const fields = {};
+    const add = (key, node) => {
+      fields[key] = node;
+      row.appendChild(node);
+    };
+    if (kind === "child-count") {
+      add(
+        "cmp",
+        mkSelect(
+          [...F.COMPARATORS].map((c) => [c, CMP_LABEL[c] || c]),
+          "==",
+          () => {},
+        ),
+      );
+      add("value", mkInput("number", "0"));
+    } else if (kind === "child-named") {
+      add("name", mkInput("text", "", "layer name"));
+      add(
+        "present",
+        mkSelect(
+          [
+            ["1", "exists"],
+            ["", "does not exist"],
+          ],
+          "1",
+          () => {},
+        ),
+      );
+    } else if (kind === "child-of-type") {
+      add("signature", mkInput("text", "", "widget:button or container"));
+      add(
+        "present",
+        mkSelect(
+          [
+            ["1", "exists"],
+            ["", "does not exist"],
+          ],
+          "1",
+          () => {},
+        ),
+      );
+    } else {
+      add("index", mkInput("number", "0"));
+      add("signature", mkInput("text", "", "widget:button or container"));
+    }
+    return { row, fields };
+  };
+
+  const readCondition = (kind, fields) => {
+    const v = (k) => fields[k]?.value;
+    if (kind === "child-count") {
+      return { kind, cmp: v("cmp"), value: Number(v("value")) };
+    }
+    if (kind === "child-named") {
+      return { kind, name: v("name"), present: !!v("present") };
+    }
+    if (kind === "child-of-type") {
+      return { kind, signature: v("signature"), present: !!v("present") };
+    }
+    return { kind, index: Number(v("index")), signature: v("signature") };
+  };
+
+  const renderEdit = (preset, card) => {
+    const edit = F.structuralEdit(preset);
+    if (!edit) return;
+
+    const box = el("div", "preset-edit");
+
+    const head = el("div", "edit-head");
+    head.appendChild(el("span", "chip is-op", edit.op));
+    head.appendChild(
+      el(
+        "span",
+        "edit-label",
+        `${F.editLabel(edit)} · ${F.editParentKey(edit)} index ${edit.index}`,
+      ),
+    );
+    const kill = el("button", "clear danger", "✕");
+    kill.type = "button";
+    kill.title = "Remove this structural edit";
+    kill.addEventListener("click", () =>
+      savePresets(
+        presets.map((p) =>
+          p.id === preset.id ? F.removeEdit(p, edit.id) : p,
+        ),
+      ),
+    );
+    head.appendChild(kill);
+    box.appendChild(head);
+
+    // A structural edit fires on EVERY tagged instance of this template on every
+    // page in the run — the count differs page to page, so the honest thing to
+    // show is the rule rather than a number that would only ever be right once.
+    box.appendChild(
+      el(
+        "div",
+        "edit-warn",
+        edit.op === "remove"
+          ? "Runs on every tagged instance on every page. A remove cannot be undone once the page is saved — tick “Leave tabs open for review” first."
+          : "Runs on every tagged instance of this template, on every page in the run.",
+      ),
+    );
+
+    if (edit.op === "add") {
+      const row = el("div", "edit-row");
+      row.appendChild(el("span", "field-label", "Insert"));
+      const place = edit.place || { mode: "index", index: edit.index };
+      row.appendChild(
+        mkSelect(
+          [
+            ["index", "at index"],
+            ["append", "at the end"],
+            ["before", "before a child named"],
+            ["after", "after a child named"],
+          ],
+          place.mode,
+          (mode) =>
+            patchEdit(preset, edit.id, {
+              place: {
+                mode,
+                index: place.index ?? edit.index,
+                anchorName: place.anchorName || "",
+              },
+            }),
+        ),
+      );
+      if (place.mode === "index") {
+        const n = mkInput("number", String(place.index ?? edit.index));
+        n.addEventListener("change", () =>
+          patchEdit(preset, edit.id, {
+            place: { mode: "index", index: Number(n.value) },
+          }),
+        );
+        row.appendChild(n);
+      }
+      if (place.mode === "before" || place.mode === "after") {
+        const t = mkInput("text", place.anchorName || "", "layer name");
+        t.addEventListener("change", () =>
+          patchEdit(preset, edit.id, {
+            place: { mode: place.mode, anchorName: t.value },
+          }),
+        );
+        row.appendChild(t);
+      }
+      box.appendChild(row);
+    }
+
+    const list = el("div", "cond-list");
+    if (!(edit.conditions || []).length) {
+      list.appendChild(
+        el(
+          "div",
+          "empty",
+          "No conditions — this will apply to every instance, every run.",
+        ),
+      );
+    }
+    for (const c of edit.conditions || []) {
+      const chip = el("span", "chip");
+      chip.appendChild(document.createTextNode(F.conditionLabel(c)));
+      // The auto-attached type check is what replaces the leaf type check a field
+      // capture gets, so it is shown but not removable — an edit without it would
+      // be strictly less safe than what it is modelled on.
+      const auto =
+        edit.op !== "add" &&
+        c.kind === "index-type" &&
+        c.index === edit.index &&
+        c.signature === F.editSignature(edit);
+      if (auto) {
+        chip.classList.add("is-auto");
+        chip.title = "Automatic — the type check that keeps this edit honest";
+      } else {
+        const x = el("button", "", "✕");
+        x.type = "button";
+        x.addEventListener("click", () =>
+          patchEdit(preset, edit.id, {
+            conditions: edit.conditions.filter((o) => o !== c),
+          }),
+        );
+        chip.appendChild(x);
+      }
+      list.appendChild(chip);
+    }
+    const condRow = el("div", "edit-row");
+    condRow.appendChild(el("span", "field-label", "Conditions"));
+    condRow.appendChild(list);
+    box.appendChild(condRow);
+
+    const addRow = el("div", "edit-row cond-add");
+    addRow.appendChild(el("span", "field-label", ""));
+    let built = conditionInputs(F.CONDITION_KINDS[0].kind);
+    let kind = F.CONDITION_KINDS[0].kind;
+    const kindSel = mkSelect(
+      F.CONDITION_KINDS.map((c) => [c.kind, c.label]),
+      kind,
+      (next) => {
+        kind = next;
+        const fresh = conditionInputs(kind);
+        built.row.replaceWith(fresh.row);
+        built = fresh;
+      },
+    );
+    addRow.appendChild(kindSel);
+    addRow.appendChild(built.row);
+    const addBtn = el("button", "clear", "Add condition");
+    addBtn.type = "button";
+    addBtn.addEventListener("click", () => {
+      const made = F.normalizeCondition(readCondition(kind, built.fields));
+      if (!made) {
+        say("error", `"${preset.name}": that condition is incomplete`);
+        return;
+      }
+      patchEdit(preset, edit.id, {
+        conditions: [...(edit.conditions || []), made],
+      });
+    });
+    addRow.appendChild(addBtn);
+    box.appendChild(addRow);
+
+    card.appendChild(box);
   };
 
   const renderPresets = () => {
@@ -408,7 +731,9 @@
         el(
           "div",
           "empty",
-          "No edge presets yet — press New preset, then capture fields in a template's editor.",
+          "No edge presets yet — press New preset, then in the template's editor" +
+            " right-click a field to capture it, or right-click a layer in the" +
+            " navigator to add, rename or remove a node.",
         ),
       );
       return;
@@ -434,6 +759,7 @@
             `${counts.nodes} element(s)`,
             `${counts.fields} field(s)`,
             `${counts.values} key(s)`,
+            ...(counts.edits ? ["1 structural edit"] : []),
           ].join(" · "),
         ),
       );
@@ -544,6 +870,7 @@
         }
         card.appendChild(body);
       }
+      renderEdit(preset, card);
       host.appendChild(card);
     }
   };
@@ -806,15 +1133,20 @@
         };
       }
 
-      setProgress(index, mode === "edge" ? "edge" : "syncing");
+      // The agent reports per page, not per phase, so this row shows the phase the
+      // page STARTS in — whichever the chosen order puts first.
+      const phases = phasesFor();
+      setProgress(index, phases[0] === "edge" ? "edge" : "syncing");
       const reply = await browser.tabs.sendMessage(tab.id, {
         __elementorTools: true,
         type: "automation-run",
         args: {
           mode,
+          phases,
           templateIds: [...picked.templates],
           toggles,
           titles: titlesById(),
+          review,
         },
       });
       if (!reply?.ok) {
@@ -828,32 +1160,41 @@
       const notes = [];
       let level = "ok";
 
-      if (report.sync) {
-        if (!report.sync.ok) {
+      // Never downgrades an error to a warning. With the phases in a chosen order
+      // either of them can be the one that already failed, so neither may assign
+      // `level` directly.
+      const warn = () => {
+        if (level !== "error") level = "warn";
+      };
+
+      // Walked in the order the phases actually ran, so the row reads as the
+      // sequence of events rather than as a fixed sync-then-edge shape.
+      for (const name of report.phases || phases) {
+        const phase = report[name];
+        if (!phase) continue;
+        if (!phase.ok) {
           level = "error";
-          notes.push(`sync failed: ${report.sync.error || "unknown"}`);
-        } else {
-          notes.push(`sync: ${report.sync.summary || "done"}`);
+          notes.push(
+            `${name === "sync" ? "sync" : "edge presets"} failed: ${phase.error || "unknown"}`,
+          );
+        } else if (name === "sync") {
+          notes.push(`sync: ${phase.summary || "done"}`);
           // Reported at the page level as well as in the tool log, because a
           // failure count is the one number that decides whether this page needs
           // a human to look at it.
-          if (report.sync.failed) level = "warn";
-        }
-      }
-      if (report.edge) {
-        if (!report.edge.ok) {
-          level = "error";
-          notes.push(`edge presets failed: ${report.edge.error || "unknown"}`);
+          if (phase.failed) warn();
         } else {
           notes.push(
-            `edge: ${report.edge.applied} field(s)` +
-              (report.edge.skipped ? `, ${report.edge.skipped} skipped` : ""),
+            `edge: ${phase.applied} field(s)` +
+              (phase.skipped ? `, ${phase.skipped} skipped` : ""),
           );
-          if (report.edge.skipped) level = level === "error" ? level : "warn";
-          for (const w of report.edge.warnings || []) say("warn", w);
+          if (phase.skipped) warn();
+          for (const w of phase.warnings || []) say("warn", w);
         }
       }
-      if (report.save?.ok) {
+      if (report.save?.review) {
+        notes.push("left open — publish from the editor tab");
+      } else if (report.save?.ok) {
         notes.push(
           report.save.saved
             ? `saved (${report.save.status || "?"})`
@@ -872,11 +1213,15 @@
 
       const note = notes.join(" · ");
       const failed = level === "error";
-      setProgress(index, failed ? "failed" : "done", note);
+      setProgress(
+        index,
+        failed ? "failed" : report.save?.review ? "review" : "done",
+        note,
+      );
       say(level, `"${job.title}" (#${job.id}) — ${note}`);
       return {
         ...job,
-        state: failed ? "failed" : "done",
+        state: failed ? "failed" : report.save?.review ? "review" : "done",
         report,
         note,
       };
@@ -892,8 +1237,14 @@
       say("error", `"${job.title}" (#${job.id}) — ${why}`);
       return { ...job, state: "failed", error: why };
     } finally {
+      // Out of openTabs either way — that set is what a cancel and this window's
+      // own beforeunload close, and a review tab holding unsaved work the user is
+      // meant to publish must survive both. A tab still mid-run stays in the set,
+      // which is right: it has nothing worth preserving yet.
       openTabs.delete(tab.id);
-      await browser.tabs.remove(tab.id).catch(() => {});
+      if (!review || cancelRequested) {
+        await browser.tabs.remove(tab.id).catch(() => {});
+      }
     }
   };
 
@@ -922,6 +1273,20 @@
     const jobs = buildQueue();
     if (!jobs.length) return;
 
+    if (review && jobs.length > REVIEW_MAX_DOCS) {
+      setState(
+        "error",
+        `review mode is limited to ${REVIEW_MAX_DOCS} documents`,
+      );
+      say(
+        "error",
+        `Refused: review mode leaves every editor open, and ${jobs.length} of them ` +
+          `would be unusable. Narrow the selection to ${REVIEW_MAX_DOCS} or fewer, ` +
+          `or untick "Leave tabs open for review".`,
+      );
+      return;
+    }
+
     cancelRequested = false;
     runLog = [];
     lastReport = null;
@@ -930,16 +1295,31 @@
     setState("running", `0 of ${jobs.length} done`);
 
     const started = Date.now();
+    const phases = phasesFor();
     say(
       "ok",
       `Run started — ${jobs.length} document(s), ${picked.templates.size} template(s) in scope, ` +
-        `mode "${mode}", ${concurrency} editor(s) at once`,
+        `mode "${MODES[mode]?.label || mode}", ${concurrency} editor(s) at once` +
+        (review ? " · REVIEW: nothing will be saved, tabs stay open" : ""),
     );
+    // Said once here rather than left to be discovered across a hundred pages.
+    // Neither consequence shows up as a failure — an instance the presets could not
+    // see is simply not in their count, which reads exactly like a clean run.
+    if (phases[0] === "edge" && phases.includes("sync")) {
+      say(
+        "warn",
+        "Edge Presets run BEFORE the sync in this order. Presets match instances on " +
+          "the #id tag alone and the sync is what writes that tag, so a container " +
+          "this run's sync is about to adopt is still untagged and its presets will " +
+          "not reach it. Any style field a preset writes is also overwritten by the " +
+          "paste that follows.",
+      );
+    }
 
     const results = await runPool(jobs, concurrency, async (job, index) => {
       const out = await runOne(job, index);
       const done = progress.filter((p) =>
-        ["done", "failed", "skipped", "cancelled"].includes(p.state),
+        ["done", "review", "failed", "skipped", "cancelled"].includes(p.state),
       ).length;
       setState(runState, `${done} of ${jobs.length} done`);
       return out;
@@ -953,6 +1333,7 @@
     const seconds = Math.round((Date.now() - started) / 1000);
     const summary =
       `${counts.done || 0} done, ${counts.failed || 0} failed` +
+      (counts.review ? `, ${counts.review} awaiting review` : "") +
       (counts.cancelled ? `, ${counts.cancelled} cancelled` : "") +
       ` in ${seconds}s`;
 
@@ -960,6 +1341,9 @@
       startedAt: new Date(started).toISOString(),
       seconds,
       mode,
+      // Spelled out beside the mode, because the mode key alone does not say which
+      // half ran first and a report read months later has to.
+      phases,
       concurrency,
       workingDomain,
       templateIds: [...picked.templates],
@@ -1012,6 +1396,7 @@
       [KEYS.settings]: {
         mode,
         concurrency,
+        review,
         toggles,
         docKind,
         templates: [...picked.templates],
@@ -1060,6 +1445,12 @@
     concurrency = Number.isFinite(n) ? Math.min(8, Math.max(1, Math.round(n))) : 3;
     $("concurrency").value = concurrency;
     saveSettings();
+  });
+
+  $("review-mode").addEventListener("change", () => {
+    review = $("review-mode").checked;
+    saveSettings();
+    renderState();
   });
 
   $("tpl-search").addEventListener("input", () => {
@@ -1127,6 +1518,10 @@
   // Closing this window cancels the run, and the tabs it opened have to go with
   // it — otherwise a cancelled run leaves three editors behind. Best effort:
   // `remove` is fired without awaiting, which the background page completes.
+  // Review tabs are NOT in openTabs by the time they are worth keeping — runOne
+  // removes each one as it finishes — so this closes only editors still mid-run.
+  // Closing a review tab here would destroy exactly the unsaved work that mode
+  // exists to protect.
   window.addEventListener("beforeunload", () => {
     cancelRequested = true;
     for (const id of openTabs) browser.tabs.remove(id).catch(() => {});
@@ -1170,10 +1565,13 @@
     toolLog = state.logs || [];
 
     const saved = state[KEYS.settings] || {};
-    if (["both", "sync", "edge"].includes(saved.mode)) mode = saved.mode;
+    // hasOwn, not `in`: `in` walks the prototype chain, so a stored "toString"
+    // would validate and then select an option that does not exist.
+    if (Object.hasOwn(MODES, saved.mode ?? "")) mode = saved.mode;
     if (Number.isFinite(saved.concurrency)) {
       concurrency = Math.min(8, Math.max(1, Math.round(saved.concurrency)));
     }
+    review = !!saved.review;
     if (saved.toggles) {
       toggles = Object.fromEntries(
         SYNC_TOGGLES.map((t) => [
@@ -1188,8 +1586,9 @@
     for (const id of saved.templates || []) picked.templates.add(String(id));
     for (const id of saved.docs || []) picked.docs.add(String(id));
 
-    $("run-mode").value = mode;
     $("concurrency").value = concurrency;
+    $("review-mode").checked = review;
+    renderModes();
     renderToggles();
     renderPresets();
     renderPickers();

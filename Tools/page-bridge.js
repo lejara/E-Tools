@@ -1782,6 +1782,307 @@
       }
       return { results };
     },
+    // An Edge Preset's ONE structural edit — add a node, rename a node, remove a
+    // node — applied to every instance the content script matched by tag.
+    //
+    // Every structural edit on the page arrives in ONE call, and that is the
+    // whole reason this op exists rather than being driven per instance. A
+    // structural change shifts the child indices of everything after it, so
+    // resolution and application must not be separated by another mutation.
+    // Three passes, in this order and never interleaved:
+    //
+    //   1. RESOLVE  — walk every parent path to a container. No writes.
+    //   2. GUARD    — two edits landing on one parent refuse each other.
+    //   3. APPLY    — snapshot the parent's children, evaluate the conditions
+    //                 against that snapshot, then write.
+    //
+    // Field writes have already happened by the time this runs (edge-presets.js
+    // orders them first), so their paths were resolved against an untouched tree.
+    //
+    // THE CONDITIONS ARE THE SAFETY MODEL. A parent address is a position, the
+    // same strength a field capture has, and the type check on a container is
+    // near-worthless because every container answers to "container". What makes a
+    // write confident is the author's declared gate — so a condition that fails
+    // is reported as `gated`, which is a designed no-op, and never as a skip.
+    "apply-edge-structural": async ({ edits }) => {
+      const list = Array.isArray(edits) ? edits : [];
+      const results = [];
+      const resolved = [];
+
+      // ---------------------------------------------------------- 1. resolve
+      for (const edit of list) {
+        const record = { key: edit.key, rootId: edit.rootId };
+        let root;
+        try {
+          root = getContainer(edit.rootId);
+        } catch (err) {
+          results.push({
+            ...record,
+            outcome: "skipped",
+            why: `instance is gone — ${String(err?.message || err)}`,
+          });
+          continue;
+        }
+        const path = Array.isArray(edit.path) ? edit.path : [];
+        let cursor = root;
+        let missAt = null;
+        for (let i = 0; i < path.length; i++) {
+          const next = childContainers(cursor)[path[i]];
+          if (!next) {
+            missAt = i;
+            break;
+          }
+          cursor = next;
+        }
+        if (missAt !== null) {
+          results.push({
+            ...record,
+            outcome: "skipped",
+            why: `parent path ran off the end at step ${missAt + 1} of ${path.length}`,
+          });
+          continue;
+        }
+        const parentElType = cursor.model?.get?.("elType") || null;
+        const parentWidgetType = cursor.model?.get?.("widgetType") || null;
+        const foundParent = parentWidgetType
+          ? `widget:${parentWidgetType}`
+          : String(parentElType || "element");
+        if (edit.expectParent && edit.expectParent !== foundParent) {
+          results.push({
+            ...record,
+            outcome: "skipped",
+            why: `parent is ${foundParent}, expected ${edit.expectParent}`,
+          });
+          continue;
+        }
+        // Only a child-bearing element can take an added node. The type check
+        // above usually catches this, but a template whose container became a
+        // widget would otherwise reach document/elements/create and fail there
+        // with a much less useful message.
+        if (edit.op === "add" && !CHILD_BEARING.has(String(parentElType))) {
+          results.push({
+            ...record,
+            outcome: "skipped",
+            why: `${foundParent} cannot hold children`,
+          });
+          continue;
+        }
+        resolved.push({ edit, record, parent: cursor });
+      }
+
+      // ------------------------------------------------------------ 2. guard
+      // Two structural edits resolving to the same container would each have
+      // measured their indices against a tree the other one moved. The content
+      // script cannot see this — two different paths on two different presets can
+      // land on one element — so it is caught here, where the ids are known, and
+      // both are refused rather than silently letting the first win.
+      const byParent = new Map();
+      for (const r of resolved) {
+        if (!byParent.has(r.parent.id)) byParent.set(r.parent.id, []);
+        byParent.get(r.parent.id).push(r);
+      }
+      const runnable = [];
+      for (const [, group] of byParent) {
+        if (group.length > 1) {
+          for (const r of group) {
+            results.push({
+              ...r.record,
+              outcome: "skipped",
+              why:
+                `${group.length} structural edits target this same container` +
+                ` — run them as separate presets, one after the other`,
+            });
+          }
+          continue;
+        }
+        runnable.push(group[0]);
+      }
+
+      // ------------------------------------------------------------ 3. apply
+      // Mirrors CONDITION_KINDS in edge-preset-format.js. That is a
+      // content-script global and unreachable from the page world — the same
+      // boundary that keeps the template-tag regex out of this file. Change a
+      // kind there, change it here.
+      const sameName = (a, b) =>
+        String(a || "").trim().toLowerCase() ===
+        String(b || "").trim().toLowerCase();
+
+      const testCondition = (c, kids) => {
+        if (c.kind === "child-count") {
+          const n = kids.length;
+          if (c.cmp === "==") return n === c.value;
+          if (c.cmp === "!=") return n !== c.value;
+          if (c.cmp === ">=") return n >= c.value;
+          if (c.cmp === "<=") return n <= c.value;
+          return false;
+        }
+        if (c.kind === "child-named") {
+          return kids.some((k) => sameName(k.title, c.name)) === !!c.present;
+        }
+        if (c.kind === "child-of-type") {
+          return kids.some((k) => k.signature === c.signature) === !!c.present;
+        }
+        if (c.kind === "index-type") {
+          return kids[c.index]?.signature === c.signature;
+        }
+        // An unrecognised kind must not pass. A gate nobody understands is a
+        // gate that is not gating, and this op writes to real pages.
+        return false;
+      };
+
+      for (const { edit, record, parent } of runnable) {
+        // Re-read per edit rather than once up front: an earlier edit in this
+        // same loop may have changed a DIFFERENT parent that happens to be an
+        // ancestor or sibling here. The guard above rules out two edits on one
+        // container, not two on related ones.
+        const kids = childContainers(parent).map((c, i) => {
+          const wt = c.model?.get?.("widgetType") || null;
+          return {
+            container: c,
+            index: i,
+            title: containerTitle(c),
+            signature: wt
+              ? `widget:${wt}`
+              : String(c.model?.get?.("elType") || "element"),
+          };
+        });
+
+        const failed = (edit.conditions || []).find((c) => !testCondition(c, kids));
+        if (failed) {
+          results.push({
+            ...record,
+            outcome: "gated",
+            condition: failed,
+            childCount: kids.length,
+          });
+          continue;
+        }
+
+        try {
+          if (edit.op === "rename") {
+            const child = kids[edit.index];
+            if (!child) {
+              results.push({
+                ...record,
+                outcome: "skipped",
+                why: `no child at index ${edit.index} (${kids.length} children)`,
+              });
+              continue;
+            }
+            if (sameName(child.title, edit.title)) {
+              results.push({
+                ...record,
+                outcome: "applied",
+                unchanged: true,
+                id: child.container.id,
+                title: child.title,
+              });
+              continue;
+            }
+            // render:false and no options.external, for the reason the `rename`
+            // op documents: _title carries no selectors, and external re-renders
+            // the element — which is what made a populated container vanish.
+            await runCommand("document/elements/settings", {
+              containers: [child.container],
+              settings: { _title: edit.title },
+              options: { render: false },
+            });
+            results.push({
+              ...record,
+              outcome: "applied",
+              id: child.container.id,
+              was: child.title,
+              title: edit.title,
+            });
+            continue;
+          }
+
+          if (edit.op === "remove") {
+            const child = kids[edit.index];
+            if (!child) {
+              results.push({
+                ...record,
+                outcome: "skipped",
+                why: `no child at index ${edit.index} (${kids.length} children)`,
+              });
+              continue;
+            }
+            const removedTitle = child.title || child.signature;
+            await runCommand("document/elements/delete", {
+              containers: [child.container],
+            });
+            results.push({
+              ...record,
+              outcome: "applied",
+              id: child.container.id,
+              removed: removedTitle,
+            });
+            continue;
+          }
+
+          // ---- add ----
+          const place = edit.place || { mode: "index", index: edit.index };
+          let at;
+          if (place.mode === "append") {
+            at = kids.length;
+          } else if (place.mode === "before" || place.mode === "after") {
+            const anchor = kids.find((k) => sameName(k.title, place.anchorName));
+            if (!anchor) {
+              // Not gated: the anchor IS the address here, so a missing one
+              // means we do not know where this goes — which is a skip, not a
+              // precondition the author declared and that legitimately failed.
+              results.push({
+                ...record,
+                outcome: "skipped",
+                why: `no child named "${place.anchorName}" to place ${place.mode}`,
+              });
+              continue;
+            }
+            at = place.mode === "before" ? anchor.index : anchor.index + 1;
+          } else {
+            at = Math.max(0, Math.min(Number(place.index) || 0, kids.length));
+          }
+
+          // A captured node carries the ids of the template elements it was cut
+          // from, and this node is planted on every instance of every page in the
+          // run. Importing it raw would put the same id on the page twice, which
+          // is precisely how a sync once deleted a page's own container with undo
+          // unable to restore it. clone first — regenerateIds mutates.
+          const model = regenerateIds(clone(edit.node), liveIds());
+
+          // The extension is creating this, not the user, so the new-element hook
+          // stays off it — otherwise pure-container-reset would zero the padding,
+          // margin and gap the capture exists to carry.
+          window[SUPPRESS_KEY]++;
+          let created;
+          try {
+            created = await runCommand("document/elements/create", {
+              container: parent,
+              model,
+              options: { edit: false, at },
+            });
+          } finally {
+            window[SUPPRESS_KEY]--;
+          }
+          const [id] = createdIds(created);
+          results.push({
+            ...record,
+            outcome: "applied",
+            id: id || null,
+            at,
+            title: model?.settings?._title || "",
+          });
+        } catch (err) {
+          results.push({
+            ...record,
+            outcome: "skipped",
+            why: String(err?.message || err),
+          });
+        }
+      }
+
+      return { results };
+    },
     "list-templates": async ({ source = "local" } = {}) => {
       if (!window.wpApiSettings?.nonce) {
         throw new Error("wpApiSettings.nonce is unavailable");

@@ -491,6 +491,78 @@ button.clear.danger:hover:not(:disabled) {
 .chip button:hover {
   color: #f3c9c9;
 }
+/* A preset's one structural edit. Visually separated from the field captures
+   above it because it is a different kind of thing: fields write values, this
+   changes what the page is made of. */
+.preset-edit {
+  border-top: 1px solid #242424;
+  padding: 6px 9px 8px;
+}
+.edit-head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+.edit-label {
+  flex: 1;
+  min-width: 0;
+  font-size: 11px;
+  word-break: break-word;
+}
+.chip.is-op {
+  padding: 1px 8px;
+  text-transform: uppercase;
+  letter-spacing: 0.4px;
+  font-weight: 600;
+  background: #2b3a55;
+  border-color: #3c5490;
+  color: #cfe0ff;
+}
+.chip.is-auto {
+  padding: 1px 8px;
+  opacity: 0.75;
+  border-style: dashed;
+}
+.edit-warn {
+  font-size: 10px;
+  color: #d8bd8a;
+  margin: 5px 0 2px;
+  line-height: 1.4;
+}
+.edit-row {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  margin-top: 6px;
+}
+.edit-row > .field-label {
+  flex: 0 0 62px;
+}
+.edit-row .text-input {
+  font-size: 10px;
+  padding: 3px 6px;
+}
+.edit-row input[type="number"] {
+  width: 62px;
+}
+.cond-list {
+  display: flex;
+  flex: 1;
+  flex-wrap: wrap;
+  gap: 4px 6px;
+}
+.cond-list .empty {
+  padding: 0;
+  font-size: 10px;
+}
+.cond-inputs {
+  display: flex;
+  gap: 6px;
+}
+.cond-add {
+  flex-wrap: wrap;
+}
+
 .rename-row {
   display: flex;
   gap: 6px;

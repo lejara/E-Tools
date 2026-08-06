@@ -21,7 +21,7 @@ Browser extension (MV3, Firefox) that adds hotkey-driven tools to Elementor's Wo
 │   ├── automation.html
 │   ├── automation.css
 │   ├── automation.js    # the GUI *and* the run loop — pickers, state machine, worker pool
-│   └── automation-agent.js # content script: runs one page (sync → edge presets → save)
+│   └── automation-agent.js # content script: runs one page (the window's phase order, then save)
 └── Tools/               # one self-contained tool per file
     ├── preview-override.js   # forces fixed widths on mobile/tablet preview
     ├── core_utils.js         # shared helpers on window.__ElementorTools (log, selectLayerById, callBridge, insertSiteTemplate, createTemplateWidget, createContainer, listSiteTemplates, pairTrees, normalizeName)
@@ -98,7 +98,7 @@ Tick state is tracked as the set of _unticked_ items keyed on identity, so an it
 
 `callBridge(op, payload, { timeout, waitLimit, onWait })` — default timeout is 3s. Ops that hit the network (`insert-template`, `list-templates`, `prefetch-templates`) pass 15s or more.
 
-Ops: `ping` · `copy` · `paste-style` · `apply-style-pairs` · `apply-advanced-settings` · `apply-preset-settings` · `read-preset-settings` · `apply-edge-preset` · `paste` · `delete` · `rename` · `create-element` · `insert-template` · `prefetch-templates` · `list-templates` · `describe-tree` · `describe-selection` · `describe-document` · `list-containers` · `list-template-widgets` · `save-document` · `configure-pure-reset` · `history-start` / `history-end`.
+Ops: `ping` · `copy` · `paste-style` · `apply-style-pairs` · `apply-advanced-settings` · `apply-preset-settings` · `read-preset-settings` · `apply-edge-preset` · `apply-edge-structural` · `paste` · `delete` · `rename` · `create-element` · `insert-template` · `prefetch-templates` · `list-templates` · `describe-tree` · `describe-selection` · `describe-document` · `list-containers` · `list-template-widgets` · `save-document` · `configure-pure-reset` · `history-start` / `history-end`.
 
 `configure-pure-reset` is the odd one out: every other op answers a question or performs an edit, and that one installs a **listener** — see Pure container reset.
 
@@ -454,7 +454,9 @@ included, go to the log.
 
 Capture is a third item on the breakpoint flyout's right-click menu, next to Copy
 and Paste, and it is offered **only** while a preset is selected in the Automation
-window.
+window. **Structural** captures live on a second surface — right-click a layer in
+the navigator — because a layer's position and its name are not field rows; see
+Structural edits below.
 
 - **The template editor is what makes the binding exact.** The document id *is* the
   template id, so nothing is inferred — no tag to consult, no ancestor walk to get
@@ -527,9 +529,10 @@ title. That is deliberately narrower than `template-sync`, which falls back to a
 name pass to catch hand-built containers: a name is hand-typed and drifts, and
 guessing in something that *writes* would produce confident wrong results.
 
-- **It composes with the sync.** `template-sync` renames and tags **every** target it
-  touches, so in a `both` run the sync tags the block and the preset then finds it in
-  the same pass.
+- **It composes with the sync, in that order.** `template-sync` renames and tags
+  **every** target it touches, so in a sync-then-edge run the sync tags the block and
+  the preset then finds it in the same pass. The Automation window's reversed order
+  gives that up — the tag is not written yet — which is why choosing it warns.
 - **Root index is honoured.** A preset captured from `#4821.1` applies only to
   `#4821.1` instances. A bare `#4821` matches root 1 only — the same rule
   `template-sync` already follows, since a single-root template accepts `#4821` and
@@ -551,9 +554,110 @@ exportable, zero-network preset, and **the staleness is a real accepted cost**: 
 a template's field, forget to re-capture, and the run pushes the old value with
 nothing to flag it. `⟳`-style re-capture is the mitigation, and it is the user's job.
 
+### Structural edits
+
+A preset may also carry **one** structural edit — `add`, `rename` or `remove` a
+node. Captured by right-clicking a layer in the **navigator** (not the panel: a
+layer's position and its name are not field rows, so there was nowhere in the
+flyout for this to live), and only while a preset is armed.
+
+**The address is the node's PARENT plus its child index**, and that is
+deliberately *exactly* as strong as a field capture's address — no stronger. It
+buys nothing on its own, and believing otherwise is the trap: a container's type
+check is near-worthless because every container answers to `container`.
+
+**The confidence comes from Matching Conditions.** Author-declared gates,
+evaluated against the matched parent before anything is written. That is the
+whole answer to "is this node missing or merely moved": the tool stops inferring
+and the author states the precondition. Four kinds — child count, a child named X
+exists/doesn't, a child of type X exists/doesn't, and the child at index N is
+type X. `CONDITION_KINDS` in `edge-preset-format.js` is the table the GUI renders
+from; the evaluator in `page-bridge.js` carries its own switch on the same `kind`
+strings, because the page world cannot read that global. Change one, change both.
+
+- **An unrecognised condition kind never passes.** A gate nobody understands is a
+  gate that is not gating, and this op writes to real pages.
+- **`index-type` is auto-attached to every rename and remove**, and is not
+  removable in the GUI. It *is* the leaf type check a field capture already gets;
+  without it an edit addressed at the parent would be strictly less safe than the
+  thing it is modelled on.
+- **A failed gate is `gated`, never `skipped`.** Three outcomes, not two — a gate
+  firing is the preset doing exactly what it was told, and folding it into
+  "skipped" makes a correct run read as a broken one across a hundred pages.
+  `gated` is logged at info; only a genuine skip warns.
+- **Idempotency is the author's job, through a condition.** An `add` with no gate
+  fires every run and duplicates. The natural guard is `no child named X`, which
+  is why a node with no `_title` is **refused at capture** rather than at apply
+  time — an unnamed node cannot be guarded, so it must never be authored.
+
+### Structural edits run last, and that ordering is load-bearing
+
+A field capture is addressed by a child-index path, and adding or removing a node
+shifts every index after it. So `applyEdgePresets` collects every structural edit
+across **all** presets during the field pass and applies them afterwards. Field
+writes therefore always resolve against a tree nothing has touched.
+
+Within the structural phase, `apply-edge-structural` takes the whole page's edits
+in **one** call and runs three passes that are never interleaved: resolve every
+parent path to a container, refuse collisions, then snapshot each parent's
+children, evaluate the conditions against that snapshot, and write.
+
+- **It is not chunked, unlike every other batched op here.** The collision guard
+  can only see two edits landing on one container if both are in the same call;
+  chunking would let a collision through by splitting the pair. The count is
+  bounded by (presets with an edit) × (instances on the page), which is small.
+- **One structural edit per preset**, refused at capture rather than replacing the
+  existing one — two in a preset can invalidate each other's indices, and the
+  honest fix is a second preset run afterwards, so it says that instead of
+  silently dropping the work the user just did.
+- **One structural edit per container per run**, enforced page-side where the
+  resolved ids are known. The content script cannot see this: two different paths
+  in two different presets can land on the same element. Both are refused rather
+  than letting the first win.
+- **An added subtree gets fresh element ids** (`regenerateIds` + `liveIds`, the
+  same machinery `insert-template` uses, and for the same reason — a duplicate id
+  is how a sync once deleted a page's own container with undo unable to restore
+  it). `create-element` is the wrong primitive here: it does not regenerate.
+
+  Both halves verified live on Elementor 4.2.1: `document/elements/create` **does**
+  build a nested subtree from a model carrying `elements` (a container with a
+  heading and a button came back with both children, right types, right titles, at
+  the requested index) — so `create` is right and `import` + `moveToIndex` is not
+  needed. And it **reuses the model's `id` verbatim**: a model with `id:
+  "zzTEST1"` produced a container whose id was `zzTEST1`. The regeneration is
+  load-bearing, not defensive.
+- **`_element_id` is stripped from the captured subtree, recursively.**
+  `template-decouple` does this when one widget becomes several siblings; here one
+  captured node is planted on every instance of every page, so the same CSS ID
+  would go site-wide.
+- **A missing named anchor is a skip, not a gate.** For `before`/`after` placement
+  the anchor *is* the address, so not finding it means we do not know where the
+  node goes — which is different from a precondition the author declared and that
+  legitimately failed.
+
+### Review mode
+
+A run option that skips `save-document` entirely, leaves every editor tab open,
+and reports the document as `awaiting review` rather than `done`. It exists for
+`remove`: a normal run closes the tab the moment the save lands, so the history
+log goes with it and there is nothing left to undo.
+
+- **`beforeunload` must not close review tabs**, or the window closing would
+  destroy exactly the unsaved work the mode protects. It closes `openTabs`, and
+  `runOne` removes each tab from that set as it finishes — a tab still mid-run
+  stays in, which is right, because it has nothing worth preserving yet.
+- **Capped at `REVIEW_MAX_DOCS` (20) and refused above it.** Every tab stays on
+  screen, so the document count *is* the number of editors left open; nobody is
+  reviewing sixty pages by hand anyway.
+- **Nothing is persisted until the user clicks**, so a crash loses the whole run.
+  That is the inverse of the normal property and was chosen deliberately.
+
 ### Files and the armed preset
 
-`{ v, id, name, templateId, templateTitle, nodes: [{ root, path, elType, widgetType, label, fields }] }`.
+`{ v, id, name, templateId, templateTitle, nodes: [{ root, path, elType, widgetType, label, fields }], edits: [...] }`.
+`v` is **2**; a v1 file still reads, it simply carries no `edits`. A hand-edited
+file with two edits keeps the first and *reports* the second rather than dropping
+it in silence — its author expected both to run.
 **`id` decides replace-or-add** on import, so Export → hand-edit → Import updates a
 preset in place. Import is tolerant and export is canonical, the same contract
 animation presets ship with; a malformed node is *reported* and dropped rather than
@@ -608,13 +712,26 @@ window being closed, and **closing the window is already the cancel gesture**.
 ### One message runs one page
 
 `Automation/automation-agent.js` is a content script, so it can simply await each
-phase: sync → edge presets → save. The window driving four separate messages per
-page would have to guess at the boundaries and would leave a page half-processed
-whenever a reply went missing.
+phase: the phases the window asked for, in the order it asked for them, then the
+save. The window driving four separate messages per page would have to guess at
+the boundaries and would leave a page half-processed whenever a reply went
+missing.
 
 - **Distinct message types, not `run-action`.** That deliberately replies as soon as
   a run has *started*, and its runners drop their arguments — so neither the
   allowlist nor the report could travel on it.
+- **The agent encodes no phase order.** `PHASES` is a table of the two phases and
+  `args.phases` is the sequence; the run is a loop over it. The order lives once,
+  in `MODES` in `automation.js`, where the GUI that offers it lives — a second copy
+  here is exactly how a select labelled one way would come to run the other.
+  - **An empty or unrecognised phase list throws rather than falling back.** A
+    guessed order means writing to a real page something the window never asked
+    for, so it goes to the listener's error channel and the row reports it. Same
+    direction as an unrecognised Edge Preset condition, which never passes.
+  - **The save stays last, always**, and is not a phase. It is what makes an
+    abandoned page an untouched page, which is the whole cancel model.
+  - A phase that hard-fails does **not** stop the next one — nothing is saved
+    either way, and the second phase's report is worth having.
 - **"Ready" is five questions, and getting it wrong is silent.** This is the one
   that actually bit, twice, on live runs. `list-containers` answers `ok: true` with
   an **empty list** while the preview container exists but its children are not
@@ -697,12 +814,36 @@ silently to "off".
   the include-picker and that target tab — one fetch.
 - A document ticked on two tabs is one job: template ids and post ids are both
   WordPress post ids, so the id alone is the identity.
-- **Run modes:** Sync + Edge Presets · Sync only · Edge Presets only. The last is the
-  fast one — no network at all per page.
+- **Run modes are a phase list, and the label names its order.** `MODES` in
+  `automation.js` is the single definition — value → label → ordered phases — and
+  the `<select>` is *rendered from it* rather than written into `automation.html`,
+  so a label cannot promise an order the run does not perform. Sync → Edge Presets ·
+  Edge Presets → Sync · Sync only · Edge Presets only. The last is the fast one — no
+  network at all per page.
+  - **Ask in phases, never by comparing `mode` to a string.** `phasesFor()` is the
+    accessor; the sync toggles grey out on `!phases.includes("sync")` and the
+    opening row state comes from `phases[0]`. The old `mode === "edge"` tests would
+    each have needed a new case for every mode added.
+  - **Sync-then-edge is the default, and the reverse warns once per run.** Two
+    things change and neither shows up as a failure — an instance the presets could
+    not see is simply not in their count, which reads exactly like a clean run:
+    Edge Presets match on the `#id.N` tag **alone** and the sync is what writes it,
+    so a container this run's sync was about to adopt is still untagged; and a
+    style-transfer field a preset writes is overwritten by the paste that follows.
+    The non-style fields presets exist for survive either order, which is what makes
+    edge-first usable at all — for presets landing on a document an earlier run
+    already synced.
+  - **The report carries `phases` beside `mode`**, because the mode key alone does
+    not say which half ran first and a report read months later has to.
 - **States.** Run: `idle → running → cancelling → finished | cancelled | error`.
-  Per document: `queued → opening → waiting → syncing → edge → saving → done |
-  failed | cancelled`. Three at once is only legible as three rows moving, which is
-  why progress is a row per document rather than a single bar.
+  Per document: `queued → opening → waiting → syncing ⇄ edge → saving → done |
+  review | failed | cancelled` — the two middle phases in the chosen order. Three at
+  once is only legible as three rows
+  moving, which is why progress is a row per document rather than a single bar.
+  `review` is distinct from `done` on purpose — nothing reached the server, so it
+  is work that still needs a human.
+- **Leave tabs open for review** turns off the save entirely — see Review mode
+  under Edge presets. It is the only safety net a `remove` has.
 - **Reads go through `tab-bridge.js`**, the same ranked ask the panel uses — this
   window has no page bridge either. `workingDomain` is deliberately the *same*
   storage key the panel uses: it names the site being worked on, and two windows
@@ -866,6 +1007,14 @@ Every write reports to the **log** — no modal, since nothing here touches the 
 The row _is_ the affordance; there is no icon. Only the label and the row's own whitespace are clickable, and the cursor changes on exactly that region — a click on an input, the unit picker or Elementor's device switcher passes straight through, so nothing that used to work stops working. `PASSTHROUGH` expresses that as a rule about **structure** (every control nests its inputs under `.elementor-control-input-wrapper`, `.e-units-wrapper`, or the switcher div) rather than a blocklist of control types that would need extending each time Elementor adds one.
 
 Right-click keeps the native menu inside text entry, where spellcheck and text copy/paste are worth more than ours.
+
+It also owns the **navigator** right-click menu (Add / Rename / Remove node, for
+Edge Preset structural edits), and that lives here for the same reason the field
+capture does: this file already resolves an element to an address and can talk to
+the content script. It is intercepted **only while a preset is armed** — Elementor
+has its own navigator context menu, and taking it away permanently to serve a
+feature nobody is currently using would be a bad trade. `buildMenu` is the shell
+both menus share, so their outside-click and Escape handling cannot drift.
 
 ### The detection rule, and the field that carries it
 

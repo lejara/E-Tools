@@ -20,12 +20,27 @@
 // Values are a SNAPSHOT, taken at capture time. Editing the template later does
 // not update the preset — re-capture does. That is a deliberate trade for a
 // self-contained, exportable preset that applies with no network call at all.
+//
+// STRUCTURAL EDITS (v2)
+//
+// A preset may also carry ONE structural edit: add a node, rename a node, or
+// remove a node. These address the node's PARENT container plus the child index,
+// which is deliberately the same strength of address a field capture already has
+// — it buys no extra confidence on its own.
+//
+// The confidence comes from MATCHING CONDITIONS: author-declared gates evaluated
+// against the matched parent before anything is written. That is the whole answer
+// to "how do we know this node is missing rather than moved" — the tool stops
+// inferring and the author states the precondition. A condition that fails is a
+// GATE, which is a designed no-op and reported separately from a skip.
 (() => {
   // Bump when the stored shape changes. A file from a newer build is refused
   // rather than half-read, the same call INDEX_VERSION makes for the usage
   // cache: reading a shape you only partly understand writes wrong values into
   // real pages, and here there is no scan to re-earn it from.
-  const EDGE_PRESET_VERSION = 1;
+  //
+  // v2 added `edits`. A v1 file still reads: it simply carries none.
+  const EDGE_PRESET_VERSION = 2;
 
   const STORAGE_KEY = "edgePresets";
 
@@ -73,6 +88,8 @@
     templateId: null,
     templateTitle: "",
     nodes: [],
+    // At most one — see mergeStructural.
+    edits: [],
   });
 
   // ------------------------------------------------------------------- paths
@@ -127,7 +144,7 @@
         values += valueCount(field);
       }
     }
-    return { nodes, fields, values };
+    return { nodes, fields, values, edits: (preset?.edits || []).length };
   };
 
   // -------------------------------------------------------------- capturing
@@ -223,6 +240,286 @@
       // rather than sitting in the list writing zero keys.
       .filter((n) => (n.fields || []).length),
   });
+
+  // ------------------------------------------------------- structural edits
+
+  const EDIT_OPS = new Set(["add", "rename", "remove"]);
+
+  // Where an added node goes inside the matched parent. "index" is the position
+  // the node held in the template; the other three exist because a page's own
+  // extra children make a captured index mean the wrong place. A named anchor
+  // survives that, which is why it is offered at all.
+  const PLACE_MODES = new Set(["index", "append", "before", "after"]);
+
+  // The gates. The GUI renders from this table and the page-side evaluator reads
+  // the same `kind` strings — it cannot read this global (page world), so it
+  // carries its own switch. Change a kind here, change it there.
+  const CONDITION_KINDS = [
+    {
+      kind: "child-count",
+      label: "Number of children",
+      fields: ["cmp", "value"],
+    },
+    {
+      kind: "child-named",
+      label: "A child named…",
+      fields: ["name", "present"],
+    },
+    {
+      kind: "child-of-type",
+      label: "A child of type…",
+      fields: ["signature", "present"],
+    },
+    {
+      kind: "index-type",
+      label: "The child at index…",
+      fields: ["index", "signature"],
+    },
+  ];
+  const CONDITION_KIND_SET = new Set(CONDITION_KINDS.map((c) => c.kind));
+  const COMPARATORS = new Set(["==", "!=", ">=", "<="]);
+
+  const newEditId = () =>
+    `ee_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 8)}`;
+
+  // The parent's address, in exactly the form nodeKey gives a field capture.
+  const editParentKey = (edit) =>
+    `${asPositiveInt(edit?.root) || 1}:${(edit?.path || []).join(".")}`;
+
+  const editSignature = (edit) =>
+    edit?.childWidgetType
+      ? `widget:${edit.childWidgetType}`
+      : String(edit?.childElType || "element");
+
+  const OP_VERB = { add: "Add", rename: "Rename", remove: "Remove" };
+
+  const editLabel = (edit) => {
+    const what =
+      edit?.childLabel || editSignature(edit) || "node";
+    const parent = edit?.parentLabel
+      ? `"${edit.parentLabel}"`
+      : `root ${asPositiveInt(edit?.root) || 1}`;
+    return `${OP_VERB[edit?.op] || "Edit"} "${what}" in ${parent}`;
+  };
+
+  const conditionLabel = (c) => {
+    if (c?.kind === "child-count") return `child count ${c.cmp} ${c.value}`;
+    if (c?.kind === "child-named") {
+      return `a child named "${c.name}" ${c.present ? "exists" : "does not exist"}`;
+    }
+    if (c?.kind === "child-of-type") {
+      return `a child of type ${c.signature} ${c.present ? "exists" : "does not exist"}`;
+    }
+    if (c?.kind === "index-type") {
+      return `the child at index ${c.index} is ${c.signature}`;
+    }
+    return "unknown condition";
+  };
+
+  // Drops anything malformed rather than half-keeping it, for the same reason a
+  // malformed field is dropped: a condition that silently does not gate is worse
+  // than one that is missing, because the write happens either way.
+  const normalizeCondition = (c) => {
+    if (!c || !CONDITION_KIND_SET.has(c.kind)) return null;
+    if (c.kind === "child-count") {
+      const value = Number(c.value);
+      if (!COMPARATORS.has(c.cmp) || !Number.isInteger(value) || value < 0) {
+        return null;
+      }
+      return { kind: "child-count", cmp: c.cmp, value };
+    }
+    if (c.kind === "child-named") {
+      const name = String(c.name || "").trim();
+      if (!name) return null;
+      return { kind: "child-named", name, present: c.present !== false };
+    }
+    if (c.kind === "child-of-type") {
+      const signature = String(c.signature || "").trim();
+      if (!signature) return null;
+      return {
+        kind: "child-of-type",
+        signature,
+        present: c.present !== false,
+      };
+    }
+    const index = Number(c.index);
+    const signature = String(c.signature || "").trim();
+    if (!isInt(index) || !signature) return null;
+    return { kind: "index-type", index, signature };
+  };
+
+  // Rename and Remove act on whatever sits at a child index, and the index alone
+  // is a position. The current design type-checks the LEAF of a field capture, so
+  // without this an edit addressed at the parent would be strictly weaker than
+  // what it replaces. Attached automatically, not offered as a choice.
+  const autoConditionFor = (edit) => {
+    if (edit?.op === "add") return null;
+    return normalizeCondition({
+      kind: "index-type",
+      index: edit?.index,
+      signature: editSignature(edit),
+    });
+  };
+
+  const withAutoCondition = (edit) => {
+    const auto = autoConditionFor(edit);
+    if (!auto) return edit.conditions || [];
+    const already = (edit.conditions || []).some(
+      (c) =>
+        c.kind === "index-type" &&
+        c.index === auto.index &&
+        c.signature === auto.signature,
+    );
+    return already ? edit.conditions : [auto, ...(edit.conditions || [])];
+  };
+
+  // A CSS ID is unique per document by definition, and an added node is planted
+  // on every matched instance of every page in the run. template-decouple drops
+  // _element_id for exactly this reason when one widget becomes several siblings;
+  // here one captured node becomes hundreds. Recursive, because a subtree carries
+  // one per element.
+  const stripElementIds = (node) => {
+    if (Array.isArray(node)) return node.map(stripElementIds);
+    if (!node || typeof node !== "object") return node;
+    const out = { ...node };
+    if (out.settings && typeof out.settings === "object") {
+      const { _element_id, ...rest } = out.settings;
+      out.settings = rest;
+    }
+    if (Array.isArray(out.elements)) out.elements = out.elements.map(stripElementIds);
+    return out;
+  };
+
+  const normalizePlace = (place, fallbackIndex) => {
+    const mode = PLACE_MODES.has(place?.mode) ? place.mode : "index";
+    const out = { mode };
+    if (mode === "index") {
+      const n = Number(place?.index ?? fallbackIndex);
+      out.index = isInt(n) ? n : 0;
+    }
+    if (mode === "before" || mode === "after") {
+      out.anchorName = String(place?.anchorName || "").trim();
+    }
+    return out;
+  };
+
+  const normalizeEdit = (raw) => {
+    if (!raw || !EDIT_OPS.has(raw.op)) {
+      return { ok: false, error: "edit has no recognised operation" };
+    }
+    const path = Array.isArray(raw.path) ? raw.path.map(Number) : null;
+    if (!path || !path.every(isInt)) {
+      return { ok: false, error: "edit parent path must be a list of child indices" };
+    }
+    const index = Number(raw.index);
+    if (!isInt(index)) {
+      return { ok: false, error: "edit carries no child index" };
+    }
+    const edit = {
+      id: typeof raw.id === "string" && raw.id ? raw.id : newEditId(),
+      op: raw.op,
+      root: asPositiveInt(raw.root) || 1,
+      path,
+      index,
+      parentElType: raw.parentElType || null,
+      parentWidgetType: raw.parentWidgetType || null,
+      parentLabel: raw.parentLabel || "",
+      childElType: raw.childElType || null,
+      childWidgetType: raw.childWidgetType || null,
+      childLabel: raw.childLabel || "",
+      conditions: (Array.isArray(raw.conditions) ? raw.conditions : [])
+        .map(normalizeCondition)
+        .filter(Boolean),
+    };
+
+    if (raw.op === "add") {
+      if (!raw.node || typeof raw.node !== "object") {
+        return { ok: false, error: "an add carries no node to create" };
+      }
+      // The guard for a repeat run is almost always "no child named X", and it
+      // cannot be written against a node with no name. Refusing here rather than
+      // at apply time is what keeps an unguarded add from ever being authored.
+      if (!edit.childLabel) {
+        return {
+          ok: false,
+          error:
+            "name the layer in the template first — an unnamed node cannot be" +
+            " guarded against being added twice",
+        };
+      }
+      edit.node = stripElementIds(raw.node);
+      edit.place = normalizePlace(raw.place, index);
+    }
+    if (raw.op === "rename") {
+      const title = String(raw.title || "").trim();
+      if (!title) return { ok: false, error: "a rename carries no new name" };
+      edit.title = title;
+    }
+
+    edit.conditions = withAutoCondition(edit);
+    return { ok: true, edit };
+  };
+
+  const structuralEdit = (preset) => (preset?.edits || [])[0] || null;
+
+  // ONE structural edit per preset, and the second is refused rather than
+  // replacing the first. Two structural edits in one preset can invalidate each
+  // other's indices, and the honest fix is a second preset run afterwards — so
+  // say that instead of silently dropping work the user just did.
+  const mergeStructural = (preset, capture) => {
+    const base = preset || makePreset("");
+    const templateId = asPositiveInt(capture?.templateId);
+    if (!templateId) return { ok: false, error: "capture carries no template id" };
+    if (base.templateId && String(base.templateId) !== String(templateId)) {
+      return {
+        ok: false,
+        error:
+          `this preset is bound to template #${base.templateId}` +
+          ` — captures must come from that template's editor`,
+      };
+    }
+    const existing = structuralEdit(base);
+    if (existing) {
+      return {
+        ok: false,
+        error:
+          `"${base.name}" already has a structural edit (${editLabel(existing)}).` +
+          ` Remove it, or capture this one into a new preset and run them in order.`,
+      };
+    }
+    const made = normalizeEdit(capture.edit);
+    if (!made.ok) return { ok: false, error: made.error };
+
+    return {
+      ok: true,
+      edit: made.edit,
+      preset: {
+        ...base,
+        v: EDGE_PRESET_VERSION,
+        templateId: String(templateId),
+        templateTitle: capture.templateTitle || base.templateTitle || "",
+        edits: [made.edit],
+      },
+    };
+  };
+
+  const removeEdit = (preset, editId) => ({
+    ...preset,
+    edits: (preset?.edits || []).filter((e) => e.id !== editId),
+  });
+
+  // The GUI edits place and conditions after capture; both go back through
+  // normalizeEdit so a hand-built condition cannot enter the stored shape
+  // unvalidated.
+  const updateEdit = (preset, editId, patch) => {
+    const at = (preset?.edits || []).findIndex((e) => e.id === editId);
+    if (at < 0) return { ok: false, error: "no such edit" };
+    const made = normalizeEdit({ ...preset.edits[at], ...patch });
+    if (!made.ok) return { ok: false, error: made.error };
+    const edits = preset.edits.slice();
+    edits[at] = made.edit;
+    return { ok: true, preset: { ...preset, edits } };
+  };
 
   // --------------------------------------------------------------- matching
 
@@ -334,10 +631,27 @@
       });
     });
 
-    if (!nodes.length) {
+    // Only the first survives, and anything past it is reported rather than
+    // dropped in silence — a hand-edited file with two is a file whose author
+    // expected both to run.
+    const edits = [];
+    const rawEdits = Array.isArray(data.edits) ? data.edits : [];
+    rawEdits.forEach((e, i) => {
+      if (edits.length) {
+        problems.push(
+          `edit ${i + 1}: a preset carries one structural edit — dropped`,
+        );
+        return;
+      }
+      const made = normalizeEdit(e);
+      if (!made.ok) problems.push(`edit ${i + 1}: ${made.error}`);
+      else edits.push(made.edit);
+    });
+
+    if (!nodes.length && !edits.length) {
       return {
         ok: false,
-        error: "no usable nodes in the file",
+        error: "no usable nodes or edits in the file",
         problems,
       };
     }
@@ -353,6 +667,7 @@
         templateId: String(templateId),
         templateTitle: data.templateTitle || "",
         nodes,
+        edits,
       },
     };
   };
@@ -370,6 +685,11 @@
       widgetType: n.widgetType || null,
       label: n.label || "",
       fields: (n.fields || []).map((f) => ({ ...f })),
+    })),
+    edits: (preset?.edits || []).map((e) => ({
+      ...e,
+      path: (e.path || []).slice(),
+      conditions: (e.conditions || []).map((c) => ({ ...c })),
     })),
   });
 
@@ -399,6 +719,22 @@
     mergeCapture,
     removeNode,
     removeField,
+    EDIT_OPS,
+    PLACE_MODES,
+    CONDITION_KINDS,
+    COMPARATORS,
+    newEditId,
+    editParentKey,
+    editSignature,
+    editLabel,
+    conditionLabel,
+    normalizeCondition,
+    normalizeEdit,
+    stripElementIds,
+    structuralEdit,
+    mergeStructural,
+    removeEdit,
+    updateEdit,
     tagMatchesNode,
     parsePresetFile,
     toPresetFile,
