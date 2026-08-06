@@ -566,6 +566,26 @@
       >
     </div>
     <div class="field" style="margin-top: 10px">
+      <label for="opt-min-match" class="field-label"
+        >Minimum Template Match (%)</label
+      >
+      <input
+        id="opt-min-match"
+        type="number"
+        min="0"
+        max="100"
+        step="5"
+        class="text-input"
+        placeholder="50"
+        autocomplete="off"
+      />
+      <span class="field-hint"
+        >A sync refuses a container when fewer than this share of the
+        <em>template's</em> layers line up. Extra layers on the page never
+        count against it. Empty uses the default.</span
+      >
+    </div>
+    <div class="field" style="margin-top: 10px">
       <label for="opt-working-domain" class="field-label">Working Domain</label>
       <input
         id="opt-working-domain"

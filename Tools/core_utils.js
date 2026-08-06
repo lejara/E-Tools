@@ -459,9 +459,21 @@
     return out;
   };
 
-  // Align one level of children. Pass 1 matches on type+name (high
-  // confidence); pass 2 fills the leftover gaps on type alone, so a renamed
-  // layer still aligns while an inserted or deleted one becomes a gap.
+  // Align one level of children, in three passes of decreasing confidence.
+  // Each pair carries which pass produced it, because "40/40 styled" reads the
+  // same whether every node matched on its name or all forty were positional
+  // guesses on unnamed containers — and those are very different results.
+  //
+  //   strict  type + name, in order            — an identity match
+  //   loose   type alone, within a gap          — a renamed layer
+  //   moved   type + name, ignoring order       — a reordered layer
+  //
+  // Pass 3 exists because LCS is order-preserving by construction, so two
+  // siblings that swapped places come out as one `missing` plus one `extra` and
+  // neither gets styled. It only pairs leftovers whose strict key is unique on
+  // BOTH sides *and* carries a real name: an unnamed container's strict key
+  // degenerates to its type, which is not an identity, and pairing two of those
+  // across a level would be a guess rather than a recovery.
   const alignChildren = (srcKids, tgtKids) => {
     const strictKey = (n) => `${nodeType(n)}\0${normalizeName(n.title)}`;
     const looseKey = (n) => nodeType(n);
@@ -474,31 +486,96 @@
       const tGap = tgtKids.slice(ti, tEnd);
       if (!sGap.length || !tGap.length) return;
       for (const [a, b] of lcsAlign(sGap, tGap, looseKey)) {
-        matched.push([si + a, ti + b]);
+        matched.push([si + a, ti + b, "loose"]);
       }
     };
 
     for (const [s, t] of lcsAlign(srcKids, tgtKids, strictKey)) {
       fillGap(s, t);
-      matched.push([s, t]);
+      matched.push([s, t, "strict"]);
       si = s + 1;
       ti = t + 1;
     }
     fillGap(srcKids.length, tgtKids.length);
 
+    const leftOver = (kids, seen) =>
+      kids.map((_, i) => i).filter((i) => !seen.has(i));
+    let srcOnly = leftOver(
+      srcKids,
+      new Set(matched.map((p) => p[0])),
+    );
+    let tgtOnly = leftOver(
+      tgtKids,
+      new Set(matched.map((p) => p[1])),
+    );
+
+    if (srcOnly.length && tgtOnly.length) {
+      // null marks a key seen more than once, which disqualifies it: a move can
+      // only be recovered where there is exactly one candidate on each side.
+      const uniqueByKey = (indexes, kids) => {
+        const map = new Map();
+        for (const i of indexes) {
+          if (!normalizeName(kids[i].title)) continue;
+          const k = strictKey(kids[i]);
+          map.set(k, map.has(k) ? null : i);
+        }
+        return map;
+      };
+      const srcByKey = uniqueByKey(srcOnly, srcKids);
+      const tgtByKey = uniqueByKey(tgtOnly, tgtKids);
+      let moved = false;
+      for (const [key, i] of srcByKey) {
+        if (i === null) continue;
+        const j = tgtByKey.get(key);
+        if (j === undefined || j === null) continue;
+        matched.push([i, j, "moved"]);
+        moved = true;
+      }
+      if (moved) {
+        srcOnly = leftOver(srcKids, new Set(matched.map((p) => p[0])));
+        tgtOnly = leftOver(tgtKids, new Set(matched.map((p) => p[1])));
+      }
+    }
+
     matched.sort((x, y) => x[0] - y[0]);
-    const srcSeen = new Set(matched.map((p) => p[0]));
-    const tgtSeen = new Set(matched.map((p) => p[1]));
-    return {
-      matched,
-      srcOnly: srcKids.map((_, i) => i).filter((i) => !srcSeen.has(i)),
-      tgtOnly: tgtKids.map((_, i) => i).filter((i) => !tgtSeen.has(i)),
-    };
+    return { matched, srcOnly, tgtOnly };
   };
 
-  // Below this share of nodes aligning, the two trees are not the same block
-  // and styling the overlap would do more harm than refusing.
+  // Below this share of the TEMPLATE's nodes aligning, the two trees are not
+  // the same block and styling the overlap would do more harm than refusing.
+  //
+  // It is deliberately the template's coverage and not the larger tree's. The
+  // denominator used to be max(src, tgt), which meant a page block holding the
+  // whole template faithfully *plus* twenty nodes somebody added scored 10/30
+  // and was refused outright — even though all ten template nodes had found
+  // homes and nothing was ambiguous. "Did the template apply?" is pairs/src;
+  // "how much of the page did we touch?" is pairs/tgt. Only the first can say
+  // this is the wrong block, so only the first is a gate.
   const MIN_MATCH_RATIO = 0.5;
+
+  // The other half of that split. Low page coverage is not evidence of a wrong
+  // match, but a template landing on a block ten times its size is worth saying
+  // out loud rather than reporting as a clean sync — so it is a warning the
+  // caller surfaces, never a refusal.
+  const LOW_PAGE_COVERAGE = 0.5;
+
+  const clampRatio = (value) => {
+    const n = Number(value);
+    return Number.isFinite(n) && n >= 0 && n <= 1 ? n : MIN_MATCH_RATIO;
+  };
+
+  // How strict the gate is, from the panel. `undefined` means "never set, use
+  // the default" — the same distinction skipWord draws — and so does anything
+  // outside 0..1, since a threshold that cannot be met would refuse every block
+  // on the site with no way to tell why from the run's own output.
+  const getMatchThreshold = async () => {
+    try {
+      const { minMatchRatio } = await browser.storage.local.get("minMatchRatio");
+      return clampRatio(minMatchRatio);
+    } catch (_) {
+      return MIN_MATCH_RATIO;
+    }
+  };
 
   // A layer whose name contains the skip word is left alone. Default "skip";
   // clearing the panel field to empty turns the feature off entirely.
@@ -531,10 +608,20 @@
   // Marking a branch "skip" means the branch is allowed to have diverged.
   const pairTrees = (src, tgt, opts = {}) => {
     const isSkipped = opts.isSkipped || (() => false);
+    const minRatio =
+      typeof opts.minRatio === "number" ? clampRatio(opts.minRatio) : MIN_MATCH_RATIO;
     const skipped = [];
     const missing = []; // in the template, absent from the page
     const extra = []; //   on the page, absent from the template
     const pairs = [];
+    // How the pairs were arrived at, so a caller can say how much of a match was
+    // identity and how much was position. The root pair is not counted: it is
+    // the match, established before the walk starts.
+    const how = { strict: 0, loose: 0, moved: 0 };
+    // Every level where the children did not all line up. The worst of them is
+    // far more actionable than a flat list of paths — it names the one layer to
+    // open rather than the six leaves underneath it.
+    const divergences = [];
 
     // The roots have to be the same kind of thing; nothing below that is
     // interpretable if they are not.
@@ -547,11 +634,40 @@
       };
     }
 
+    // The root itself carrying the skip word is a deliberate act, not a failed
+    // match, and it has to be answered here. The walk below skips such a node
+    // and returns, which for the root means zero pairs against a denominator
+    // floored at 1 — a 0% ratio, reported as "too different to be the same
+    // block". Marking a container `skip` is exactly how you hold it back, so
+    // that read is precisely backwards.
+    if (isSkipped(src.title) || isSkipped(tgt.title)) {
+      return {
+        ok: true,
+        rootSkipped: true,
+        pairs: [],
+        skipped: [tgt.title || src.title || "root"],
+        missing: [],
+        extra: [],
+        how,
+        divergence: null,
+        ratio: 1,
+        templateCoverage: 1,
+        pageCoverage: 1,
+      };
+    }
+
     // Whole skipped subtrees come out of the ratio on each side. Counting
     // their descendants would let the skip word itself push a container under
     // the threshold, which is the opposite of what marking a branch means.
     let srcSkip = 0;
     let tgtSkip = 0;
+
+    // A path a human can follow back into the navigator. The bare "[2]" this
+    // replaced is an index into a tree they cannot see from the modal.
+    const stepPath = (path, i, node) => {
+      const name = String(node.title || "").trim();
+      return `${path} > [${i}]${name ? ` "${name}"` : ""}`;
+    };
 
     const walk = (s, t, path) => {
       if (isSkipped(s.title) || isSkipped(t.title)) {
@@ -566,12 +682,14 @@
       const tgtKids = t.children || [];
       const { matched, srcOnly, tgtOnly } = alignChildren(srcKids, tgtKids);
 
+      let unaligned = 0;
       for (const i of srcOnly) {
         if (isSkipped(srcKids[i].title)) {
           srcSkip += countNodes(srcKids[i]);
           continue;
         }
         missing.push(`${path} > ${nodeLabel(srcKids[i])}`);
+        unaligned++;
       }
       for (const j of tgtOnly) {
         if (isSkipped(tgtKids[j].title)) {
@@ -579,26 +697,56 @@
           continue;
         }
         extra.push(`${path} > ${nodeLabel(tgtKids[j])}`);
+        unaligned++;
       }
-      for (const [i, j] of matched) {
-        walk(srcKids[i], tgtKids[j], `${path} > [${i}]`);
+      if (unaligned) {
+        divergences.push({
+          path,
+          unaligned,
+          srcCount: srcKids.length,
+          tgtCount: tgtKids.length,
+          aligned: matched.length,
+        });
+      }
+      for (const [i, j, kind] of matched) {
+        // Counted only for pairs that actually yield a pair. A matched child
+        // that turns out to be skipped is not a node this run aligned.
+        if (!isSkipped(srcKids[i].title) && !isSkipped(tgtKids[j].title)) {
+          how[kind]++;
+        }
+        walk(srcKids[i], tgtKids[j], stepPath(path, i, tgtKids[j]));
       }
     };
 
     walk(src, tgt, "root");
 
-    // Ratio is against the larger tree so that a template matching only a
-    // small corner of a big page container still reads as a poor match.
-    const total = Math.max(
-      countNodes(src) - srcSkip,
-      countNodes(tgt) - tgtSkip,
-      1,
-    );
-    const ratio = pairs.length / total;
-    if (ratio < MIN_MATCH_RATIO) {
+    // Two questions, deliberately kept apart — see MIN_MATCH_RATIO. Only the
+    // template's coverage gates; the page's is reported.
+    const srcTotal = Math.max(countNodes(src) - srcSkip, 1);
+    const tgtTotal = Math.max(countNodes(tgt) - tgtSkip, 1);
+    const templateCoverage = pairs.length / srcTotal;
+    const pageCoverage = pairs.length / tgtTotal;
+
+    // Worst first, so the caller can print one line and have it be the useful
+    // one. Ties keep document order, which reads top-down like the navigator.
+    const worst = divergences
+      .slice()
+      .sort((a, b) => b.unaligned - a.unaligned)[0];
+    const divergence = worst
+      ? `${worst.path}: template has ${worst.srcCount} child(ren), ` +
+        `page has ${worst.tgtCount}, ${worst.aligned} aligned`
+      : null;
+
+    if (templateCoverage < minRatio) {
       return {
         ok: false,
-        ratio,
+        // Kept as the template's coverage: it is the number the gate compared,
+        // so it is the number that explains the refusal.
+        ratio: templateCoverage,
+        templateCoverage,
+        pageCoverage,
+        how,
+        divergence,
         // Carried on the failure path too, and no caller in THIS extension
         // wants them: "Link to Component" does, and that now lives in Elementor
         // Components (../Elementor_Components), which ships its own verbatim
@@ -614,13 +762,28 @@
         missing,
         extra,
         error:
-          `only ${pairs.length}/${total} nodes aligned (${Math.round(ratio * 100)}%) — ` +
-          `too different to be the same block ` +
+          `only ${pairs.length}/${srcTotal} template node(s) aligned ` +
+          `(${Math.round(templateCoverage * 100)}%) — too different to be the same block ` +
           `(${missing.length} missing from page, ${extra.length} extra on page)`,
       };
     }
 
-    return { ok: true, pairs, skipped, missing, extra, ratio };
+    return {
+      ok: true,
+      pairs,
+      skipped,
+      missing,
+      extra,
+      ratio: templateCoverage,
+      templateCoverage,
+      pageCoverage,
+      how,
+      divergence,
+      // A template landing on a block much larger than itself. Not a refusal —
+      // the template applied in full — but the one shape a wrong tag produces
+      // that otherwise reads as a clean sync.
+      lowPageCoverage: pageCoverage < LOW_PAGE_COVERAGE,
+    };
   };
 
   // The panel window has no page bridge of its own — only the editor tab can
@@ -830,10 +993,17 @@
       //
       // Two shapes:
       //   choose(items, labelOf, buttonText)              -> items[] | null
-      //   choose({ buildItems, labelOf, buttonText, toggles }) -> {items, toggles} | null
+      //   choose({ buildItems, labelOf, buttonText, toggles, keyOf }) -> {items, toggles} | null
       // The object form takes a buildItems(toggleState) callback because a
       // toggle can change which items even qualify, so flipping one has to
       // rebuild the list rather than just filter it.
+      //
+      // keyOf is what makes "survives a rebuild" true. Without it the tick
+      // state is keyed on object identity, and a buildItems that constructs
+      // fresh objects each call — which any builder that computes labels or
+      // groups rows must — silently re-ticks everything the user unticked, on
+      // every toggle flip. Pass a stable id; identity is only the default so
+      // the legacy array form keeps working.
       choose(itemsOrConfig, labelOfArg, buttonTextArg) {
         const legacy = Array.isArray(itemsOrConfig);
         const {
@@ -841,6 +1011,7 @@
           labelOf,
           buttonText,
           toggles = [],
+          keyOf,
         } = legacy
           ? {
               buildItems: () => itemsOrConfig,
@@ -848,6 +1019,7 @@
               buttonText: buttonTextArg,
             }
           : itemsOrConfig;
+        const idOf = keyOf || ((item) => item);
 
         return new Promise((resolve) => {
           const toggleState = {};
@@ -916,7 +1088,7 @@
           const go = makeBtn(buttonText, true);
           btnRow.replaceChildren(leftGroup, cancel, go);
 
-          const chosenItems = () => items.filter((i) => !unticked.has(i));
+          const chosenItems = () => items.filter((i) => !unticked.has(idOf(i)));
 
           const renderButtons = () => {
             const n = chosenItems().length;
@@ -957,9 +1129,10 @@
               addOwn(empty);
             }
             for (const item of items) {
-              const row = checkRow(labelOf(item), !unticked.has(item), (on) => {
-                if (on) unticked.delete(item);
-                else unticked.add(item);
+              const key = idOf(item);
+              const row = checkRow(labelOf(item), !unticked.has(key), (on) => {
+                if (on) unticked.delete(key);
+                else unticked.add(key);
                 renderButtons();
               });
               boxes.set(item, row.querySelector("input"));
@@ -971,8 +1144,8 @@
           const setAll = (on) => {
             for (const [item, box] of boxes) {
               box.checked = on;
-              if (on) unticked.delete(item);
-              else unticked.add(item);
+              if (on) unticked.delete(idOf(item));
+              else unticked.add(idOf(item));
             }
             renderButtons();
           };
@@ -1074,4 +1247,6 @@
   ns.nodeType = nodeType;
   ns.getSkipMatcher = getSkipMatcher;
   ns.DEFAULT_SKIP_WORD = DEFAULT_SKIP_WORD;
+  ns.getMatchThreshold = getMatchThreshold;
+  ns.MIN_MATCH_RATIO = MIN_MATCH_RATIO;
 })();

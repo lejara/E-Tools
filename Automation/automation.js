@@ -63,12 +63,14 @@
   // Sync-then-edge is the default because the sync is the half that pastes the
   // template's own values over the page's. The reverse is offered for the case
   // where the presets are meant to land on a document an earlier run already
-  // synced, and it costs two things that `startRun` warns about once per run:
-  //   · Edge Presets match instances on the `#id.N` tag ALONE, and the sync is what
-  //     writes that tag. Run first, the presets cannot see a hand-built container
-  //     the sync was about to adopt.
+  // synced, and it costs one thing that `startRun` warns about once per run:
   //   · Any style-transfer field a preset writes is overwritten by the paste that
   //     follows it. The non-style fields presets exist for are untouched.
+  //
+  // It used to cost a second thing — the sync tagged every target it touched, so
+  // presets running first could not see a container the sync was about to adopt.
+  // Both halves match on the `#id.N` tag now and neither writes one, so the two
+  // phases see the same set of instances in either order.
   const MODES = {
     both: { label: "Sync → Edge Presets", phases: ["sync", "edge"] },
     "edge-first": { label: "Edge Presets → Sync", phases: ["edge", "sync"] },
@@ -1302,17 +1304,16 @@
         `mode "${MODES[mode]?.label || mode}", ${concurrency} editor(s) at once` +
         (review ? " · REVIEW: nothing will be saved, tabs stay open" : ""),
     );
-    // Said once here rather than left to be discovered across a hundred pages.
-    // Neither consequence shows up as a failure — an instance the presets could not
-    // see is simply not in their count, which reads exactly like a clean run.
+    // Said once here rather than left to be discovered across a hundred pages. It
+    // does not show up as a failure — a preset that wrote its value and had it
+    // pasted over still counts as applied, which reads exactly like a clean run.
     if (phases[0] === "edge" && phases.includes("sync")) {
       say(
         "warn",
-        "Edge Presets run BEFORE the sync in this order. Presets match instances on " +
-          "the #id tag alone and the sync is what writes that tag, so a container " +
-          "this run's sync is about to adopt is still untagged and its presets will " +
-          "not reach it. Any style field a preset writes is also overwritten by the " +
-          "paste that follows.",
+        "Edge Presets run BEFORE the sync in this order, so any STYLE field a preset " +
+          "writes is overwritten by the paste that follows it — silently, since the " +
+          "preset still counts as applied. The non-style fields presets exist for are " +
+          "untouched, which is what makes this order usable.",
       );
     }
 
