@@ -32,11 +32,71 @@
   // what a preview that has not started building looks like.
   const SETTLE_NONEMPTY = 1;
   const SETTLE_EMPTY = 3;
+  // The blind path: the saved document config was unreadable, so there is no
+  // ground truth at all and "empty" can only be established by time.
+  //
+  // This used to be the ONLY path — SETTLE_EMPTY applied to every empty-looking
+  // page, which meant 3 polls at 800ms decided it. 2.4 seconds is nowhere near a
+  // large page's boot, so a still-building editor passed for an empty one and the
+  // whole page was skipped, silently, because "no matches" is a legitimate answer.
+  // That is now the rare degraded case, so it can afford to be properly patient.
+  const SETTLE_EMPTY_BLIND = 12;
+
+  // How many polls the rendered element count may sit still, SHORT of what the
+  // saved document says, before it is accepted anyway. The 1:1 correspondence
+  // between saved elements and walked containers holds on this build, but a
+  // future Elementor that renders one fewer node must not turn every run into a
+  // 120s timeout — a count that has stopped growing has finished building,
+  // whatever the arithmetic says. Reported rather than swallowed.
+  const UNDERCOUNT_GRACE = 8;
 
   // Module-level, because a settling check is the one thing here that needs memory
   // between polls. The window calls readiness() repeatedly; these carry across.
   let lastTop = -1;
+  let lastTotal = -1;
   let stableHits = 0;
+  let totalStableHits = 0;
+  let firstPollAt = 0;
+
+  // Whether Firefox is throttling this tab, answered once and reused.
+  //
+  // A background tab gets its timers clamped to >=1s and its requestAnimationFrame
+  // suspended outright — and Elementor builds the preview through rAF, so a hidden
+  // tab can look exactly like a slow site: the readiness probe just never passes.
+  // Those two are worth being able to tell apart from a run's report rather than
+  // by guessing, so a frame probe rides along on every reply.
+  //
+  // The cost is self-selecting: an unthrottled tab answers in ~16ms, and only a
+  // suspended one pays the full window — which is precisely the tab worth waiting
+  // to learn about.
+  let framesMs;
+  const frameProbe = (ms = 1200) =>
+    new Promise((resolve) => {
+      const t0 = Date.now();
+      let settled = false;
+      const timer = setTimeout(() => {
+        if (settled) return;
+        settled = true;
+        resolve(null);
+      }, ms);
+      requestAnimationFrame(() => {
+        if (settled) return;
+        settled = true;
+        clearTimeout(timer);
+        resolve(Date.now() - t0);
+      });
+    });
+
+  const environment = async () => {
+    if (framesMs === undefined) framesMs = await frameProbe();
+    return {
+      hidden: document.hidden,
+      visibilityState: document.visibilityState,
+      // null means no frame arrived at all, which is the signature of a tab
+      // Firefox has suspended rather than a site that is merely slow.
+      frameMs: framesMs,
+    };
+  };
 
   // "The editor is ready" is not one fact, and getting it wrong is expensive: a
   // run that starts too early reads an EMPTY document, concludes the page holds no
@@ -54,13 +114,17 @@
   // before it, so early on the rendered count and the model count are both 0 and
   // agree — which is exactly how an unbuilt page passed for a built empty one.
   const readiness = async () => {
+    if (!firstPollAt) firstPollAt = Date.now();
+    const env = await environment();
+    const not = (why) => ({ ready: false, why, env });
+
     const ping = await ns.callBridge("ping", {}, { waitLimit: 1, timeout: 2000 });
     if (!ping?.ok || !ping.ready) {
-      return { ready: false, why: "Elementor has not booted yet" };
+      return not("Elementor has not booted yet");
     }
     const doc = await ns.callBridge("describe-document", {}, { waitLimit: 1 });
     if (!doc?.ok) {
-      return { ready: false, why: `no document yet — ${doc?.error || "unknown"}` };
+      return not(`no document yet — ${doc?.error || "unknown"}`);
     }
     // The preview is a same-origin iframe, so its own load state is readable and
     // is a real signal rather than an inference. It is created dynamically, so it
@@ -75,31 +139,60 @@
       }
     })();
     if (frameState !== "complete") {
-      return { ready: false, why: `preview iframe is ${frameState || "not there yet"}` };
+      return not(`preview iframe is ${frameState || "not there yet"}`);
     }
 
     const page = await ns.callBridge("list-containers", {}, { waitLimit: 1 });
     if (!page?.ok) {
-      return { ready: false, why: `preview not built — ${page?.error || "unknown"}` };
+      return not(`preview not built — ${page?.error || "unknown"}`);
     }
     // `list-containers` answering ok is NOT enough, and this is the trap that cost
     // a real run: the preview container exists well before its children are built,
     // so an early walk returns an EMPTY list with ok: true. The sync then sees no
     // top containers, concludes the page holds no templates, and the page is
     // skipped — on a page with five of them.
+    const all = page.containers || [];
+    const rendered = all.filter((c) => c.depth === 0).length;
+    const saved = page.saved || { top: null, total: null, via: null };
+
+    // GATE 1, and the one that actually settles this: the saved document config,
+    // read off the server response before a single view is built. Compared on the
+    // TOTAL element count rather than the top level, because a page whose top
+    // containers exist while their descendants are still rendering is exactly what
+    // breaks nested matching — the top-level check cannot see that at all.
     //
-    // So the rendered depth-0 count has to match what the document model says.
-    // `topLevelExpected: 0` is a legitimately empty page and is accepted; `null`
-    // means the model was unreadable, where not checking beats never being ready.
-    const rendered = (page.containers || []).filter((c) => c.depth === 0).length;
+    // `total: 0` is a legitimately empty document and passes; `via: null` means
+    // the config was unreadable and the blind settle below carries it instead.
+    let undercount = null;
+    if (typeof saved.total === "number" && all.length < saved.total) {
+      if (all.length === lastTotal) totalStableHits += 1;
+      else {
+        lastTotal = all.length;
+        totalStableHits = 0;
+      }
+      stableHits = 0;
+      lastTop = rendered;
+      if (totalStableHits < UNDERCOUNT_GRACE) {
+        return not(`preview still building (${all.length}/${saved.total} elements)`);
+      }
+      // Stopped growing well short of the saved count. Accepted rather than left
+      // to time out, and carried into the reply so the run says so — see
+      // UNDERCOUNT_GRACE.
+      undercount = { rendered: all.length, saved: saved.total };
+    } else {
+      lastTotal = all.length;
+      totalStableHits = 0;
+    }
+
+    // GATE 2 — the live model, kept as an independent second signal. It is precise
+    // once populated; it simply cannot be trusted to say "empty", because
+    // `elementor.elements` fills in WITH the preview rather than before it, which
+    // is what made the old empty check a coin flip.
     const expected = page.topLevelExpected;
     if (typeof expected === "number" && expected > 0 && rendered !== expected) {
       stableHits = 0;
       lastTop = rendered;
-      return {
-        ready: false,
-        why: `preview still building (${rendered}/${expected} top-level containers)`,
-      };
+      return not(`preview still building (${rendered}/${expected} top-level containers)`);
     }
 
     if (rendered === lastTop) stableHits += 1;
@@ -107,27 +200,38 @@
       lastTop = rendered;
       stableHits = 0;
     }
-    const needed = rendered === 0 ? SETTLE_EMPTY : SETTLE_NONEMPTY;
+    // A rendered page needs one confirming sample. An empty one needs more, and
+    // how many depends on whether anything authoritative said it is empty: with
+    // the saved config readable this is a formality, without it, it is the only
+    // evidence there is.
+    const needed =
+      rendered > 0
+        ? SETTLE_NONEMPTY
+        : saved.via
+          ? SETTLE_EMPTY
+          : SETTLE_EMPTY_BLIND;
     if (stableHits < needed) {
-      return {
-        ready: false,
-        why:
-          rendered === 0
-            ? `no top-level containers yet — confirming the document really is empty (${stableHits}/${needed})`
-            : `preview settling (${rendered} top-level, ${stableHits}/${needed})`,
-      };
+      return not(
+        rendered === 0
+          ? `no top-level containers yet — confirming the document really is empty (${stableHits}/${needed}${saved.via ? "" : ", saved count unreadable"})`
+          : `preview settling (${rendered} top-level, ${stableHits}/${needed})`,
+      );
     }
 
     return {
       ready: true,
+      env,
+      elapsedMs: Date.now() - firstPollAt,
       doc: {
         id: doc.id,
         title: doc.title || "",
         status: doc.status || null,
         isTemplate: !!doc.isTemplate,
       },
-      containers: (page.containers || []).length,
+      containers: all.length,
       topLevel: rendered,
+      saved,
+      undercount,
     };
   };
 

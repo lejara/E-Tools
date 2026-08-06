@@ -10,7 +10,8 @@
     "bump:minor": "node scripts/bump-version.js minor",
     "bump:major": "node scripts/bump-version.js major",
     "lint": "web-ext lint",
-    "sign": "node scripts/sign.js"
+    "sign": "node scripts/sign.js",
+    "auto": "node scripts/automation-browser.js"
   },
   "repository": {
     "type": "git",

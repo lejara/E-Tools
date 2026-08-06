@@ -1,6 +1,7 @@
 # Elementor Tool
 
 Typical flow each release: npm run bump → npm run sign → install the .xpi from about:addons.
+Automation runs go in their own browser: `npm run auto` — see "Firefox throttles what it cannot see".
 Browser extension (MV3, Firefox) that adds hotkey-driven tools to Elementor's WordPress editor.
 
 ## Structure: UI -> Tools
@@ -765,19 +766,43 @@ missing.
   - The iframe is same-origin, so its load state is a real signal rather than an
     inference. It is created dynamically, so the *top* document reaching
     `complete` proves nothing and is not used.
-  - **Settling is the load-bearing part.** The rendered depth-0 count must agree
-    with itself across consecutive polls: once when non-empty, **three times when
-    zero** — because "zero" is also what an unbuilt preview looks like, and only
-    time tells those apart.
-  - `list-containers` also returns `topLevelExpected` from `elementor.elements.length`
-    (the document model), and the rendered count must match it. **That check alone
-    was not enough** and shipping it was the second bug: `elementor.elements` fills
-    in *with* the preview, not before it, so early on both counts are 0 and agree.
-    It is kept because it is precise once the model is populated; the settling
-    check is what covers the window where it is not.
+  - **The saved document config is the ground truth, and settling is now the
+    backstop.** `list-containers` returns `saved: { top, total, via }` from
+    `savedElementCounts()` — the element tree the editor booted with, read off the
+    server response *before* a single view is built. That is the one count that is
+    already correct at the moment the question is worth asking.
+  - **It compares TOTAL elements, not the top level.** A page whose top containers
+    exist while their descendants are still rendering passes any depth-0 test and
+    then breaks nested matching, which the top-level check cannot see at all.
+  - `saved.via` names which candidate answered (`documents.getCurrent().config.elements`,
+    then `config.document.elements`), the same shape and reason as `isTemplateVia`.
+    `via: null` means unreadable, and the blind settle below carries it instead.
+  - **`UNDERCOUNT_GRACE` is the escape hatch, and it must stay.** The 1:1
+    correspondence between saved elements and walked containers holds on this
+    build, but a future Elementor rendering one fewer node would otherwise turn
+    every run into a 120s timeout. A count that has **stopped growing** has
+    finished building, whatever the arithmetic says — so eight still polls accept
+    it and the run *reports* the shortfall rather than swallowing it.
+  - `topLevelExpected` from `elementor.elements.length` (the document model) is
+    kept as an independent second gate. **That check alone was not enough** and
+    shipping it was the second bug: `elementor.elements` fills in *with* the
+    preview, not before it, so early on both counts are 0 and agree.
+  - **Settling was the third bug, and it was the live one.** With `expected` at 0
+    or `null` during a boot, the model gate was skipped **entirely** and the only
+    thing left was `SETTLE_EMPTY` — three polls at 800ms. **2.4 seconds decided
+    whether a page was empty**, which is nowhere near a large page's boot, so a
+    still-building editor passed for an empty one and the page was skipped in
+    silence. Settling now only decides the empty case, and only `SETTLE_EMPTY_BLIND`
+    (12) when `saved.via` is null; with the config readable it is a formality.
   - The timeout is 120s: three Elementor editors booting at once on a slow site is
     routinely tens of seconds, and failing early would report a working site as
     broken.
+- **The document that answered must be the one that was asked for.** `runOne`
+  compares `ready.doc.id` against `job.id` and fails the row otherwise. The id came
+  back on every readiness reply and was being thrown away, so a redirect, a session
+  bouncing through wp-login, or a URL that resolved elsewhere would sync **and
+  save** the wrong page — with every phase reporting a clean result about a
+  document nobody selected.
 - **Every branch of `runTemplateOperation` must return a value.** One bare `return;`
   survived on the "no template matches" path, and an automation run cannot tell
   `undefined` from "the tool is not loaded in this tab" — which is exactly what it
@@ -791,6 +816,55 @@ missing.
   thing* and **is** saved: carrying on past individual failures is what the sync is
   designed to do, and discarding the rest of its work would make one bad container
   cost the whole page.
+
+### Firefox throttles what it cannot see
+
+A run opens editors nobody is looking at, and Firefox treats those as free to slow
+down: background tabs get `setTimeout` clamped to ≥1s, and **hidden tabs have
+`requestAnimationFrame` suspended outright**. Elementor builds its preview through
+rAF, so a hidden editor does not merely load slowly — it can never finish. From the
+window that looks identical to a slow site.
+
+Two halves, because neither is sufficient alone:
+
+- **One unfocused window per editor, not a background tab.** `openTab`'s
+  `ownWindow` option. Only the *selected* tab of a window counts as visible, so N
+  concurrent editors need N windows — sharing one would leave all but the front one
+  hidden, which is the situation being escaped. Unfocused so the run does not steal
+  the keyboard, and deliberately **not minimized**: a minimized window is hidden and
+  throttles exactly like a background tab. Staggered by `index % concurrency` so
+  they cannot land perfectly stacked, since a fully occluded window can be marked
+  hidden too.
+- **`npm run auto`** launches a second Firefox through `web-ext` with the throttling
+  prefs off (`scripts/automation-browser.js`). Prefs are browser-level and **cannot
+  be set from inside an extension**, which is the whole reason this script exists.
+  It also turns off Windows occlusion tracking, which is what makes the staggering
+  above a belt rather than the only defence.
+
+Notes on that script:
+
+- **It is a separate browser, and the profile lives outside the repo.** The repo is
+  in OneDrive and a Firefox profile is a directory of live sqlite files; syncing one
+  invites corruption and a permanent upload loop. It goes under `LOCALAPPDATA`.
+- **`--keep-profile-changes` against a dedicated profile**, so the WordPress login,
+  the Edge Presets and the working domain survive between runs. That flag would be
+  reckless against a real profile; it is correct here because the directory exists
+  for nothing else.
+- The extension id is fixed in `browser_specific_settings`, so `storage.local`
+  is stable across launches rather than a fresh sandbox each time.
+- **A Playwright/geckodriver runner was reconsidered here and refused again.**
+  Everything it would buy is the prefs, which `web-ext` already sets; against that
+  it costs a second harness, a hand-seeded profile, and a pinned extension UUID
+  just to reach the Automation page — Playwright does not support installing
+  Firefox add-ons. Same conclusion as the original decision at the top of this
+  section, reached from a different direction.
+
+**The run reports which it was.** The readiness reply carries `env`
+(`hidden`, `visibilityState`, `frameMs`) from a one-shot rAF probe, cached per tab.
+`frameMs: null` means no frame ever arrived — the signature of a suspended tab
+rather than a slow site — and `throttleNote` turns that into a log line naming
+`npm run auto`. The probe is self-selecting: an unthrottled tab answers in ~16ms,
+and only the tab worth learning about pays the full 1.2s window.
 
 ### The allowlist gates both halves
 
