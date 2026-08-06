@@ -124,6 +124,13 @@
     if (!tgtRes?.ok) {
       tally.failed++;
       modal.setRow(rowId, "error", `could not read page container — ${tgtRes?.error}`);
+      // Logged as well as shown. An automated run closes this tab the moment the
+      // page is done, so a failure that only ever reached the modal is a failure
+      // nobody will ever read.
+      ns.log(
+        "warn",
+        `Template sync: "${target.title}" — could not read page container: ${tgtRes?.error}`,
+      );
       return null;
     }
 
@@ -133,6 +140,7 @@
     if (!paired.ok) {
       tally.failed++;
       modal.setRow(rowId, "error", paired.error);
+      ns.log("warn", `Template sync: "${target.title}" — ${paired.error}`);
       for (const m of (paired.missing || []).slice(0, 6)) {
         modal.note(`    missing from page: ${m}`, "warn");
       }
@@ -387,6 +395,11 @@
     const collisions = insertedIds.filter((id) => tally.pageIds.has(id));
     if (collisions.length) {
       tally.failed++;
+      ns.log(
+        "error",
+        `${op.logName}: "${template.title}" — inserted copy re-used id(s) already on ` +
+          `this page (${collisions.join(", ")}); nothing was touched`,
+      );
       modal.note(
         `✕ "${template.title}" — the inserted copy re-used id(s) already on this page ` +
           `(${collisions.join(", ")}), so nothing was touched. Remove the copy at the end ` +
@@ -404,6 +417,10 @@
       if (!insertedIds.length) {
         tally.failed++;
         modal.note(`✕ "${template.title}" — insert produced no elements`, "error");
+        ns.log(
+          "error",
+          `${op.logName}: "${template.title}" — insert produced no elements`,
+        );
         return;
       }
 
@@ -466,6 +483,10 @@
         const res = srcTrees[i];
         if (!res?.ok) {
           tally.failed++;
+          ns.log(
+            "warn",
+            `${op.logName}: "${template.title}" root ${i + 1} — could not read: ${res?.error}`,
+          );
           modal.note(
             `✕ "${template.title}" root ${i + 1} — could not read: ${res?.error}`,
             "error",
@@ -573,10 +594,20 @@
     }
   };
 
-  const runTemplateOperation = async (op) => {
+  // `auto` is the Automation window's entry point. It supplies exactly what the
+  // confirm checklist would have collected — which templates are in scope, the
+  // nested toggle, the preserve toggles — and makes the run resolve to a summary
+  // instead of only drawing one.
+  //
+  // The confirm is skipped there and nowhere else. CLAUDE.md's rule that it is
+  // always shown is a rule about a *hotkey*, where the keypress is the only thing
+  // the user said. An automation run has already been specified page by page and
+  // template by template in its own GUI, and re-asking inside each of a hundred
+  // editor tabs would not make it safer — it would make it impossible.
+  const runTemplateOperation = async (op, auto = null) => {
     if (running) {
       ns.log("warn", `${op.logName}: already running`);
-      return;
+      return { ok: false, error: "a template run is already in progress" };
     }
     running = true;
 
@@ -592,6 +623,7 @@
       const cancelledEarly = () => {
         ns.log("info", `${op.logName}: cancelled`);
         modal.finish("Cancelled — nothing was changed.", "warn");
+        return { ok: false, cancelled: true };
       };
 
       modal.setStatus("Fetching site templates…");
@@ -603,7 +635,7 @@
       if (!templatesRes?.ok) {
         ns.log("warn", `${op.logName}: ${templatesRes?.error}`);
         modal.finish(`Could not fetch templates — ${templatesRes?.error}`, "error");
-        return;
+        return { ok: false, error: String(templatesRes?.error || "fetch failed") };
       }
       const all = templatesRes.templates || [];
       const { byName, byId, ambiguous } = buildTemplateIndex(all);
@@ -617,7 +649,7 @@
       if (!pageRes?.ok) {
         ns.log("warn", `${op.logName}: ${pageRes?.error}`);
         modal.finish(`Could not read page — ${pageRes?.error}`, "error");
-        return;
+        return { ok: false, error: String(pageRes?.error || "page read failed") };
       }
       const everything = pageRes.containers || [];
       const topLevel = everything.filter((c) => c.depth === 0);
@@ -711,7 +743,16 @@
           "warn",
         );
         ns.log("info", `${op.logName}: no template matches`);
-        return;
+        // Must return a value, not fall off the end. An automation run reads this
+        // result, and `undefined` there is indistinguishable from "the tool is not
+        // loaded in this tab" — which is exactly how it was reported once.
+        return {
+          ok: true,
+          applied: 0,
+          failed: 0,
+          targets: 0,
+          summary: `no template matches (${topLevel.length} top container(s), ${all.length} template(s))`,
+        };
       }
 
       // The checklist is one row per page container, and only a template's roots
@@ -847,38 +888,87 @@
           "warn",
         );
         ns.log("info", `${op.logName}: no root matched a container`);
-        return;
+        return {
+          ok: true,
+          applied: 0,
+          failed: 0,
+          targets: 0,
+          summary: "no root matched a container",
+        };
       }
 
-      modal.setStatus(op.prompt(buildPlan({ nested: false }).length));
-      const choice = await modal.choose({
-        buildItems: buildPlan,
-        labelOf: (r) => r.label,
-        buttonText: op.button,
-        toggles: [
-          {
-            key: "nested",
-            label: "Match nested containers",
-            hint: "Whole page, not just top level. Root name + type must match.",
-            default: false,
-          },
-          ...(op.toggles || []),
-        ],
-      });
-      if (!choice) {
-        ns.log("info", `${op.logName}: cancelled`);
-        modal.close();
-        return;
+      // The run's template allowlist, and it gates BOTH halves of an automation
+      // run: a template outside it is never inserted here, and edge-presets.js
+      // filters its presets against the same list. Empty means no allowlist,
+      // which is what the interactive path always passes.
+      const allow = new Set((auto?.templateIds || []).map(String));
+
+      // One definition of the toggles for both paths. The automation sends a
+      // key → boolean map and anything it omits falls back to that row's own
+      // `default`, so the group names stay in OPS where they belong and a drifted
+      // key degrades to the recommended state rather than silently to "off".
+      const toggleRows = [
+        {
+          key: "nested",
+          label: "Match nested containers",
+          hint: "Whole page, not just top level. Root name + type must match.",
+          default: false,
+        },
+        ...(op.toggles || []),
+      ];
+
+      let chosen;
+      let toggleState;
+      if (auto) {
+        toggleState = {};
+        for (const t of toggleRows) {
+          toggleState[t.key] =
+            auto.toggles && t.key in auto.toggles
+              ? !!auto.toggles[t.key]
+              : !!t.default;
+        }
+        const full = buildPlan({ nested: !!toggleState.nested });
+        chosen = allow.size
+          ? full.filter((r) =>
+              r.acts.some((a) => allow.has(String(a.template.templateId))),
+            )
+          : full;
+        modal.setStatus(
+          `Automation: ${chosen.length} of ${full.length} container(s) in scope`,
+        );
+        // Not a failure. Most pages in a site-wide run legitimately hold none of
+        // the templates being updated, and saying so plainly is what keeps the
+        // automation's log readable.
+        if (!chosen.length) {
+          const why = "no container matched a template in this run's allowlist";
+          ns.log("info", `${op.logName}: ${why}`);
+          modal.finish(`Nothing to do — ${why}.`, "warn");
+          return { ok: true, applied: 0, failed: 0, targets: 0, summary: why };
+        }
+      } else {
+        modal.setStatus(op.prompt(buildPlan({ nested: false }).length));
+        const choice = await modal.choose({
+          buildItems: buildPlan,
+          labelOf: (r) => r.label,
+          buttonText: op.button,
+          toggles: toggleRows,
+        });
+        if (!choice) {
+          ns.log("info", `${op.logName}: cancelled`);
+          modal.close();
+          return { ok: false, cancelled: true };
+        }
+        chosen = choice.items;
+        toggleState = choice.toggles;
       }
       // The chooser took the button row and the Escape key for its own Cancel,
       // so the run has to arm its own again.
       modal.allowCancel();
-      const chosen = choice.items;
-      const nested = !!choice.toggles.nested;
+      const nested = !!toggleState.nested;
       // Every ticked option's groups, in one list. Duplicates between overlapping
       // groups cost nothing page-side, so no attempt is made to fold them.
       const preserve = (op.toggles || []).flatMap((t) =>
-        choice.toggles[t.key] ? t.groups || [] : [],
+        toggleState[t.key] ? t.groups || [] : [],
       );
       const plan = buildPlan({ nested });
       const targetIndex = nested
@@ -890,7 +980,15 @@
       // so unticking still saves the whole round trip it used to.
       const allowed = new Set(chosen.map((r) => r.target.id));
       const wanted = new Set();
-      for (const r of chosen) for (const a of r.acts) wanted.add(a.template.templateId);
+      for (const r of chosen) {
+        for (const a of r.acts) {
+          // One ticked container can be reached by several templates — by id tag
+          // from one and by name from another. Under an allowlist only the
+          // allowed ones are inserted for it.
+          if (allow.size && !allow.has(String(a.template.templateId))) continue;
+          wanted.add(a.template.templateId);
+        }
+      }
       const selected = buildQueue({ nested }).filter((t) =>
         wanted.has(t.templateId),
       );
@@ -913,7 +1011,7 @@
       // each option that is on says so before the run rather than leaving the
       // result looking like a clean sync.
       for (const t of op.toggles || []) {
-        if (choice.toggles[t.key] && t.note) modal.note(`· ${t.note}`);
+        if (toggleState[t.key] && t.note) modal.note(`· ${t.note}`);
       }
       if (chosen.length < plan.length) {
         modal.note(
@@ -1039,9 +1137,19 @@
         outcome,
         stopped || tally.failed || tally.skippedRoots ? "warn" : "ok",
       );
+      return {
+        ok: true,
+        cancelled: stopped,
+        applied: tally.applied,
+        failed: tally.failed,
+        nodes: tally.nodes,
+        targets: chosen.length,
+        summary,
+      };
     } catch (err) {
       ns.log("error", `${op.logName}: ${err?.message || err}`);
       modal.finish(`Error — ${err?.message || err}`, "error");
+      return { ok: false, error: String(err?.message || err) };
     } finally {
       if (logId !== null && logId !== undefined) {
         await ns.callBridge("history-end", { logId }, { waitLimit: 1 });
@@ -1050,6 +1158,10 @@
     }
   };
 
-  ns.syncTemplateStyles = () => runTemplateOperation(OPS.styles);
-  ns.replaceWithTemplate = () => runTemplateOperation(OPS.replace);
+  // `auto` is the Automation window's option bag. The hotkey and the panel's Run
+  // button both call these with nothing and get the confirm checklist — the
+  // keydown path passes the event to its runner, which drops it, so an accidental
+  // keypress can never arrive here looking like an automation run.
+  ns.syncTemplateStyles = (auto) => runTemplateOperation(OPS.styles, auto);
+  ns.replaceWithTemplate = (auto) => runTemplateOperation(OPS.replace, auto);
 })();

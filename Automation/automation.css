@@ -1,0 +1,501 @@
+/* Same visual language as UI/panel.html — dark, 12px system-ui, #7a9cff accent —
+   because this is the same tool in a second window, not a different product. */
+body {
+  font:
+    12px/1.4 system-ui,
+    sans-serif;
+  margin: 0;
+  padding: 12px;
+  background: #1e1e1e;
+  color: #eee;
+}
+
+h1 {
+  font-size: 11px;
+  margin: 0 0 8px;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.5px;
+  color: #999;
+}
+
+.empty {
+  color: #888;
+  font-style: italic;
+  padding: 6px 2px;
+}
+
+.field {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+.field.grow {
+  flex: 1;
+  min-width: 0;
+}
+.field.narrow {
+  width: 92px;
+  flex: none;
+}
+.field-label {
+  font-size: 10px;
+  color: #888;
+  text-transform: uppercase;
+  letter-spacing: 0.4px;
+}
+
+.text-input {
+  background: #151515;
+  color: #eee;
+  border: 1px solid #2a2a2a;
+  border-radius: 4px;
+  padding: 5px 7px;
+  font: inherit;
+  font-size: 11px;
+  outline: none;
+  min-width: 0;
+}
+.text-input:focus {
+  border-color: #4a4a4a;
+}
+
+button.clear {
+  background: #333;
+  color: #eee;
+  border: 1px solid #444;
+  border-radius: 4px;
+  padding: 4px 10px;
+  font: inherit;
+  font-size: 11px;
+  cursor: pointer;
+  white-space: nowrap;
+}
+button.clear:hover:not(:disabled) {
+  background: #3a3a3a;
+}
+button.clear:disabled {
+  opacity: 0.45;
+  cursor: default;
+}
+button.clear.primary {
+  background: #2d3c66;
+  border-color: #3c5490;
+}
+button.clear.primary:hover:not(:disabled) {
+  background: #35477a;
+}
+button.clear.danger:hover:not(:disabled) {
+  background: #5a2b2b;
+  border-color: #7a3a3a;
+}
+
+/* ------------------------------------------------------------------ topbar */
+
+.topbar {
+  display: flex;
+  gap: 12px;
+  align-items: flex-end;
+  padding-bottom: 10px;
+  border-bottom: 1px solid #2a2a2a;
+}
+.topbar-state {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
+  padding-bottom: 3px;
+}
+.state-text {
+  color: #999;
+  font-size: 11px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.pill {
+  font-size: 10px;
+  text-transform: uppercase;
+  letter-spacing: 0.5px;
+  padding: 2px 7px;
+  border-radius: 9px;
+  background: #333;
+  border: 1px solid #444;
+  color: #bbb;
+  white-space: nowrap;
+}
+.pill.is-running {
+  background: #2d3c66;
+  border-color: #3c5490;
+  color: #cfe;
+}
+.pill.is-ok {
+  background: #24402c;
+  border-color: #356044;
+  color: #cfe6d4;
+}
+.pill.is-warn {
+  background: #4a3a1e;
+  border-color: #6d552c;
+  color: #f0dcae;
+}
+.pill.is-error {
+  background: #4a2323;
+  border-color: #6d3232;
+  color: #f3c9c9;
+}
+
+/* ------------------------------------------------------------------- views */
+
+.views {
+  display: flex;
+  gap: 4px;
+  margin: 10px 0;
+}
+.view-tab {
+  background: #262626;
+  color: #bbb;
+  border: 1px solid #333;
+  border-radius: 4px;
+  padding: 5px 12px;
+  font: inherit;
+  font-size: 11px;
+  cursor: pointer;
+}
+.view-tab.is-active {
+  background: #2d3c66;
+  border-color: #3c5490;
+  color: #eee;
+}
+.view.is-hidden {
+  display: none;
+}
+
+/* ---------------------------------------------------------------- controls */
+
+.controls {
+  display: flex;
+  gap: 10px;
+  align-items: flex-end;
+  flex-wrap: wrap;
+  margin-bottom: 12px;
+}
+.spacer {
+  flex: 1;
+}
+.toggle-row {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px 14px;
+  padding: 4px 0 2px;
+}
+.toggle {
+  display: flex;
+  align-items: center;
+  gap: 5px;
+  cursor: pointer;
+  user-select: none;
+  font-size: 11px;
+}
+.toggle input {
+  accent-color: #7a9cff;
+  cursor: pointer;
+}
+
+/* ----------------------------------------------------------------- pickers */
+
+.columns {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 12px;
+}
+.picker,
+.pane {
+  min-width: 0;
+}
+.pane {
+  margin-top: 12px;
+}
+.picker-head {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 8px;
+}
+.count {
+  font-size: 10px;
+  color: #888;
+  text-align: right;
+}
+.picker-tools {
+  display: flex;
+  gap: 6px;
+  margin-bottom: 6px;
+}
+.picker-tools .text-input {
+  flex: 1;
+}
+.kinds {
+  display: flex;
+  gap: 4px;
+  margin-bottom: 6px;
+}
+.kind {
+  background: #232323;
+  color: #aaa;
+  border: 1px solid #303030;
+  border-radius: 3px;
+  padding: 3px 9px;
+  font: inherit;
+  font-size: 10px;
+  cursor: pointer;
+}
+.kind.is-active {
+  background: #333f5c;
+  border-color: #44557f;
+  color: #eee;
+}
+
+.list {
+  background: #171717;
+  border: 1px solid #262626;
+  border-radius: 4px;
+  max-height: 230px;
+  overflow-y: auto;
+  padding: 2px;
+}
+.list.tall {
+  max-height: 180px;
+}
+.list.very-tall {
+  max-height: 520px;
+}
+.list.mono {
+  font-family: ui-monospace, monospace;
+  font-size: 11px;
+}
+
+.row {
+  display: flex;
+  align-items: flex-start;
+  gap: 7px;
+  padding: 4px 6px;
+  border-radius: 3px;
+}
+.row:hover {
+  background: #1f1f1f;
+}
+.row input[type="checkbox"] {
+  accent-color: #7a9cff;
+  cursor: pointer;
+  margin-top: 1px;
+  flex: none;
+}
+.row-body {
+  min-width: 0;
+  flex: 1;
+}
+.row-title {
+  word-break: break-word;
+}
+.row-meta {
+  color: #888;
+  font-size: 10px;
+  margin-top: 1px;
+}
+.badge {
+  display: inline-block;
+  font-size: 9px;
+  text-transform: uppercase;
+  letter-spacing: 0.4px;
+  padding: 1px 5px;
+  border-radius: 8px;
+  background: #2c3550;
+  border: 1px solid #3b4668;
+  color: #c3d0f0;
+  margin-left: 6px;
+  vertical-align: 1px;
+}
+.badge.plain {
+  background: #2a2a2a;
+  border-color: #383838;
+  color: #aaa;
+}
+
+/* --------------------------------------------------------------- run rows */
+
+.runbar {
+  display: flex;
+  gap: 8px;
+  align-items: center;
+  margin: 12px 0 0;
+}
+.split {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 12px;
+  margin-top: 12px;
+}
+.split .pane {
+  margin-top: 0;
+}
+
+.prow {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+  padding: 3px 6px;
+}
+.prow-name {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.prow-note {
+  color: #999;
+  font-size: 10px;
+  max-width: 55%;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.logline {
+  padding: 2px 6px;
+  white-space: pre-wrap;
+  word-break: break-word;
+  border-bottom: 1px solid #1e1e1e;
+}
+.logline .when {
+  color: #666;
+  margin-right: 6px;
+}
+.logline.warn {
+  color: #f0dcae;
+}
+.logline.error {
+  color: #f3c9c9;
+}
+.logline.ok {
+  color: #cfe6d4;
+}
+
+/* --------------------------------------------------------------- presets */
+
+.armed {
+  margin-bottom: 10px;
+}
+.armed-inner {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 7px 10px;
+  border-radius: 4px;
+  background: #2d3c66;
+  border: 1px solid #3c5490;
+}
+.armed-inner.is-idle {
+  background: #232323;
+  border-color: #303030;
+  color: #999;
+}
+.armed-name {
+  flex: 1;
+  min-width: 0;
+}
+
+.how {
+  font-size: 11px;
+  color: #999;
+  line-height: 1.45;
+  background: #191919;
+  border: 1px solid #262626;
+  border-radius: 4px;
+  padding: 8px 10px;
+  margin-bottom: 10px;
+}
+.how strong {
+  color: #ccc;
+}
+
+.preset {
+  border: 1px solid #262626;
+  border-radius: 4px;
+  margin: 4px 2px;
+  background: #1a1a1a;
+}
+.preset.is-armed {
+  border-color: #3c5490;
+}
+.preset-head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 7px 9px;
+}
+.preset-name {
+  flex: 1;
+  min-width: 0;
+  font-weight: 600;
+  word-break: break-word;
+}
+.preset-sub {
+  font-weight: 400;
+  color: #888;
+  font-size: 10px;
+  margin-top: 2px;
+}
+.preset-nodes {
+  border-top: 1px solid #242424;
+  padding: 4px 9px 7px;
+}
+.node {
+  padding: 3px 0;
+  border-bottom: 1px solid #202020;
+}
+.node:last-child {
+  border-bottom: none;
+}
+.node-path {
+  font-family: ui-monospace, monospace;
+  font-size: 10px;
+  color: #9aa;
+}
+.node-fields {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px 6px;
+  margin-top: 3px;
+}
+.chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  font-size: 10px;
+  background: #232323;
+  border: 1px solid #303030;
+  border-radius: 10px;
+  padding: 1px 4px 1px 8px;
+}
+.chip button {
+  background: none;
+  border: none;
+  color: #888;
+  cursor: pointer;
+  font: inherit;
+  padding: 0 3px;
+}
+.chip button:hover {
+  color: #f3c9c9;
+}
+.rename-row {
+  display: flex;
+  gap: 6px;
+  padding: 0 9px 8px;
+}
+.rename-row .text-input {
+  flex: 1;
+}

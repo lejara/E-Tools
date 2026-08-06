@@ -1,0 +1,189 @@
+<!doctype html>
+<html>
+  <head>
+    <meta charset="utf-8" />
+    <title>Elementor Tools · Automation</title>
+    <link rel="stylesheet" href="automation.css" />
+  </head>
+  <body>
+    <div class="topbar">
+      <div class="field grow">
+        <span class="field-label">Working site (wp-admin)</span>
+        <input
+          id="working-domain"
+          class="text-input"
+          type="text"
+          placeholder="example.com"
+          spellcheck="false"
+        />
+      </div>
+      <div class="topbar-state">
+        <span id="state-pill" class="pill">idle</span>
+        <span id="state-text" class="state-text">Set a working site to begin</span>
+      </div>
+    </div>
+
+    <nav class="views" id="views">
+      <button class="view-tab is-active" data-view="run" type="button">
+        Automation
+      </button>
+      <button class="view-tab" data-view="presets" type="button">
+        Edge Presets
+      </button>
+    </nav>
+
+    <!-- ------------------------------------------------------------- run -->
+    <section id="view-run" class="view">
+      <div class="controls">
+        <div class="field">
+          <span class="field-label">Run</span>
+          <select id="run-mode" class="text-input">
+            <option value="both">Sync + Edge Presets</option>
+            <option value="sync">Template sync only</option>
+            <option value="edge">Edge Presets only</option>
+          </select>
+        </div>
+        <div class="field narrow">
+          <span class="field-label">Editors at once</span>
+          <input
+            id="concurrency"
+            class="text-input"
+            type="number"
+            min="1"
+            max="8"
+            value="3"
+          />
+        </div>
+        <div class="field grow">
+          <span class="field-label">Sync options</span>
+          <div class="toggle-row" id="sync-toggles"></div>
+        </div>
+        <button id="refresh" class="clear" type="button">Refresh lists</button>
+      </div>
+
+      <div class="columns">
+        <div class="picker">
+          <div class="picker-head">
+            <h1>Templates to include</h1>
+            <span class="count" id="tpl-count"></span>
+          </div>
+          <div class="picker-tools">
+            <input
+              id="tpl-search"
+              class="text-input"
+              type="search"
+              placeholder="Search templates…"
+              spellcheck="false"
+            />
+            <button class="clear" type="button" data-all="tpl">Shown</button>
+            <button class="clear" type="button" data-none="tpl">None</button>
+          </div>
+          <div class="list" id="tpl-list"></div>
+        </div>
+
+        <div class="picker">
+          <div class="picker-head">
+            <h1>Documents to process</h1>
+            <span class="count" id="doc-count"></span>
+          </div>
+          <div class="kinds" id="doc-kinds">
+            <button class="kind is-active" data-kind="page" type="button">
+              Pages
+            </button>
+            <button class="kind" data-kind="template" type="button">
+              Templates
+            </button>
+            <button class="kind" data-kind="other" type="button">Other</button>
+          </div>
+          <div class="picker-tools">
+            <input
+              id="doc-search"
+              class="text-input"
+              type="search"
+              placeholder="Search pages…"
+              spellcheck="false"
+            />
+            <button class="clear" type="button" data-all="doc">Shown</button>
+            <button class="clear" type="button" data-none="doc">None</button>
+          </div>
+          <div class="list" id="doc-list"></div>
+        </div>
+      </div>
+
+      <div class="runbar">
+        <button id="start" class="clear primary" type="button" disabled>
+          Start run
+        </button>
+        <button id="cancel" class="clear" type="button" disabled>Cancel</button>
+        <span class="spacer"></span>
+        <button id="copy-log" class="clear" type="button" disabled>
+          Copy log
+        </button>
+        <button id="download-report" class="clear" type="button" disabled>
+          Download report
+        </button>
+      </div>
+
+      <div class="split">
+        <div class="pane">
+          <h1>Progress</h1>
+          <div class="list tall" id="progress">
+            <div class="empty">Nothing queued</div>
+          </div>
+        </div>
+        <div class="pane">
+          <h1>Run log</h1>
+          <div class="list tall mono" id="run-log">
+            <div class="empty">No run yet</div>
+          </div>
+        </div>
+      </div>
+
+      <div class="pane">
+        <div class="picker-head">
+          <h1>Tool log</h1>
+          <span class="count"
+            >Written by the tools themselves — every sync failure lands here</span
+          >
+        </div>
+        <div class="list mono" id="tool-log">
+          <div class="empty">No activity yet</div>
+        </div>
+      </div>
+    </section>
+
+    <!-- --------------------------------------------------------- presets -->
+    <section id="view-presets" class="view is-hidden">
+      <div class="controls">
+        <button id="preset-new" class="clear primary" type="button">
+          New preset
+        </button>
+        <button id="preset-import" class="clear" type="button">Import…</button>
+        <input
+          id="preset-file"
+          type="file"
+          accept="application/json,.json"
+          hidden
+        />
+        <span class="spacer"></span>
+        <span class="count" id="preset-count"></span>
+      </div>
+
+      <div class="armed" id="armed-banner"></div>
+
+      <div class="how">
+        <strong>How to capture:</strong> select a preset below, open that
+        template's own Elementor editor, then right-click a field (or a section
+        header) and choose <em>Capture</em>. The template must have no unsaved
+        changes — the preset stores the value, not a live link.
+      </div>
+
+      <div class="list very-tall" id="preset-list"></div>
+    </section>
+
+    <script src="../template-format.js"></script>
+    <script src="../edge-preset-format.js"></script>
+    <script src="../tab-bridge.js"></script>
+    <script src="automation.js"></script>
+  </body>
+</html>

@@ -41,6 +41,13 @@
       window.__ElementorTools?.applyAnimationPreset?.(args || {});
       return true;
     },
+    // Also not in ACTIONS, for the same reason. The Automation window's per-preset
+    // Run button dispatches here, so applying a preset by hand and applying it in
+    // a batch go through the same entry point into the tool.
+    applyEdgePreset: (args) => {
+      window.__ElementorTools?.applyEdgePresets?.(args || {});
+      return true;
+    },
     reselectRoot: async () => {
       const { selectedLayer } =
         await browser.storage.local.get("selectedLayer");

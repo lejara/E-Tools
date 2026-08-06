@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "Elementor Tools",
-  "version": "2.4.9",
+  "version": "3.0.1",
   "description": "Time is an Element",
   "browser_specific_settings": {
     "gecko": {
@@ -44,11 +44,13 @@
         "Tools/preview-override.js",
         "template-format.js",
         "animation-preset-fields.js",
+        "edge-preset-format.js",
         "Tools/core_utils.js",
         "Tools/multi-select.js",
         "Tools/pure-container-reset.js",
         "Tools/breakpoint-flyout.js",
         "Tools/animation-presets.js",
+        "Tools/edge-presets.js",
         "Tools/layer-root-finder.js",
         "Tools/replace-styles.js",
         "Tools/replace-layer.js",
@@ -61,6 +63,7 @@
         "Tools/admin-templates.js",
         "Tools/wp-pages.js",
         "Tools/template-index.js",
+        "Automation/automation-agent.js",
         "hotkey-defaults.js",
         "hotkeys.js"
       ],

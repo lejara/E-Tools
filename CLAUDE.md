@@ -7,14 +7,21 @@ Browser extension (MV3, Firefox) that adds hotkey-driven tools to Elementor's Wo
 
 ```
 ├── manifest.json        # MV3 manifest
-├── background.js        # toolbar-icon click → opens UI/panel.html
+├── background.js        # toolbar-icon click → UI/panel.html · opens the Automation window · the single writer for the activity log
 ├── hotkeys.js           # global keybindings (dispatches to tools)
 ├── hotkey-defaults.js   # dual-context: ACTIONS table + binding formatting
 ├── template-format.js   # dual-context: template/post metadata, search, list normalization, Edit & View URL building
 ├── animation-preset-fields.js # dual-context: the Motion Effects field table, preset file build/parse/validate
+├── edge-preset-format.js # dual-context: the Edge Preset schema, child-index paths, tag matching, file parse/validate
+├── tab-bridge.js        # dual-context: askElementorTab / focusTab / openTab — the tab-ranking both windows share
 ├── UI/                  # window opened from the toolbar icon
 │   ├── panel.html
 │   └── panel.js         # reads browser.storage.local, re-renders on change; site-content list
+├── Automation/          # the batch runner, in its own window
+│   ├── automation.html
+│   ├── automation.css
+│   ├── automation.js    # the GUI *and* the run loop — pickers, state machine, worker pool
+│   └── automation-agent.js # content script: runs one page (sync → edge presets → save)
 └── Tools/               # one self-contained tool per file
     ├── preview-override.js   # forces fixed widths on mobile/tablet preview
     ├── core_utils.js         # shared helpers on window.__ElementorTools (log, selectLayerById, callBridge, insertSiteTemplate, createTemplateWidget, createContainer, listSiteTemplates, pairTrees, normalizeName)
@@ -31,6 +38,7 @@ Browser extension (MV3, Firefox) that adds hotkey-driven tools to Elementor's Wo
     ├── template-insert.js    # multi-select picker over the template library, inserts the ticked templates
     ├── template-decouple.js  # swaps Elementor Template widgets for a copy of the template's own content
     ├── animation-presets.js  # applies a saved Motion Effects preset to the selection, with delay accumulation
+    ├── edge-presets.js       # Edge Presets: preset storage, capture receiver, and the apply pipeline
     ├── wp-rest.js            # shared wp-admin REST access: wp_rest nonce + authenticated JSON GET
     ├── admin-templates.js    # serves the panel's template list from wp-admin (no editor, no page bridge)
     ├── wp-pages.js           # serves the panel's post list — every post type, with the Elementor flag
@@ -38,7 +46,8 @@ Browser extension (MV3, Firefox) that adds hotkey-driven tools to Elementor's Wo
     └── overlay.js            # draggable in-page HUD (root layer, logs, Edit-in-Elementor link)
 ```
 
-- Load order: `template-format.js` first (`core_utils.js` reads `normalizeName` off it), then `core_utils.js`, then `multi-select.js`, then other tools, then `hotkeys.js`. `wp-rest.js` must precede `admin-templates.js`, `wp-pages.js` and `template-index.js` — all three read `window.__WpRest` and bail without it. `template-index.js` also reads `window.__ElementorTemplateFormat` for the tag rule. `animation-preset-fields.js` must precede `Tools/animation-presets.js`, which reads `window.__AnimationPresetFields` and bails without it.
+- Load order: `template-format.js` first (`core_utils.js` reads `normalizeName` off it), then `core_utils.js`, then `multi-select.js`, then other tools, then `hotkeys.js`. `wp-rest.js` must precede `admin-templates.js`, `wp-pages.js` and `template-index.js` — all three read `window.__WpRest` and bail without it. `template-index.js` also reads `window.__ElementorTemplateFormat` for the tag rule. `animation-preset-fields.js` must precede `Tools/animation-presets.js`, which reads `window.__AnimationPresetFields` and bails without it. `edge-preset-format.js` must precede **both** `Tools/breakpoint-flyout.js` (which reads `STORAGE_KEY` off it to push the armed preset) and `Tools/edge-presets.js` (which bails without it) — it sits with the other dual-context files, before `core_utils.js`. `Automation/automation-agent.js` goes last but one, after every tool it drives.
+- `Tools/breakpoint-flyout.js` loads **before** `Tools/edge-presets.js` and calls `ns.captureEdgeField` off the namespace at message time, not at load time — so that order is not a constraint, and must not become one.
 - Tools share `window.__ElementorTools` inside the editor page; cross-window state uses `browser.storage.local` (`selectedLayer`, `logs`).
 - Hotkeys: `Ctrl+Shift+1` capture root layer · `Ctrl+Shift+2` replace styles · `Ctrl+Shift+3` replace layer · `Ctrl+Shift+4` batch rename · `Ctrl+Shift+5` reselect stored root · `Ctrl+Shift+6` sync template styles · `Ctrl+Shift+7` replace with template · `Ctrl+Shift+8` insert site templates · `Ctrl+Shift+9` decouple templates.
 - Add a tool: drop a file in `Tools/`, append its path to `content_scripts[0].js` in `manifest.json`.
@@ -89,7 +98,7 @@ Tick state is tracked as the set of _unticked_ items keyed on identity, so an it
 
 `callBridge(op, payload, { timeout, waitLimit, onWait })` — default timeout is 3s. Ops that hit the network (`insert-template`, `list-templates`, `prefetch-templates`) pass 15s or more.
 
-Ops: `ping` · `copy` · `paste-style` · `apply-style-pairs` · `apply-advanced-settings` · `apply-preset-settings` · `read-preset-settings` · `paste` · `delete` · `rename` · `create-element` · `insert-template` · `prefetch-templates` · `list-templates` · `describe-tree` · `describe-selection` · `list-containers` · `list-template-widgets` · `configure-pure-reset` · `history-start` / `history-end`.
+Ops: `ping` · `copy` · `paste-style` · `apply-style-pairs` · `apply-advanced-settings` · `apply-preset-settings` · `read-preset-settings` · `apply-edge-preset` · `paste` · `delete` · `rename` · `create-element` · `insert-template` · `prefetch-templates` · `list-templates` · `describe-tree` · `describe-selection` · `describe-document` · `list-containers` · `list-template-widgets` · `save-document` · `configure-pure-reset` · `history-start` / `history-end`.
 
 `configure-pure-reset` is the odd one out: every other op answers a question or performs an edit, and that one installs a **listener** — see Pure container reset.
 
@@ -189,6 +198,17 @@ Preload failure is non-fatal by design — that template's own insert fetches it
 - **`_title` and `_element_cache` are never transferred.** `_title` is the navigator label and the decouple writes its own tagged name there.
 - **Default render, unlike `rename`.** These controls carry selectors, so the model change alone leaves the preview stale — `render: false` would put the padding in the model and nowhere on screen. `options.external` still stays off, for the reason documented on `rename`.
 - **Multi-root: `_element_id` is dropped, everything else repeats.** Several siblings land where one widget stood; repeating spacing across them is a judgement call the modal warns about, but the same CSS ID on three elements is three duplicate DOM ids. The toggle is **on by default** — decoupling is meant to produce the same block, unlinked, and silently losing the widget's box was the gap this closes.
+
+`describe-document` reports the document this editor has open — `id`, `title`, `status`, `docType`, `isDirty`, and `isTemplate`. Three jobs read it: the Automation window's "you are in" line, the gate on Edge Preset capture, and the readiness probe.
+
+- **`isTemplate` must be certain, because capture binds a preset to whatever it says.** Three independent signals, tried in order — `cfg.post_type === "elementor_library"`, then `post_type=elementor_library` in `urls.exit_to_dashboard`, then `?elementor_library=` in `urls.permalink` — and `isTemplateVia` reports which one spoke, so a wrong answer is diagnosable rather than mysterious. Failing all three means "not a template", which makes capture **refuse**: the safe direction, since the alternative binds a preset to a page id naming no template.
+- **`isDirty` is the one field with no fallback.** A false "clean" would let a capture snapshot a value the template does not have, and under a snapshot format nothing downstream could ever notice. `null` means unknown and every caller treats that as dirty.
+
+`save-document` is the only thing in this codebase that saves. Nothing else does, which is why a sync whose tab is closed changes nothing — and why the Automation tool's cancel can be "close the tab".
+
+- **`document/save/default` decides publish-vs-draft from the post's own status**, which is exactly what is wanted: a published page is republished, and a **draft stays a draft** rather than being pushed live by a batch pointed at a hundred documents.
+- **An unchanged document is skipped, and that is the point, not an optimisation.** Saving anyway moves `post_modified` and writes a revision for a page the run decided not to touch. `force: true` overrides it; nothing passes that today.
+- **`stillChanged` is read back after the save.** A save that reports the document still changed did not take, and the tab is closed immediately afterwards — this is the last moment anything can notice.
 
 `history-start`/`history-end` wrap a burst of `$e.run` calls in one undo step via `document/history/start-log`. Both degrade to no-ops (`logId: null`) rather than failing the caller.
 
@@ -402,6 +422,349 @@ Targets are sent in batches of `NODE_CHUNK` (20). The page world cannot yield mi
 
 **Known limitation: a preset leaves no trace on the element.** Unlike the template tag, nothing records which preset an element carries, so "re-apply preset X everywhere it was used" is not a question this design can answer. Accepted deliberately.
 
+## Edge presets
+
+`Tools/edge-presets.js` force-pushes named fields from a template onto every
+instance of it. **There is no hotkey** — which fields to push cannot be expressed
+as a keystroke, the same reason animation presets have none.
+
+**Why it exists:** `paste-style` only transfers *style* controls, so a sync cannot
+touch a button's label, a link URL, an icon, or any other non-style setting. An
+Edge Preset is the named list of fields to push anyway — the edges a sync cannot
+reach, hence the name. Applying is defined as writing **only** the named fields;
+nothing else on the element is touched.
+
+**Applying makes no network request at all.** The values are a snapshot, the
+instances are found by their `#id.N` tag, and the paths are walked page-side. An
+Edge-Presets-only run over a hundred pages is bounded by editor load time and
+nothing else — where a sync pays a library fetch plus an insert per matched
+template per page.
+
+**Two ways to apply, one entry point.** A **Run on page** button per preset row in
+the Automation window applies it to whatever page an editor tab has open, and an
+automation run applies every preset whose template is in the allowlist. Both go
+through `run-action` → the `runners` table in `hotkeys.js` → `ns.applyEdgePresets`,
+for the reason that table exists: a button and its automated twin must not drift.
+`applyEdgePreset` sits there without a binding, exactly like `applyAnimationPreset`
+— which preset to apply cannot be expressed as a keystroke. The manual button's
+reply reports only that the run *started*; the per-instance results, skips
+included, go to the log.
+
+### Authored in the template's own editor
+
+Capture is a third item on the breakpoint flyout's right-click menu, next to Copy
+and Paste, and it is offered **only** while a preset is selected in the Automation
+window.
+
+- **The template editor is what makes the binding exact.** The document id *is* the
+  template id, so nothing is inferred — no tag to consult, no ancestor walk to get
+  wrong. Capture in a page editor is refused.
+- **One preset is bound to one template; many presets may share a template.** The
+  binding is set by the first capture and enforced by `mergeCapture`, which is the
+  one place that knows a preset is single-template.
+- **The address is the root index plus a child-index path.** `edgeAddress` walks
+  *upward* from the clicked element and stops at the document container, whose
+  direct children are the template's roots. Root index is 1-based, matching the tag
+  and how every tool here labels roots; it is the first component of the address,
+  so captures from different roots of a kit coexist in one preset.
+- **Parents are compared by id, never by identity.** `children` hands back fresh
+  wrappers — the same reason `indexInParent` in `page-bridge.js` falls back to an
+  id match.
+- **Capture is refused while the template is dirty.** A snapshot taken from an
+  unsaved template silently disagrees with the template it names, and under a
+  snapshot format nothing downstream could ever notice. Asked page-side at click
+  time (`elementor.saver.isEditorChanged()`) rather than pushed in as config,
+  because it changes on every keystroke.
+- **Every other refusal is reported on click, not by hiding the item.** Wrong
+  editor, wrong template, unsaved — the menu item appears whenever a preset is
+  armed and explains itself, rather than leaving the user hunting for where Capture
+  went.
+- **Capturing the same field twice replaces it in place.** Node identity is
+  `root:path`, field identity is `field:<control>` or `section:<name>`, so
+  authoring is idempotent — the same instinct `withTemplateTag` follows.
+
+### Values key by control key, not by device
+
+`edge-preset-format.js` holds the schema, and this is the one place it
+deliberately departs from the flyout's clipboard payload.
+
+The clipboard **has** to key a field by device, because its whole point is pasting
+between two *different* fields whose key names differ (`padding` into `margin`). An
+Edge Preset never does that: it writes the same field of the same widget type it
+was captured from, and the type check at apply time is what guarantees it. The key
+names on both ends are therefore identical by construction, the device mapping has
+nothing to do, and dropping it makes apply one uniform loop over `[key, value]` for
+fields and whole sections alike — with **no second copy of
+`resolveBase`/`buildFamily` in the bridge** to drift from the flyout's.
+
+A section capture is stored whole, defaults included, for the same reason a section
+copy is: paste is defined as making the target one-to-one with the source.
+
+### The type check is the whole safety model
+
+A child index is a position, and deleting a layer above the target shifts every
+index after it. So `apply-edge-preset` compares the captured signature
+(`widget:button`, `container`) against what the path actually landed on, and a
+mismatch **skips** — it never writes and never tries to repair the path.
+
+- **Repair was considered and rejected.** Aligning the instance against the template
+  with `ns.pairTrees` would survive inserted and deleted siblings, but it needs the
+  template's own JSON — which would cost the "no network at all" property that makes
+  an Edge-Presets-only run fast. A wrong write to a real page is far worse than a
+  reported skip.
+- **Only the leaf is checked.** An intermediate step that diverged almost always
+  produces a wrong leaf type anyway, so storing the whole chain would buy detection
+  the skip already gives.
+- A path that runs off the end of the tree, and a key the target has no control for,
+  are reported the same way. **Every skip is reported**: a field that could not be
+  written is a value the user put in the preset and did not get, which is exactly
+  where silence reads as success.
+
+### Matching an instance is tag-only
+
+An untagged block is invisible to Edge Presets even if its name matches a template
+title. That is deliberately narrower than `template-sync`, which falls back to a
+name pass to catch hand-built containers: a name is hand-typed and drifts, and
+guessing in something that *writes* would produce confident wrong results.
+
+- **It composes with the sync.** `template-sync` renames and tags **every** target it
+  touches, so in a `both` run the sync tags the block and the preset then finds it in
+  the same pass.
+- **Root index is honoured.** A preset captured from `#4821.1` applies only to
+  `#4821.1` instances. A bare `#4821` matches root 1 only — the same rule
+  `template-sync` already follows, since a single-root template accepts `#4821` and
+  `#4821.1` interchangeably.
+- **Inside a template document, depth-0 nodes are skipped**, exactly the exclusion
+  `findTemplateTags` makes for the usage index and for the same reason: a template's
+  own roots are named `<title> #<id>` by the tools that put them there, so matching
+  them would apply a preset to the very element it was captured from. It is about
+  position, not about which template the tag names.
+
+### Snapshot, not live link
+
+A preset stores the **values** as they were at capture time. Editing the template
+later does not update the preset — re-capture does.
+
+Live-reading the template's saved JSON at apply time was the alternative and would
+delete the staleness bug outright. Snapshot was chosen for the self-contained,
+exportable, zero-network preset, and **the staleness is a real accepted cost**: change
+a template's field, forget to re-capture, and the run pushes the old value with
+nothing to flag it. `⟳`-style re-capture is the mitigation, and it is the user's job.
+
+### Files and the armed preset
+
+`{ v, id, name, templateId, templateTitle, nodes: [{ root, path, elType, widgetType, label, fields }] }`.
+**`id` decides replace-or-add** on import, so Export → hand-edit → Import updates a
+preset in place. Import is tolerant and export is canonical, the same contract
+animation presets ship with; a malformed node is *reported* and dropped rather than
+kept, because a typo is otherwise indistinguishable from a field that had no effect.
+A file with no `id` is imported as a new preset. A file from a **newer** `v` is
+refused outright rather than half-read.
+
+`edgePresetArmed` holds the selected preset's **id**, not a copy of it, so a rename
+cannot leave two disagreeing versions of one name in play. `breakpoint-flyout.js`
+pushes it — plus the document from `describe-document` — over the same `__bpf`
+channel the clipboard uses, because `browser.storage` is unreachable from the page
+world. The document is cached after the first successful read (it cannot change
+without a page load) and retried twice on load, since Elementor is frequently still
+booting at `document_idle`.
+
+**`breakpoint-flyout.js` owns the channel; `edge-presets.js` owns the storage.** The
+capture op is delegated through `ns.captureEdgeField` rather than implemented in the
+loader, so there is exactly one listener answering one message — two listeners
+replying to one `__bpf` message would race and `askContentScript` would keep
+whichever landed first, the same trap CLAUDE.md already documents for `ping`.
+
+## Automation tool
+
+`Automation/` runs template sync and Edge Presets over many documents unattended.
+Its own window, opened from a button at the bottom of `UI/panel.html`, holding both
+the run GUI and the Edge Presets manager.
+
+**It is not a WebDriver script, and that was a decision.** A Node + geckodriver
+runner was the starting design; the extension can already do all of it —
+`browser.tabs.create` opens editors, content scripts auto-inject, the agent *is*
+inside the editor so readiness needs no page-world probing, and saving is one bridge
+op. The Node route additionally needed geckodriver pinning, a login flow, a new
+postMessage channel for triggering and reporting, and a second copy of the WP-REST
+reads, because Selenium's `executeScript` runs in the page world and **cannot** see
+`window.__WpRest` or message the extension. What it would have bought — a separate
+profile, unattended scheduling, killing a wedged browser — was not worth that.
+
+### The run loop lives in the window
+
+Not in the background script. Background ownership would only buy surviving the
+window being closed, and **closing the window is already the cancel gesture**.
+
+- **Cancel abandons in-flight pages by closing their tabs.** Safe by construction:
+  the save is the last thing a page does, so an abandoned page was never written to.
+  The pending `sendMessage` rejects into `runOne`'s catch, which checks
+  `cancelRequested` and records `cancelled` rather than a failure.
+- `beforeunload` closes every tab the run opened, so a cancelled run does not leave
+  three editors behind.
+- Paying for a port protocol and MV3 event-page keepalive to protect work that is
+  safe to lose would be the wrong trade.
+
+### One message runs one page
+
+`Automation/automation-agent.js` is a content script, so it can simply await each
+phase: sync → edge presets → save. The window driving four separate messages per
+page would have to guess at the boundaries and would leave a page half-processed
+whenever a reply went missing.
+
+- **Distinct message types, not `run-action`.** That deliberately replies as soon as
+  a run has *started*, and its runners drop their arguments — so neither the
+  allowlist nor the report could travel on it.
+- **"Ready" is five questions, and getting it wrong is silent.** This is the one
+  that actually bit, twice, on live runs. `list-containers` answers `ok: true` with
+  an **empty list** while the preview container exists but its children are not
+  built — so the sync sees no top containers, concludes the page holds no
+  templates, and skips it. On a page with five of them. "No matches" is a
+  legitimate answer, so nothing looks wrong.
+  - `ping` → `describe-document` → **the preview iframe's own `readyState`** →
+    `list-containers` → **settling**.
+  - The iframe is same-origin, so its load state is a real signal rather than an
+    inference. It is created dynamically, so the *top* document reaching
+    `complete` proves nothing and is not used.
+  - **Settling is the load-bearing part.** The rendered depth-0 count must agree
+    with itself across consecutive polls: once when non-empty, **three times when
+    zero** — because "zero" is also what an unbuilt preview looks like, and only
+    time tells those apart.
+  - `list-containers` also returns `topLevelExpected` from `elementor.elements.length`
+    (the document model), and the rendered count must match it. **That check alone
+    was not enough** and shipping it was the second bug: `elementor.elements` fills
+    in *with* the preview, not before it, so early on both counts are 0 and agree.
+    It is kept because it is precise once the model is populated; the settling
+    check is what covers the window where it is not.
+  - The timeout is 120s: three Elementor editors booting at once on a slow site is
+    routinely tens of seconds, and failing early would report a working site as
+    broken.
+- **Every branch of `runTemplateOperation` must return a value.** One bare `return;`
+  survived on the "no template matches" path, and an automation run cannot tell
+  `undefined` from "the tool is not loaded in this tab" — which is exactly what it
+  reported, on a tab where the tool was loaded and working. A wrong diagnosis sent
+  the investigation in the wrong direction for a whole run.
+- **A phase that hard-fails leaves the page unsaved.** `ok: false` means the run
+  stopped somewhere it did not expect to, so what the model holds is unknown; not
+  saving leaves the server copy exactly as it was, which is both safe and
+  re-runnable. This does not conflict with "always save what was edited" — a page
+  that is not saved was never edited. A sync reporting `failed: 3` is a *different
+  thing* and **is** saved: carrying on past individual failures is what the sync is
+  designed to do, and discarding the rest of its work would make one bad container
+  cost the whole page.
+
+### The allowlist gates both halves
+
+One template selection drives the whole run. `template-sync`'s `auto` option bag
+carries `templateIds`, and `edge-presets.js` filters its presets against the same
+list — a preset whose template is not ticked does not run. Because a preset already
+knows its own template, **there is no separate preset → template mapping table
+anywhere**.
+
+- Without it a run updating two templates would re-sync the other thirty on every
+  page — a great deal of mutation nobody asked for, on pages nobody will review.
+- A ticked container can be reached by several templates (by id tag from one, by name
+  from another); under an allowlist only the allowed ones are inserted for it.
+
+### `auto` skips the confirm, and only there
+
+`runTemplateOperation(op, auto)` replaces the confirm checklist with the choices
+`auto` carries and returns a summary instead of only drawing one.
+
+CLAUDE.md's rule that the confirm is always shown is a rule about a **hotkey**, where
+the keypress is the only thing the user said. An automation run has already been
+specified page by page and template by template in its own GUI; re-asking inside
+each of a hundred editor tabs would not make it safer, it would make it impossible.
+The hotkey and the panel's Run button both call with nothing and still get the
+checklist — and the keydown path passes the *event* to its runner, which drops it,
+so an accidental keypress can never arrive looking like an automation run.
+
+Toggles are resolved in one place for both paths: `auto.toggles` is a key → boolean
+map and anything it omits falls back to that row's own `default`, so the group names
+stay in `OPS` and a drifted key degrades to the recommended state rather than
+silently to "off".
+
+### The GUI
+
+- **Two pickers, both searchable, and searching never narrows the selection.** A
+  ticked row hidden by a later search still counts, and the count line says how many
+  are hidden — so the number can never look wrong. The bulk button is labelled
+  **Shown**, not All, because that is what it ticks. Same rule as
+  `template-insert.js`.
+- **Documents to process covers Pages · Templates · Other.** Template documents are
+  selectable because a template can contain a tagged instance of *another* template,
+  and a pages-only run would never reach that copy. The Templates list serves both
+  the include-picker and that target tab — one fetch.
+- A document ticked on two tabs is one job: template ids and post ids are both
+  WordPress post ids, so the id alone is the identity.
+- **Run modes:** Sync + Edge Presets · Sync only · Edge Presets only. The last is the
+  fast one — no network at all per page.
+- **States.** Run: `idle → running → cancelling → finished | cancelled | error`.
+  Per document: `queued → opening → waiting → syncing → edge → saving → done |
+  failed | cancelled`. Three at once is only legible as three rows moving, which is
+  why progress is a row per document rather than a single bar.
+- **Reads go through `tab-bridge.js`**, the same ranked ask the panel uses — this
+  window has no page bridge either. `workingDomain` is deliberately the *same*
+  storage key the panel uses: it names the site being worked on, and two windows
+  disagreeing about that is the one setting that must never differ.
+- **The report is a download, not a file on disk.** An extension page has no
+  filesystem. `Copy log` and `Download report` (JSON: per-document state, note,
+  error and the full phase reports) are the honest version of that.
+- **The Edge Presets tab carries the manual `Run on page` button**, disabled while a
+  preset is unbound — an unbound preset matches nothing, and reporting zero
+  instances would read as a result rather than as unfinished authoring.
+- **That button names the document it dispatched to**, and it has to. Which editor
+  answers is the tab ranking's call — origin, then *active* — and this window is a
+  popup, so the editor on screen is often **not** the active tab: with two editors
+  open and a third tab active, both editors score equally and the first in query
+  order wins. Verified live, where a run intended for a page landed in the
+  template's own editor and correctly wrote nothing. Unnamed, that is
+  indistinguishable from a preset that matched nothing.
+- **A row button's label says what the click DOES, not what the state is.** It read
+  `Capturing` when armed once, and since `New preset` auto-arms, the first thing a
+  user meets on a fresh preset is that button — so clicking it to "select" the
+  preset silently disarmed it. It reads `✓ Stop capturing` now; which preset is
+  armed is already carried by the banner and the card border.
+
+### The activity log has one writer
+
+`ns.log` now sends its entry to `background.js`, which appends it. It used to do its
+own read-modify-write against `browser.storage.local`, which is a race — and an
+automation run makes it a certainty: three editor tabs are live at once, each logging
+steadily, and two overlapping `get`→`set` pairs silently drop whichever entry lost.
+Losing lines is not acceptable in the log whose whole job is to record what failed
+while nobody was watching.
+
+- The direct write stays as a **fallback**, so a line is never lost to a background
+  page that did not answer — that degrades to the old race rather than to nothing.
+- `LOG_LIMIT` went 50 → **500**, mirrored in `background.js` (the writer) and
+  `core_utils.js` (the fallback). A 50-entry window would have thrown away everything
+  but the last page or two of a hundred-document run. Change one, change both.
+- Sync failures that previously only reached the modal now also call `ns.log`. In an
+  automated run the tab is closed the moment the page is done, so a failure that only
+  ever reached a modal is a failure nobody will ever read.
+
+### Verified on a live site
+
+- **`document/save/default` resolves AFTER its ajax completes.** Measured on a real
+  page: the op took **5.7s** and came back `saved: true`, `status: "publish"`,
+  `stillChanged: false`, with `modified_gmt` advanced server-side and the content
+  persisted. So closing the tab immediately after the save is safe, and the
+  `stillChanged` read-back stays as the net rather than the only defence.
+- **A published page is republished, never downgraded to a draft.**
+- **A page the run did not change is not saved.** Verified by its `modified_gmt`
+  standing still across a run that reported `not saved — nothing changed`.
+- **A hard failure really does leave the page untouched.** A page whose sync failed
+  kept both its old `modified_gmt` and a deliberately planted marker value, while
+  its partner in the same run was saved.
+
+### Known risk, still unverified
+
+- **`browser.tabs.remove` versus Elementor's unsaved-changes prompt.** The cancel path
+  closes tabs that may hold unsaved changes. `tabs.remove` is expected to force-close
+  without running `beforeunload` dialogs; if it does not, a cancel will stall behind
+  a modal. Cancel has not been exercised on a live run yet.
+
 ## Pure container reset
 
 Two panel checkboxes, both **on by default**, riding one `document/elements/create` hook. **Both are scoped to one event: the user adding a new container.**
@@ -498,7 +861,7 @@ Every write reports to the **log** — no modal, since nothing here touches the 
 `Tools/breakpoint-flyout-page.js` adds two things to Elementor's panel, deliberately scoped differently. **There is no hotkey, no button and no field list.**
 
 - **Left-click a responsive field** — its label or the empty part of its row — opens a flyout showing that field at every active breakpoint at once, instead of cycling the device switcher one breakpoint at a time.
-- **Right-click any field at all** opens a small menu with Copy and Paste for that field's value.
+- **Right-click any field at all** opens a small menu with Copy and Paste for that field's value — plus **Capture** into the armed Edge Preset, when there is one and this is that template's editor. See Edge presets for why capture lives here: the flyout is where a field row can be clicked at all, and `controlInfo`/`sectionInfo` already resolve exactly what a capture needs.
 
 The row _is_ the affordance; there is no icon. Only the label and the row's own whitespace are clickable, and the cursor changes on exactly that region — a click on an input, the unit picker or Elementor's device switcher passes straight through, so nothing that used to work stops working. `PASSTHROUGH` expresses that as a rule about **structure** (every control nests its inputs under `.elementor-control-input-wrapper`, `.e-units-wrapper`, or the switcher div) rather than a blocklist of control types that would need extending each time Elementor adds one.
 
@@ -805,7 +1168,7 @@ Every row in the panel's Hotkeys list has a **Run** button beside it, so the too
 
 ### Dual-context files
 
-`template-format.js`, `hotkey-defaults.js` and `animation-preset-fields.js` are loaded **both** as content scripts and by `panel.html`, each assigning one global. The template usage index is the newest thing riding this: `findTemplateTags` runs in a content script and `buildUsageIndex` runs in the panel, and both live beside the tag regex they depend on so a reader and a writer cannot drift. `animation-preset-fields.js` is there because the panel authors preset files and the editor applies them: one side writes the comments and validates an import, the other reads the defaults and types, and a second copy of the field table is exactly how the two would drift. That is the mechanism for anything the panel and the editor must agree on — template metadata rendering, the search predicate, `normalizeTemplateList`, and Edit-URL construction all live in `template-format.js` precisely because `panel.js`, `template-insert.js`, `admin-templates.js` and `overlay.js` would otherwise drift. Neither file may touch `location` or the DOM at load time.
+`template-format.js`, `hotkey-defaults.js`, `animation-preset-fields.js`, `edge-preset-format.js` and `tab-bridge.js` are loaded **both** as content scripts (or by both extension windows) and by `panel.html`, each assigning one global. `edge-preset-format.js` is there because the editor captures into a preset and the Automation window authors, validates and exports one: the schema, the child-index path encoding and the tag-matching rule have to be a single definition. `tab-bridge.js` is the odd one — it is loaded by the two *windows* rather than by content scripts, because both ask the same ranked question of the same set of tabs and a forked ranking is what let a background editor answer for the wrong site once already. The template usage index is the newest thing riding this: `findTemplateTags` runs in a content script and `buildUsageIndex` runs in the panel, and both live beside the tag regex they depend on so a reader and a writer cannot drift. `animation-preset-fields.js` is there because the panel authors preset files and the editor applies them: one side writes the comments and validates an import, the other reads the defaults and types, and a second copy of the field table is exactly how the two would drift. That is the mechanism for anything the panel and the editor must agree on — template metadata rendering, the search predicate, `normalizeTemplateList`, and Edit-URL construction all live in `template-format.js` precisely because `panel.js`, `template-insert.js`, `admin-templates.js` and `overlay.js` would otherwise drift. Neither file may touch `location` or the DOM at load time.
 
 **The page world is outside this mechanism.** `page-bridge.js` is injected as a page-world script and cannot read a content-script global, so its `list-templates` op carries its own copy of the field mapping that `normalizeTemplateList` holds — the same boundary that keeps the template-tag regex out of it. Those two are the one sanctioned duplication here; change one, change both. Do not "fix" it by having the bridge reach for the global.
 

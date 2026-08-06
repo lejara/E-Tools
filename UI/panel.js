@@ -205,76 +205,18 @@ const TAB_REQUESTS = {
 // (Tools/admin-templates.js) and list-posts (Tools/wp-pages.js, which also runs
 // in the editor) but stays silent on run-action, so an editor-only message
 // simply falls through to the next candidate.
-const askElementorTab = async (message, { preferOrigin = "" } = {}) => {
-  const tabs = await browser.tabs.query({});
-  const urlOf = (t) => t.url || "";
-  // tab.url is only populated where the extension holds host permission for
-  // that tab; fall back to broadcasting rather than assuming it is there.
-  const editors = tabs.filter((t) => urlOf(t).includes("action=elementor"));
-  const admins = tabs.filter(
-    (t) => !editors.includes(t) && urlOf(t).includes("/wp-admin/"),
-  );
-  // One ranking across both kinds of tab, not editors-as-a-block followed by
-  // admins-as-a-block. Grouping first meant a background editor on any site
-  // outranked the wp-admin tab in front of the user, so list-templates went
-  // down the editor's page-bridge path while list-posts — which wp-pages.js
-  // answers in either tab — went to the admin one. Same panel, two sources,
-  // and only one of them failing.
-  //
-  //   origin  the Working Domain names the site being asked about, so another
-  //           client's tab must never answer for it
-  //   active  the tab in front of the user, which is the one they mean
-  //   editor  a tiebreak only: it can service every message, including
-  //           run-action, which an admin tab declines
-  //
-  // Ranking editor below active costs one declined message before run-action
-  // finds its tab, and buys the panel agreeing with what is on screen.
-  const matchesOrigin = (t) =>
-    !!preferOrigin && urlOf(t).startsWith(`${preferOrigin}/`);
-  const score = (t) =>
-    (matchesOrigin(t) ? 4 : 0) +
-    (t.active ? 2 : 0) +
-    (editors.includes(t) ? 1 : 0);
-  const known = [...editors, ...admins];
-  const candidates = (known.length ? known : tabs.slice()).sort(
-    (a, b) => score(b) - score(a),
-  );
-  for (const tab of candidates) {
-    try {
-      const reply = await browser.tabs.sendMessage(tab.id, message);
-      if (reply) return { tab, reply };
-    } catch (_) {
-      // No content script listening in that tab — expected for most of them.
-    }
-  }
-  return { tab: null, reply: null };
-};
+// Lives in tab-bridge.js, loaded by this page and by the Automation window. The
+// tab ranking is the part that must not fork: both windows are asking the same
+// question of the same set of tabs.
+const { askElementorTab, focusTab, openInNewTab } = window.__TabBridge;
 
-const focusTab = async (tab) => {
-  if (!tab) return;
-  try {
-    await browser.tabs.update(tab.id, { active: true });
-    if (tab.windowId !== undefined) {
-      await browser.windows.update(tab.windowId, { focused: true });
-    }
-  } catch (_) {
-    // The tab can be gone by now; the run itself already happened.
-  }
-};
-
-const openInNewTab = async (url) => {
-  // The panel lives in a popup window, which cannot hold tabs — put the tab in
-  // a normal browser window instead of letting it default to this one.
-  const wins = await browser.windows.getAll({});
-  const normal = wins.filter((w) => w.type === "normal");
-  const target = normal.find((w) => w.focused) || normal[0];
-  if (target) {
-    await browser.tabs.create({ url, windowId: target.id, active: true });
-    await browser.windows.update(target.id, { focused: true });
-    return;
-  }
-  await browser.windows.create({ url });
-};
+// The Automation window is its own popup, opened by the background script so the
+// focus-or-create rule lives in one place.
+document.getElementById("open-automation").addEventListener("click", () => {
+  browser.runtime
+    .sendMessage({ __elementorTools: true, type: "open-automation" })
+    .catch(() => {});
+});
 
 // ---- Template usage index ---------------------------------------------------
 // "Where is this template used?", answered by the template tag: every layer the

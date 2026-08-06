@@ -453,11 +453,27 @@
   // other way round it would flip a flag the user had deliberately switched off.
   let unlinkNewEnabled = false;
 
+  // Edge Preset capture state, pushed in over the same channel for the same
+  // reason: which preset is armed lives in browser.storage, and which document
+  // this editor has open is decided by the bridge's `describe-document` — one
+  // implementation of that heuristic, reached over a channel, rather than a
+  // second copy of it in this file.
+  //
+  // `{ id, name, templateId }` for the preset the Automation window has selected,
+  // and `{ isTemplate, id, title }` for this document. Both null until pushed,
+  // which correctly means "no capture offered".
+  let edgeArmed = null;
+  let edgeDoc = null;
+
   window.addEventListener("message", (event) => {
     if (event.source !== window) return;
     const d = event.data;
     if (!d || d.__bpf !== true || d.__config !== true) return;
-    unlinkNewEnabled = !!d.unlinkNew;
+    // Applied only where present, so the unlink flag and the edge state can be
+    // pushed independently without either clobbering the other's value.
+    if ("unlinkNew" in d) unlinkNewEnabled = !!d.unlinkNew;
+    if ("edgeArmed" in d) edgeArmed = d.edgeArmed || null;
+    if ("edgeDoc" in d) edgeDoc = d.edgeDoc || null;
   });
 
   // Honoured at commit, never at seed. Seeding isLinked into `working` looks like
@@ -990,6 +1006,130 @@
     };
   };
 
+  // ---------------------------------------------------------- edge capture
+
+  // Where this element sits, as the address an Edge Preset stores: which of the
+  // template's roots it is under (1-based, matching the tag and how every tool
+  // here labels roots) and the child-index path from that root down to it.
+  //
+  // Walks upward rather than searching down, because the element is the one the
+  // user right-clicked. It stops at the document container, whose direct children
+  // ARE the template's roots — which is the whole reason capture is restricted to
+  // a template's own editor: there is no tag to consult and none is needed.
+  //
+  // Parents are compared by id, never by identity: `children` hands back fresh
+  // wrappers, the same reason indexInParent in page-bridge.js falls back to an id
+  // match.
+  const edgeAddress = (container) => {
+    const root = window.elementor?.getPreviewContainer?.();
+    if (!root?.id) return { error: "cannot read the document root" };
+
+    const indexIn = (child, parent) => {
+      const kids = parent?.children;
+      const list = Array.isArray(kids)
+        ? kids
+        : kids && typeof kids.length === "number"
+          ? Array.from(kids)
+          : [];
+      return list.findIndex((c) => c && c.id === child.id);
+    };
+
+    const path = [];
+    let cursor = container;
+    let guard = 0;
+    while (cursor?.parent && cursor.parent.id !== root.id && guard++ < 64) {
+      const at = indexIn(cursor, cursor.parent);
+      if (at < 0) return { error: "lost track of the element's position" };
+      path.unshift(at);
+      cursor = cursor.parent;
+    }
+    if (!cursor?.parent || cursor.parent.id !== root.id) {
+      return { error: "this element is not inside one of the template's roots" };
+    }
+    const rootAt = indexIn(cursor, root);
+    if (rootAt < 0) return { error: "cannot place the template root" };
+
+    return {
+      root: rootAt + 1,
+      path,
+      elType: container.model?.get?.("elType") || null,
+      widgetType: container.model?.get?.("widgetType") || null,
+      label: container.settings?.get?.("_title") || "",
+    };
+  };
+
+  // Keyed by control KEY rather than by device — see edge-preset-format.js for
+  // why the preset format departs from the clipboard payload there. Staged values
+  // win while the flyout is open on this row, so capturing after editing captures
+  // what is on screen, exactly as copy does.
+  const edgeFieldValues = (info, row) => {
+    const staged = open && open.row === row ? open.working : null;
+    const values = {};
+    for (const { key } of info.entries) {
+      values[key] =
+        staged && key in staged
+          ? copyValue(staged[key])
+          : copyValue(info.container.settings.get(key));
+    }
+    return values;
+  };
+
+  const doCapture = async (info, row) => {
+    if (!edgeArmed) return { ok: false, error: "No edge preset selected" };
+    if (!edgeDoc?.isTemplate) {
+      return { ok: false, error: "Open the template's own editor to capture" };
+    }
+    if (
+      edgeArmed.templateId &&
+      String(edgeArmed.templateId) !== String(edgeDoc.id)
+    ) {
+      return {
+        ok: false,
+        error: `"${edgeArmed.name}" is bound to template #${edgeArmed.templateId}`,
+      };
+    }
+    // Asked here and now rather than pushed in with the config: it changes on
+    // every keystroke. A snapshot taken from an unsaved template is a preset that
+    // silently disagrees with the template it names — and under a snapshot format
+    // there is nothing downstream that could ever notice.
+    if (window.elementor?.saver?.isEditorChanged?.() !== false) {
+      return {
+        ok: false,
+        error: "Unsaved changes — update the template first",
+      };
+    }
+
+    const address = edgeAddress(info.container);
+    if (address.error) return { ok: false, error: address.error };
+
+    const field =
+      info.scope === "section"
+        ? {
+            scope: "section",
+            section: info.section,
+            label: info.label,
+            values: sectionValues(info),
+          }
+        : {
+            scope: "field",
+            control: info.base,
+            label: info.label,
+            type: info.type,
+            responsive: info.responsive,
+            values: edgeFieldValues(info, row),
+          };
+
+    const res = await askContentScript("edge-capture", {
+      presetId: edgeArmed.id,
+      templateId: edgeDoc.id,
+      templateTitle: edgeDoc.title || "",
+      ...address,
+      field,
+    });
+    if (!res.ok) return { ok: false, error: res.error || "Capture failed" };
+    return { ok: true, note: res.note };
+  };
+
   // ------------------------------------------------------------------ menu
 
   let menu = null;
@@ -1054,6 +1194,14 @@
 
     item(copyText, () => doCopy(info, row));
     item(pasteText, () => doPaste(info, row));
+
+    // Offered whenever a preset is armed. Every other condition — right editor,
+    // right template, template saved — is reported on click rather than by
+    // hiding the item, so a refusal explains itself instead of leaving the user
+    // wondering where Capture went.
+    if (edgeArmed) {
+      item(`Capture into "${edgeArmed.name}"`, () => doCapture(info, row));
+    }
 
     document.body.appendChild(root);
     place(root, new DOMRect(x, y, 0, 0));

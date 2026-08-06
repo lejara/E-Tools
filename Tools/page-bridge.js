@@ -1529,7 +1529,23 @@
         }
       };
       walk(root, null, 0);
-      return { containers: out };
+      // How many top-level elements the DOCUMENT MODEL says there are, so a caller
+      // can tell a finished walk from one that raced the preview's rendering.
+      //
+      // This exists because an automation run read an empty container list from a
+      // still-building editor, got `ok: true`, and concluded the page held no
+      // templates — on a page with five top-level containers. The model is
+      // populated from the saved data up front while the views render after, so
+      // comparing the two is what says "the preview has caught up".
+      //
+      // Measured on this build: a settled editor reports `elementor.elements.length`
+      // equal to the number of depth-0 containers this walk finds. `null` where the
+      // collection is unreadable, so a caller degrades to not checking rather than
+      // to never being ready.
+      return {
+        containers: out,
+        topLevelExpected: window.elementor?.elements?.length ?? null,
+      };
     },
     // Collapses the whole sync (potentially hundreds of $e.run calls) into a
     // single undo step. Non-fatal: a null logId just means no grouping.
@@ -1550,6 +1566,221 @@
         window.$e?.internal?.("document/history/end-log", { id: logId });
       } catch (_) {}
       return {};
+    },
+    // Which document this editor has open. Read for three separate jobs, which
+    // is why it answers all of them at once: the Automation window's "you are
+    // in" line, the gate on Edge Preset capture (template editor only, and not
+    // while dirty), and the save decision below.
+    //
+    // Every field is taken from the first of several candidates and the op says
+    // which one answered, the same tactic list-templates uses for date fields and
+    // describe-selection uses for `via`. Elementor exposes a document through
+    // both `documents.getCurrent()` and `config.document` and the two are not
+    // identically shaped across versions.
+    "describe-document": async () => {
+      const doc = window.elementor?.documents?.getCurrent?.() || null;
+      const cfg = doc?.config || window.elementor?.config?.document || null;
+      if (!cfg) throw new Error("no current Elementor document");
+
+      const first = (...values) => {
+        for (const v of values) {
+          if (v !== undefined && v !== null && v !== "") return v;
+        }
+        return null;
+      };
+      const unwrap = (v) => (v && typeof v === "object" ? v.value ?? null : v);
+
+      // A library template must be told apart from a page with certainty,
+      // because capture binds a preset to whatever this says. Three independent
+      // signals, tried in order, and `via` reports which one spoke — a wrong
+      // answer here is diagnosable instead of mysterious. Failing all three means
+      // "not a template", which makes capture refuse: the safe direction, since
+      // the alternative is binding a preset to a page id that names no template.
+      const urls = cfg.urls || {};
+      let isTemplate = false;
+      let via = "none";
+      if (cfg.post_type === "elementor_library") {
+        isTemplate = true;
+        via = "post_type";
+      } else if (/post_type=elementor_library/.test(String(urls.exit_to_dashboard || ""))) {
+        isTemplate = true;
+        via = "exit_to_dashboard";
+      } else if (/[?&]elementor_library=/.test(String(urls.permalink || ""))) {
+        isTemplate = true;
+        via = "permalink";
+      }
+
+      return {
+        id: first(doc?.id, cfg.id),
+        title: first(
+          doc?.container?.settings?.get?.("post_title"),
+          cfg.settings?.settings?.post_title,
+          cfg.panel?.title,
+        ),
+        status: unwrap(
+          first(cfg.status, doc?.container?.settings?.get?.("post_status")),
+        ),
+        docType: unwrap(first(cfg.type, cfg.doc_type)),
+        isTemplate,
+        isTemplateVia: via,
+        // The one field with no fallback, and it must not be guessed: a false
+        // "clean" would let a capture snapshot a value the template does not
+        // have. Null means unknown, and every caller treats that as dirty.
+        isDirty: window.elementor?.saver?.isEditorChanged?.() ?? null,
+      };
+    },
+    // The automation saves what it edited. Nothing else in this extension ever
+    // reaches for save — a sync only touches the in-editor model, which is why a
+    // run whose tab is closed changes nothing.
+    //
+    // `document/save/default` decides publish-vs-draft from the post's own
+    // status, which is exactly the wanted behaviour: a published page is
+    // republished, and a draft stays a draft rather than being pushed live by a
+    // batch the user pointed at a hundred pages.
+    "save-document": async ({ force = false } = {}) => {
+      const changed = window.elementor?.saver?.isEditorChanged?.();
+      // Skipping an unchanged document is not an optimisation, it is the point:
+      // saving it anyway moves `post_modified` and writes a revision for a page
+      // the run decided not to touch.
+      if (!force && changed === false) {
+        return { saved: false, why: "no changes to save" };
+      }
+      await runCommand("document/save/default", {});
+      const cfg =
+        window.elementor?.documents?.getCurrent?.()?.config ||
+        window.elementor?.config?.document ||
+        {};
+      const status = cfg.status;
+      return {
+        saved: true,
+        status: status && typeof status === "object" ? status.value : status,
+        stillChanged: window.elementor?.saver?.isEditorChanged?.() ?? null,
+      };
+    },
+    // Write an Edge Preset's captured fields onto the instances the content
+    // script has already resolved. It hands over `rootId`s it matched by template
+    // tag; this walks the child-index path inside each one and writes.
+    //
+    // Page-side in one round trip for the same reason apply-style-pairs is: a
+    // preset over a page with several instances is dozens of nodes, and a
+    // postMessage pair per node made the messaging cost more than the Elementor
+    // commands.
+    //
+    // THE TYPE CHECK IS THE WHOLE SAFETY MODEL. A child index is a position, and
+    // deleting a layer above the target shifts every index after it. So the
+    // captured signature is compared against what the path actually landed on and
+    // a mismatch SKIPS — it never writes and never tries to repair the path.
+    // Repair would mean aligning the instance against the template (pairTrees),
+    // which needs the template's own JSON and is deliberately out of scope: a
+    // preset applies with no network call at all, and a wrong write to a real
+    // page is far worse than a reported skip.
+    //
+    // Only the leaf is checked. An intermediate step that diverged almost always
+    // produces a wrong leaf type anyway, and storing the whole chain to catch the
+    // rest would buy detection the skip already gives.
+    "apply-edge-preset": async ({ targets }) => {
+      const list = Array.isArray(targets) ? targets : [];
+      const results = [];
+      for (const target of list) {
+        const root = getContainer(target.rootId);
+        const nodes = [];
+        for (const node of target.nodes || []) {
+          const path = Array.isArray(node.path) ? node.path : [];
+          let cursor = root;
+          let missAt = null;
+          for (let i = 0; i < path.length; i++) {
+            const next = childContainers(cursor)[path[i]];
+            if (!next) {
+              missAt = i;
+              break;
+            }
+            cursor = next;
+          }
+          if (missAt !== null) {
+            nodes.push({
+              key: node.key,
+              ok: false,
+              why: `path ran off the end at step ${missAt + 1} of ${path.length}`,
+            });
+            continue;
+          }
+
+          const elType = cursor.model?.get?.("elType") || null;
+          const widgetType = cursor.model?.get?.("widgetType") || null;
+          const found = widgetType
+            ? `widget:${widgetType}`
+            : String(elType || "element");
+          if (node.expect && node.expect !== found) {
+            nodes.push({
+              key: node.key,
+              ok: false,
+              id: cursor.id,
+              title: containerTitle(cursor),
+              found,
+              why: `expected ${node.expect}, found ${found}`,
+            });
+            continue;
+          }
+
+          const controls = cursor.settings?.controls || {};
+          const settings = {};
+          const applied = [];
+          const skipped = [];
+          for (const field of node.fields || []) {
+            for (const [key, value] of Object.entries(field.values || {})) {
+              const mapped = resolveControlKey(controls, key);
+              if (!mapped) {
+                skipped.push({ key, why: "no such control on this element" });
+                continue;
+              }
+              // Only a single-field capture carries one authoritative type; a
+              // section holds many, so there is nothing to compare it against.
+              const targetType = controls[mapped]?.type;
+              if (
+                field.scope === "field" &&
+                field.type &&
+                targetType &&
+                targetType !== field.type
+              ) {
+                skipped.push({
+                  key,
+                  why: `type mismatch (${field.type} vs ${targetType})`,
+                });
+                continue;
+              }
+              settings[mapped] = value;
+              applied.push(mapped);
+            }
+          }
+
+          // Default render, and options.external stays off — the same pair of
+          // reasons as apply-preset-settings: these controls carry selectors so
+          // the model change alone would leave the preview stale, and external
+          // re-renders the element, which is what made a populated container
+          // vanish from the preview (see `rename`).
+          if (applied.length) {
+            await runCommand("document/elements/settings", {
+              containers: [cursor],
+              settings,
+            });
+          }
+          nodes.push({
+            key: node.key,
+            ok: true,
+            id: cursor.id,
+            title: containerTitle(cursor),
+            found,
+            applied,
+            skipped,
+          });
+        }
+        results.push({
+          rootId: target.rootId,
+          rootTitle: containerTitle(root),
+          nodes,
+        });
+      }
+      return { results };
     },
     "list-templates": async ({ source = "local" } = {}) => {
       if (!window.wpApiSettings?.nonce) {

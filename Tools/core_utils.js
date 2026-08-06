@@ -3,11 +3,33 @@
 
   const ns = (window.__ElementorTools = window.__ElementorTools || {});
 
-  const LOG_LIMIT = 50;
+  // Raised from 50 for the automation: a run over a hundred documents logs a
+  // steady stream, and a 50-entry window would have thrown away everything but
+  // the last page or two by the time anyone read it. Mirrored in background.js,
+  // which is the writer — change one, change both.
+  const LOG_LIMIT = 500;
   const NAV_ELEMENT = ".elementor-navigator__element[data-id]";
 
+  // Appended through the background script rather than written here, because the
+  // read-modify-write below is a race and an automation run makes it a certainty:
+  // three editor tabs are live at once, each logging steadily, and two overlapping
+  // get→set pairs silently drop whichever entry lost. Losing lines is not
+  // acceptable in a log whose whole job is to say what failed while nobody was
+  // watching. One writer in the background serialises them.
+  //
+  // The direct write stays as a fallback so a log line is never lost to a
+  // background page that did not answer — that degrades to the old behaviour,
+  // which is a race rather than nothing.
   const log = async (level, message) => {
     const entry = { level, message, time: Date.now() };
+    try {
+      const res = await browser.runtime.sendMessage({
+        __elementorTools: true,
+        type: "log-entry",
+        entry,
+      });
+      if (res?.ok) return;
+    } catch (_) {}
     try {
       const { logs = [] } = await browser.storage.local.get("logs");
       const next = [entry, ...logs].slice(0, LOG_LIMIT);
@@ -97,6 +119,7 @@
     "copy",
     "describe-tree",
     "describe-selection",
+    "describe-document",
     "inspect-template",
     "list-containers",
     "list-template-widgets",
