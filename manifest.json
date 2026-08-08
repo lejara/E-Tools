@@ -62,6 +62,7 @@
         "Tools/wp-rest.js",
         "Tools/admin-templates.js",
         "Tools/wp-pages.js",
+        "Tools/slug-transfer.js",
         "Tools/template-index.js",
         "Automation/automation-agent.js",
         "hotkey-defaults.js",

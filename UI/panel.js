@@ -43,6 +43,11 @@ const presetNewBtn = document.getElementById("preset-new");
 const presetImportBtn = document.getElementById("preset-import");
 const presetFileEl = document.getElementById("preset-file");
 const presetDelayEl = document.getElementById("preset-delay");
+const slugCsvBtn = document.getElementById("slug-csv");
+const slugRunBtn = document.getElementById("slug-run");
+const slugFileEl = document.getElementById("slug-file");
+const slugStatusEl = document.getElementById("slug-status");
+const slugReportEl = document.getElementById("slug-report");
 const hotkeysEl = document.getElementById("hotkeys");
 const resetAllHotkeysBtn = document.getElementById("reset-all-hotkeys");
 const hotkeyErrorEl = document.getElementById("hotkey-error");
@@ -1355,6 +1360,512 @@ presetDelayEl.addEventListener("change", () => {
   });
 });
 
+// ---- Slug & SEO transfer ----------------------------------------------------
+// One button that moves each CSV row's slug, SEO title and SEO description onto
+// the page named in its `new_page` column, renaming whatever already holds that
+// slug to "<slug>-alt" first. Tools/slug-transfer.js is the engine — nothing is
+// installed on the site, it drives core REST plus Rank Math's own updateMeta
+// route. This half holds the CSV and the confirm.
+//
+// THE CSV IS DATA, NOT CODE. It is picked here and parsed here, and the rows
+// travel with the request. Nothing about it is stored on the server, so
+// correcting a row is picking the file again — no plugin re-upload, no generated
+// PHP to go stale, and no second copy for the two halves to disagree about.
+const SLUG_CSV_KEY = "slugTransferCsv";
+// Destructuring this directly was a live hazard: a missing global throws a
+// TypeError at load, which aborts the REST of panel.js — the storage read, the
+// hotkey list, every listener below this line. One unloaded file would present as
+// a panel that renders nothing and answers nothing, with the cause thirty
+// sections away. Same reasoning, same fix, as the `missing` guard in
+// Tools/admin-templates.js: carry on and say what did not load.
+const slugFormat = window.__SlugTransferFormat || null;
+const readCsv = slugFormat
+  ? slugFormat.readCsv
+  : () => ({
+      rows: [],
+      skipped: [],
+      warnings: [],
+      error:
+        "slug-transfer-format.js did not load — check the <script> tags in UI/panel.html",
+    });
+
+// { fileName, loadedAt, rows, skipped, warnings } — persisted, so the CSV is
+// loaded once rather than every time the panel is reopened.
+let slugCsv = null;
+// The dry run's result, and the armed state: with a plan in hand the button
+// applies it. Cleared by anything that could make the plan untrue — a new CSV, a
+// failure, a different site answering.
+let slugPlan = null;
+let slugPlanOrigin = "";
+let slugResult = null;
+let slugBusy = false;
+// Whether the in-flight run is an apply or another read. Not derivable from
+// slugPlan: a zero-write plan is still a plan, and clicking it re-reads.
+let slugApplying = false;
+let slugError = "";
+
+const NO_WP_TAB =
+  "No WordPress admin tab open — open wp-admin on the Working Domain, then Run.";
+
+// The transfer's durable record. Everything else it says lives in the status line
+// and the report box, and both are gone the moment the panel is closed or the CSV
+// is reloaded — which is exactly the wrong property for the one feature here that
+// rewrites live URLs. A run that moved seven pages' addresses has to leave a trace
+// somebody can read afterwards.
+//
+// Goes through background.js, the single writer, for the reason CLAUDE.md gives:
+// concurrent read-modify-write against storage.local silently drops entries. The
+// direct write is the same fallback core_utils.js keeps, so a line is never lost
+// to a background page that did not answer.
+const slugLog = async (level, message) => {
+  const entry = { level, message: `Slug transfer: ${message}`, time: Date.now() };
+  try {
+    const res = await browser.runtime.sendMessage({
+      __elementorTools: true,
+      type: "log-entry",
+      entry,
+    });
+    if (res?.ok) return;
+  } catch (_) {}
+  try {
+    const { logs = [] } = await browser.storage.local.get("logs");
+    await browser.storage.local.set({ logs: [entry, ...logs].slice(0, 500) });
+  } catch (_) {}
+};
+
+// One line per row, saying what actually happened to it rather than what was
+// planned. Written for both phases: a plan nobody applied is still worth being
+// able to look back at, and it is the only way to tell "the run did nothing"
+// apart from "the run was never reached".
+const logSlugReport = async (report) => {
+  const s = report.summary || {};
+  const phase = report.dry_run ? "planned" : "APPLIED";
+  await slugLog(
+    s.failed ? "warn" : "info",
+    `${phase} on ${report.site} — ${s.rows} row(s), ${s.slugs_set} slug(s), ` +
+      `${s.reparented || 0} moved, ${s.renamed} renamed to -alt, ${s.seo_set} SEO field(s), ` +
+      `${s.already} already correct, ${s.failed} failed ` +
+      `(auto-redirect ${report.auto_redirect === true ? "ON" : report.auto_redirect === false ? "off" : "unknown"})`,
+  );
+  for (const warning of report.warnings || []) await slugLog("warn", warning);
+  for (const row of report.rows || []) {
+    if (row.error) {
+      await slugLog("error", `${row.slug} (line ${row.line}) — ${row.error}`);
+      continue;
+    }
+    const bits = [];
+    if (row.slug_action === "done") bits.push(`slug → ${row.slug_written || row.slug}`);
+    else if (row.slug_action === "set") bits.push(`slug ${row.target?.slug} → ${row.slug}`);
+    else if (row.slug_action === "already") bits.push("slug already correct");
+    const where = row.parent_slug ? `"${row.parent_slug}"` : "top level";
+    if (row.parent_action === "done") bits.push(`moved under ${where}`);
+    else if (row.parent_action === "set") bits.push(`parent → ${where}`);
+    else if (row.parent_action === "skipped" || row.parent_action === "failed") {
+      bits.push(`parent NOT set (${row.parent_note || "unknown"})`);
+    }
+    for (const occ of row.renames || []) {
+      bits.push(`#${occ.id} ${occ.slug} → ${occ.new_slug || occ.rename_to}`);
+    }
+    const seo = (row.seo || []).filter((x) => x.action === "done" || x.action === "set");
+    if (seo.length) bits.push(`${seo.length} SEO field(s)`);
+    const bad = (row.seo || []).filter((x) => x.action === "failed");
+    if (bad.length) bits.push(`${bad.length} SEO field(s) FAILED`);
+    if (row.front_page) {
+      bits.push(`front page → #${row.front_page.to}${row.front_page.result ? ` (${row.front_page.result})` : ""}`);
+    }
+    await slugLog(
+      bad.length ? "warn" : "info",
+      `${row.slug} (line ${row.line}) #${row.target?.id} — ${bits.join(", ") || "nothing to do"}`,
+    );
+  }
+};
+
+const slugRowCount = () => slugCsv?.rows?.length || 0;
+
+// How many writes the plan actually amounts to. It is the button's label, so it
+// has to count the same things the run reports: a slug that is already right and
+// SEO that already matches are not changes, and a plan of zero must not read as
+// "ready to apply".
+const slugPlanWrites = (plan) => {
+  if (!plan) return 0;
+  let n = 0;
+  for (const row of plan.rows || []) {
+    if (row.error) continue;
+    if (row.slug_action === "set") n += 1;
+    if (row.parent_action === "set") n += 1;
+    n += (row.renames || []).length;
+    for (const seo of row.seo || []) if (seo.action === "set") n += 1;
+    if (row.front_page) n += 1;
+  }
+  return n;
+};
+
+const slugSub = (parent, text, tone = "") => {
+  const el = document.createElement("div");
+  el.className = tone ? `sub ${tone}` : "sub";
+  el.textContent = text;
+  parent.appendChild(el);
+};
+
+const SEO_LABEL = { title: "SEO title", desc: "SEO description" };
+const SEO_TONE = { set: "act", done: "done", failed: "warn", already: "" };
+
+const renderSlugRow = (row, applied) => {
+  const wrap = document.createElement("div");
+  wrap.className = "content-row st-row";
+  const line = document.createElement("div");
+  line.className = "template";
+  const text = document.createElement("div");
+  text.className = "text";
+
+  const name = document.createElement("div");
+  name.className = row.error ? "name bad" : "name";
+  name.textContent = row.slug;
+  text.appendChild(name);
+
+  if (row.error) {
+    slugSub(text, row.error, "warn");
+  }
+  if (row.target) {
+    slugSub(
+      text,
+      `${row.target.title || "(untitled)"} · #${row.target.id} · ` +
+        `${row.target.post_type} · ${row.target.status} · /${row.target.path}/`,
+    );
+  } else if (!row.error) {
+    slugSub(text, row.new_page);
+  }
+
+  if (row.slug_action === "set") {
+    slugSub(text, `slug: ${row.target?.slug} → ${row.slug}`, "act");
+  } else if (row.slug_action === "done") {
+    slugSub(text, `slug set to ${row.slug_written || row.slug}`, "done");
+  } else if (row.slug_action === "already") {
+    slugSub(text, `slug already ${row.slug} — left alone`);
+  } else if (row.slug_action === "suffixed") {
+    slugSub(text, `slug became ${row.slug_written}`, "warn");
+  }
+
+  // The move gets its own line, like the front page does, because it changes a
+  // live URL on its own — a page can keep its slug and still end up somewhere
+  // else entirely.
+  const parentLabel = row.parent_slug ? `"${row.parent_slug}"` : "top level";
+  if (row.parent_action === "set") {
+    slugSub(text, `parent: → ${parentLabel} (#${row.parent_to || 0})`, "act");
+  } else if (row.parent_action === "done") {
+    slugSub(text, `moved under ${parentLabel}`, "done");
+  } else if (row.parent_action === "skipped" || row.parent_action === "failed") {
+    slugSub(text, `parent not set — ${row.parent_note || "unknown"}`, "warn");
+  }
+  if (row.parent_error) {
+    slugSub(text, `parent "${row.parent_slug}": ${row.parent_error}`, "warn");
+  }
+
+  for (const occ of row.renames || []) {
+    const done = occ.result === "renamed";
+    slugSub(
+      text,
+      `-alt: "${occ.title || "(untitled)"}" #${occ.id} ${occ.slug} → ` +
+        `${occ.new_slug || occ.rename_to}${done ? "" : occ.result ? ` (${occ.result})` : ""}`,
+      done ? "done" : occ.result ? "warn" : "act",
+    );
+  }
+  for (const other of row.same_name || []) {
+    // No path on these — they come straight off the collision search, which
+    // reads a flat list and never walks a parent chain. Naming the parent id is
+    // both cheaper and more useful, since "which parent" is the entire reason
+    // this row is being left alone.
+    slugSub(
+      text,
+      `left alone: #${other.id} "${other.slug}" ` +
+        `(parent ${other.parent || "top level"}) — ${other.why}`,
+    );
+  }
+
+  for (const seo of row.seo || []) {
+    const label = SEO_LABEL[seo.field] || seo.field;
+    if (seo.action === "none-in-csv") {
+      slugSub(text, `${label}: none in CSV — not touched`);
+    } else if (seo.action === "already") {
+      slugSub(text, `${label}: already matches`);
+    } else if (seo.action === "failed") {
+      slugSub(text, `${label}: write failed`, "warn");
+    } else {
+      slugSub(
+        text,
+        `${label}: ${applied ? "written" : "will set"} — ${seo.value}`,
+        SEO_TONE[seo.action] || "act",
+      );
+    }
+  }
+
+  // The front page is the one line here that changes what a visitor sees at the
+  // site root, so it gets its own row rather than riding along in a note.
+  if (row.front_page) {
+    const fp = row.front_page;
+    slugSub(
+      text,
+      `front page: #${fp.from} "${fp.from_title}" → #${fp.to} "${fp.to_title}"` +
+        (fp.result ? ` (${fp.result})` : ""),
+      fp.result && fp.result !== "done" ? "warn" : fp.result ? "done" : "act",
+    );
+  }
+
+  for (const note of row.notes || []) slugSub(text, note, "warn");
+
+  line.appendChild(text);
+
+  // Which spreadsheet row this is. A report that says "no post found" is only
+  // actionable if you can find the row it came from, and a slug is not what the
+  // CSV is sorted by.
+  if (row.line) {
+    const where = document.createElement("div");
+    where.className = "type";
+    where.textContent = `line ${row.line}`;
+    line.appendChild(where);
+  }
+
+  // The one row action worth having: a plan that names the wrong page is only
+  // recognisable by opening it, and every row here is about to have its URL
+  // rewritten.
+  if (row.target?.edit_link) {
+    const actions = document.createElement("div");
+    actions.className = "row-actions";
+    const edit = document.createElement("a");
+    edit.className = "edit";
+    edit.textContent = "Edit";
+    edit.href = row.target.edit_link;
+    edit.target = "_blank";
+    edit.rel = "noopener";
+    actions.appendChild(edit);
+    line.appendChild(actions);
+  }
+
+  wrap.appendChild(line);
+  return wrap;
+};
+
+const renderSlugReport = () => {
+  const report = slugResult || slugPlan;
+  if (!report) {
+    slugReportEl.hidden = true;
+    slugReportEl.replaceChildren();
+    return;
+  }
+  slugReportEl.hidden = false;
+  const kids = [];
+
+  const head = document.createElement("div");
+  head.className = "usages-note";
+  const s = report.summary || {};
+  // auto_redirect is stated on every report, not only when it blocks. It is the
+  // one setting that decides whether a clean-looking run is actually clean, so
+  // "it was off when this ran" belongs in the record.
+  const auto =
+    report.auto_redirect === true
+      ? "auto-redirect ON"
+      : report.auto_redirect === false
+        ? "auto-redirect off"
+        : "auto-redirect unknown";
+  head.textContent =
+    `${report.dry_run ? "Plan" : "Applied"} on ${report.site} · ` +
+    `SEO: ${report.seo?.label || "none detected"} · ${auto} · ` +
+    `${s.rows} row(s), ${s.slugs_set} slug(s), ${s.reparented || 0} moved, ` +
+    `${s.renamed} renamed to -alt, ` +
+    `${s.seo_set} SEO field(s), ${s.already} already correct, ${s.failed} failed`;
+  kids.push(head);
+
+  for (const warning of report.warnings || []) {
+    const el = document.createElement("div");
+    el.className = "usages-note";
+    el.style.color = "#e0b060";
+    el.textContent = warning;
+    kids.push(el);
+  }
+
+  for (const row of report.rows || []) {
+    kids.push(renderSlugRow(row, !report.dry_run));
+  }
+  slugReportEl.replaceChildren(...kids);
+};
+
+const renderSlug = () => {
+  const rows = slugRowCount();
+  const writes = slugPlanWrites(slugPlan);
+
+  slugCsvBtn.disabled = slugBusy;
+  slugRunBtn.disabled = slugBusy || !rows;
+  slugRunBtn.classList.toggle("armed", !!slugPlan && writes > 0);
+  // A plan with nothing in it leaves the button reading "Run", not "Apply 0" —
+  // clicking then re-reads the site, which is the only useful thing left to do.
+  // An enabled button that returns early is a dead button.
+  slugRunBtn.textContent = slugBusy ? "…" : slugPlan && writes ? `Apply ${writes}` : "Run";
+
+  const bits = [];
+  if (!slugCsv) {
+    bits.push("No CSV loaded — click CSV… to pick the migration file");
+  } else {
+    bits.push(`${slugCsv.fileName}: ${rows} row(s)`);
+    if (slugCsv.skipped?.length) {
+      bits.push(`${slugCsv.skipped.length} without a new_page (skipped)`);
+    }
+    for (const w of slugCsv.warnings || []) bits.push(w);
+  }
+  if (slugBusy) {
+    bits.push(slugApplying ? "applying…" : "reading the site…");
+  } else if (slugPlan) {
+    bits.push(
+      writes
+        ? "review the plan below, then click Apply — this rewrites live URLs"
+        : "nothing left to do; the site already matches the CSV",
+    );
+  }
+
+  slugStatusEl.textContent = slugError || bits.join(" · ");
+  slugStatusEl.classList.toggle("error", !!slugError);
+  renderSlugReport();
+};
+
+const loadSlugCsv = async (file) => {
+  slugError = "";
+  let text = "";
+  try {
+    text = await file.text();
+  } catch (err) {
+    slugError = `Could not read that file — ${err?.message || err}`;
+    renderSlug();
+    return;
+  }
+  const parsed = readCsv(text);
+  if (parsed.error) {
+    slugError = parsed.error;
+    slugLog("error", `could not read ${file.name} — ${parsed.error}`);
+    renderSlug();
+    return;
+  }
+  if (!parsed.rows.length) {
+    slugError =
+      "No rows with a new_page — that column names the page that receives the slug, " +
+      "so there is nothing to transfer yet";
+  }
+  slugCsv = { fileName: file.name, loadedAt: Date.now(), ...parsed };
+  // A plan describes the CSV it was built from. A new file makes it a promise
+  // about rows that may no longer exist, so it is dropped rather than re-labelled.
+  slugPlan = null;
+  slugPlanOrigin = "";
+  slugResult = null;
+  await browser.storage.local.set({ [SLUG_CSV_KEY]: slugCsv });
+  slugLog(
+    parsed.rows.length ? "info" : "warn",
+    `loaded ${file.name} — ${parsed.rows.length} row(s) with a new_page, ` +
+      `${parsed.skipped.length} skipped without one` +
+      (parsed.warnings.length ? `; ${parsed.warnings.length} warning(s)` : ""),
+  );
+  for (const w of parsed.warnings) slugLog("warn", `${file.name}: ${w}`);
+  renderSlug();
+};
+
+const runSlugTransfer = async () => {
+  if (slugBusy || !slugRowCount()) return;
+  // Only a plan that would actually write anything arms the button. A zero-write
+  // plan falls back to re-planning, matching the label renderSlug() gave it.
+  const applying = !!slugPlan && slugPlanWrites(slugPlan) > 0;
+
+  slugBusy = true;
+  slugApplying = applying;
+  slugError = "";
+  renderSlug();
+
+  const preferOrigin = parseWorkingDomain(workingDomain)?.origin || "";
+  // Logged before the ask, not after. "Nothing happened" is the failure this is
+  // for, and a run that never got a reply leaves no other evidence it was even
+  // attempted — the status line goes back to idle and looks identical to a button
+  // that was never clicked.
+  slugLog(
+    "info",
+    `${applying ? "APPLY" : "plan"} requested — ${slugCsv.rows.length} row(s)` +
+      `${preferOrigin ? `, expecting ${preferOrigin}` : ", no Working Domain set"}`,
+  );
+  try {
+    const { reply } = await askElementorTab(
+      {
+        __elementorTools: true,
+        type: "slug-transfer",
+        options: { rows: slugCsv.rows, dryRun: !applying },
+      },
+      { preferOrigin },
+    );
+    if (!reply) throw new Error(NO_WP_TAB);
+
+    // Which site answered is the one thing worth refusing over. The tab ranking
+    // PREFERS the Working Domain, it does not guarantee it — a popup panel has no
+    // active tab of its own, so with no wp-admin tab open on that origin some
+    // other site's tab will happily answer. Rewriting one client's page URLs
+    // because their tab was open is not a mistake a report can undo.
+    const answered = reply.origin || "";
+    if (preferOrigin && answered && answered !== preferOrigin) {
+      throw new Error(
+        `${answered} answered, not the Working Domain (${preferOrigin}) — ` +
+          "open wp-admin there and try again",
+      );
+    }
+    // And the apply has to land on the same site the plan was read from. Planning
+    // on staging and applying wherever the ranking points next is the same
+    // failure arriving a click later.
+    if (applying && slugPlanOrigin && answered !== slugPlanOrigin) {
+      throw new Error(
+        `the plan was read from ${slugPlanOrigin} but ${answered} answered — ` +
+          "nothing was applied, Run again to re-plan",
+      );
+    }
+    if (!reply.ok) throw new Error(reply.error);
+    // An `ok` with no report is a broken contract, not a broken site, and it has
+    // to say which. It shipped once — the engine returned the report flattened
+    // into the reply, so `ok` was true and `result` undefined, and the only
+    // symptom was "can't access property summary, report is undefined" from
+    // whichever line touched it first. Name the cause here instead.
+    if (!reply.result?.summary) {
+      throw new Error(
+        "the responding tab answered ok but sent no report — reload the extension " +
+          "so Tools/slug-transfer.js matches this panel, then Run again",
+      );
+    }
+
+    if (applying) {
+      slugResult = reply.result;
+      slugPlan = null;
+      slugPlanOrigin = "";
+    } else {
+      slugPlan = reply.result;
+      slugPlanOrigin = answered;
+      slugResult = null;
+    }
+    await logSlugReport(reply.result);
+  } catch (err) {
+    slugError = err?.message || String(err);
+    slugLog("error", `${applying ? "apply" : "plan"} failed — ${slugError}`);
+    // Disarmed on any failure. The site may have moved under the plan — half of
+    // pass A can have landed — so the next click has to read it again rather than
+    // apply a plan that was true a moment ago.
+    slugPlan = null;
+    slugPlanOrigin = "";
+  } finally {
+    slugBusy = false;
+    slugApplying = false;
+    renderSlug();
+  }
+};
+
+slugCsvBtn.addEventListener("click", () => slugFileEl.click());
+slugFileEl.addEventListener("change", () => {
+  const file = slugFileEl.files?.[0];
+  // Cleared so re-picking the same path fires change again — the usual way a
+  // corrected CSV is reloaded is by saving over it and picking it once more.
+  slugFileEl.value = "";
+  if (file) loadSlugCsv(file);
+});
+slugRunBtn.addEventListener("click", () => runSlugTransfer());
+
 const showHotkeyError = (msg, level = "error") => {
   hotkeyErrorEl.textContent = msg;
   hotkeyErrorEl.classList.toggle("ok", !!msg && level === "ok");
@@ -1553,6 +2064,7 @@ browser.storage.local
     "templateUsageIndex",
     "animationPresets",
     "animationDelayAccumulation",
+    "slugTransferCsv",
   ])
   .then((state) => {
     renderLayer(state.selectedLayer || null);
@@ -1579,6 +2091,13 @@ browser.storage.local
       : [];
     presetDelayEl.value = state.animationDelayAccumulation ?? "";
     renderPresets();
+    // The CSV survives the panel closing, but a PLAN never does. It describes the
+    // site as it was at that moment, and the whole point of the two clicks is that
+    // the second one follows a review of the first — restoring an armed plan from a
+    // previous session would put an Apply button in front of somebody who never saw
+    // what it applies.
+    slugCsv = state.slugTransferCsv?.rows ? state.slugTransferCsv : null;
+    renderSlug();
     // The usage index renders from cache immediately and only ever rescans on
     // demand — the walk behind it reads every document on the site, which is not
     // something a panel should do just because it opened.
@@ -1675,5 +2194,15 @@ browser.storage.onChanged.addListener((changes, area) => {
     document.activeElement !== presetDelayEl
   ) {
     presetDelayEl.value = changes.animationDelayAccumulation.newValue ?? "";
+  }
+  if (changes.slugTransferCsv) {
+    const next = changes.slugTransferCsv.newValue;
+    slugCsv = next?.rows ? next : null;
+    // Same rule as on load: the rows this plan was built from are gone, so the
+    // plan is no longer a description of anything.
+    slugPlan = null;
+    slugPlanOrigin = "";
+    slugResult = null;
+    renderSlug();
   }
 });

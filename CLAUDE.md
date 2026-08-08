@@ -15,6 +15,8 @@ Browser extension (MV3, Firefox) that adds hotkey-driven tools to Elementor's Wo
 ├── animation-preset-fields.js # dual-context: the Motion Effects field table, preset file build/parse/validate
 ├── edge-preset-format.js # dual-context: the Edge Preset schema, child-index paths, tag matching, file parse/validate
 ├── tab-bridge.js        # dual-context: askElementorTab / focusTab / openTab — the tab-ranking both windows share
+├── slug-transfer-format.js # the migration CSV parser and row shape — panel.html only, not a content script
+├── site_update/         # the slug/SEO migration — the CSV and its operator notes (nothing is installed on the site)
 ├── UI/                  # window opened from the toolbar icon
 │   ├── panel.html
 │   └── panel.js         # reads browser.storage.local, re-renders on change; site-content list
@@ -40,7 +42,8 @@ Browser extension (MV3, Firefox) that adds hotkey-driven tools to Elementor's Wo
     ├── template-decouple.js  # swaps Elementor Template widgets for a copy of the template's own content
     ├── animation-presets.js  # applies a saved Motion Effects preset to the selection, with delay accumulation
     ├── edge-presets.js       # Edge Presets: preset storage, capture receiver, and the apply pipeline
-    ├── wp-rest.js            # shared wp-admin REST access: wp_rest nonce + authenticated JSON GET
+    ├── wp-rest.js            # shared wp-admin REST access: wp_rest nonce + authenticated JSON GET/POST
+    ├── slug-transfer.js      # the slug/SEO transfer engine — core REST + rankmath/v1, nothing installed on the site
     ├── admin-templates.js    # serves the panel's template list from wp-admin (no editor, no page bridge)
     ├── wp-pages.js           # serves the panel's post list — every post type, with the Elementor flag
     ├── template-index.js     # the site-wide walk for template usage — types → docs → _elementor_data → #id tags
@@ -1298,7 +1301,7 @@ Elementor registers that key with `show_in_rest` — unconditionally, on `rest_a
 
 Three files split the job, and the split matters:
 
-- **`Tools/wp-rest.js`** — the `wp_rest` nonce and an authenticated JSON GET. Guarded on `/wp-admin/` only, so it loads on editor _and_ plain admin pages.
+- **`Tools/wp-rest.js`** — the `wp_rest` nonce and authenticated JSON `getJson` / `postJson`. Guarded on `/wp-admin/` only, so it loads on editor _and_ plain admin pages. Both share the one-silent-retry-on-401 rule, and it is safe on a POST for the reason it is safe on a GET: a request rejected for a stale nonce was rejected **before** the callback ran, so nothing was written and re-sending cannot write twice. 401/403 is the only status that gets a retry.
 - **`Tools/admin-templates.js`** — `list-templates`, excluding the editor (`action=elementor`), because `core_utils.js` already answers that there.
 - **`Tools/wp-pages.js`** — `list-posts`, on **every** `/wp-admin/` page including the editor, since nothing else answers it.
 
@@ -1309,7 +1312,7 @@ Three files split the job, and the split matters:
 - **The in-flight nonce promise is cached, not the value** — a page listing asks once and then makes a request per post type, and without this they would race into one fetch each. A rejection is evicted; otherwise one blip would poison the tab for its lifetime. Same reasoning as `templateContentCache` in `page-bridge.js`.
 - **A 401/403 buys exactly one silent retry** with a fresh nonce. Nonces expire in 12–24h and a long-lived admin tab will eventually present a stale one, which is indistinguishable from being logged out until you retry.
 - **`run-action` is not handled by either admin file, deliberately.** `hotkeys.js` is editor-only; returning `undefined` leaves `askElementorTab` free to try the next tab rather than resolving a run nothing here can perform.
-- **Only one file answers `ping` per page type.** `core_utils.js` on the editor, `admin-templates.js` on plain admin. `wp-pages.js` answers neither `ping` nor anything but `list-posts` — a third listener replying to one message means two replies racing, and `sendMessage` keeps whichever lands first.
+- **Only one file answers `ping` per page type.** `core_utils.js` on the editor, `admin-templates.js` on plain admin. `wp-pages.js` answers nothing but `list-posts` and `slug-transfer.js` nothing but `slug-transfer` — a third listener replying to one message means two replies racing, and `sendMessage` keeps whichever lands first.
 
 `wp-pages.js` walks `/wp/v2/types` and then paginates each type's collection at `per_page=100`, reading `X-WP-TotalPages` for the bound. It takes `include` / `exclude` slug lists so the panel can ask for one tab's worth rather than the whole site.
 
@@ -1404,6 +1407,183 @@ perfectly plausible while being wrong.
 Known gap, inherited from the tag itself: a layer renamed without keeping its
 `#id` drops out of the index. That is the same trade `template-sync` makes — the
 tag is exact, and a name is hand-typed and drifts.
+
+## Panel: Slug & SEO transfer
+
+One button that moves each migration-CSV row's **slug**, **SEO title** and **SEO
+description** onto the page named in its `new_page` column, renaming whatever
+already holds that slug to `<slug>-alt` first. `slug-transfer-format.js` parses
+the CSV, `UI/panel.js` holds it and the confirm, and `Tools/slug-transfer.js` is
+the whole engine. `site_update/README.md` is the operator's copy.
+
+`slug-transfer-format.js` is **panel-only**, not a content script — the parsing
+happens where the file picker is. It follows the dual-context files' rules anyway
+(one global, no `location` or DOM at load) so promoting it later is a manifest line.
+
+### Nothing is installed on the site, and that rules out hooks
+
+There is no companion plugin, no mu-plugin, no theme edit. A WordPress hook has to
+be registered during WordPress's PHP boot, so **"nothing installed" and "our own
+hooks" are mutually exclusive** — there is no way to register one from a content
+script. What is used instead is the endpoints WordPress and Rank Math already
+register, so every write still goes through `wp_update_post` / `update_post_meta`
+and fires the normal `post_updated` / `save_post` chain.
+
+A PHP plugin was built first and deleted. It bought three things — a direct
+`post_name` write that never fires `post_updated`, an exact query against the
+redirections table, and `get_post_meta` for "already matches" reporting — and cost
+a file on the server that has to be installed, activated and kept in step. The
+call was made to pay those three costs instead. The first is the expensive one; see
+below.
+
+**Two sources, because one is not enough:**
+
+| what | endpoint |
+| --- | --- |
+| slug | `/wp/v2/<type>` — `post_name` is core's own field |
+| SEO title / description | `/rankmath/v1/updateMeta` |
+| front page | `/wp/v2/settings` (`page_on_front`) |
+
+**Core REST does not expose Rank Math's meta.** Measured on this install: a page's
+`meta` object carries seven keys (`_acf_changed`, `footnotes`, and five
+`_elementor_*`) and **no `rank_math_*` at all**. So the SEO half cannot go through
+`/wp/v2` in any form. Rank Math registers `/rankmath/v1/updateMeta` for exactly
+this and its own editor sidebar posts to it — verified end-to-end on page #64317,
+where the write landed and the front end rendered it in `<title>`,
+`meta[name=description]` and `og:title`.
+
+### Rank Math's auto-redirect is the thing that would silently break this
+
+`redirections_post_redirect` mints a 301 from a published post's **old** slug
+whenever that slug changes. Fatal in one specific place: freeing `about-introhive`
+by renaming its holder to `about-introhive-alt` creates a 301 from
+`/about-introhive/` — the exact path the new page is about to take. The transfer
+completes, saves cleanly, reports success, and every visitor to the new URL lands
+on the old page. **On this site the setting is `true` and there are 1,660 active
+redirects**, so this is measured, not hypothetical.
+
+- **The run refuses rather than warns**, and only when the plan actually contains a
+  rename — a run with nothing to rename is let through whatever the setting says.
+  Unreadable counts as on, because the failure mode if it is on is invisible.
+- **The setting is read, never written.** Rank Math keeps it inside one large
+  serialised options blob; posting a partial shape at `/rankmath/v1/updateSettings`
+  risks flattening two hundred unrelated settings, which is far worse than asking
+  for one checkbox. It is read by regexing the settings page HTML for
+  `"redirections_post_redirect":\s*(true|false)` — ugly, and the only route to it
+  from out here.
+- **`auto_redirect` is reported on every run, not only when it blocks.** It is the
+  one setting that decides whether a clean-looking run is actually clean, so "it
+  was off when this ran" belongs in the record.
+
+### Collisions are WordPress's own rule, not a wider guess
+
+`wp_unique_post_slug()` compares, for a hierarchical type:
+
+```
+post_name = X AND post_type IN ( <type>, 'attachment' ) AND post_parent = P
+```
+
+So a `post` named `careers` does **not** collide with a `page` named `careers` —
+WordPress holds both happily — and renaming it would be pure collateral damage.
+The deleted plugin searched every post type and would have done exactly that.
+
+- **Attachments collide, at the same parent**, and that is the easy one to miss: an
+  unnoticed media item on the slug turns the target's write into `careers-2`.
+- **`status=any` is not universally accepted.** `/wp/v2/media` answers
+  `rest_invalid_param` for it, because attachments only register
+  `inherit`/`private`/`trash` and the collection's enum is built from that. The
+  collision search died on a 400 until `listBy` took a per-base status. Everything
+  else takes `any`, which is what makes drafts visible.
+- Same-slug pages under a different parent are reported and left alone.
+
+### The front page follows the page it replaces
+
+The front page is whatever `page_on_front` names. When the page being moved out of
+the way **is** that post, the transfer is handing its identity to the new page and
+the setting has to follow — otherwise the slugs move and the site's homepage
+silently stays the old page. On this CSV that is row 1: `page_on_front` is #43698,
+which currently holds `hp-dec-2024`.
+
+- **Derived, not configured.** Any future row whose occupant is the front page gets
+  the same treatment, with no toggle to forget to tick.
+- **Shown as its own plan line**, and it counts toward the Apply button's write
+  total. The plan review is what authorises it — this is the one line here that
+  changes what a visitor sees at the site root.
+- **Written last**, so a failed slug write never leaves the front page pointing at
+  a page that did not get its slug.
+
+### The CSV is data, and it lives on the extension side
+
+The rows are parsed in the panel and travel **with the request**. Nothing is stored
+server-side, so correcting a row is picking the file again — no re-upload, no
+generated PHP, no second source of truth to go stale. This is a transfer done in
+passes (rows gain a `new_page` as pages get built), so the CSV changing is the
+normal case.
+
+- **A row with no `new_page` is dropped, and counted.** That column names the page
+  that RECEIVES the slug, so a row without one describes a destination that does
+  not exist yet. 23 of 30 rows in the current export are in that state, and "23
+  were not part of this" is a fact worth seeing before pressing Run.
+- **A row with a `new_page` and no slug is a different thing** — a spreadsheet
+  mistake rather than a row that is not ready — so it warns instead of joining the
+  silent pile.
+- **Two rows claiming one slug is caught before anything is sent.** The first would
+  take it and the second would rename it to `-alt` as an occupant, undoing the
+  first.
+- Parsing is a real CSV state machine: this export quotes descriptions containing
+  commas, doubled quotes **and embedded newlines** — the `law-firms` row runs its
+  description across four physical lines — so splitting on either character
+  silently shifts every column after it.
+
+### Two clicks, one button
+
+First click plans, second applies.
+
+- **Only a plan that would write something arms the button.** A zero-write plan
+  leaves it reading `Run` and re-plans on click — an enabled button whose handler
+  returns early is a dead button.
+- **A plan never survives the panel closing**, unlike the CSV. It describes the
+  site as it was at that moment, and the whole point of the second click is that it
+  follows a review of the first.
+- **Any failure disarms.** Half of pass A can have landed, so the next click has to
+  re-read the site rather than apply a plan that was true a moment ago.
+- **Which site answers is refused over, not merely reported.** `askElementorTab`
+  *prefers* the Working Domain, it does not guarantee it — this window is a popup
+  with no active tab of its own, so with no wp-admin tab open on that origin some
+  other client's tab will happily answer. The run compares `reply.origin` against
+  the Working Domain, and an apply additionally compares it against the origin the
+  *plan* was read from. Rewriting one client's page URLs because their tab was open
+  is not a mistake a report can undo.
+
+### Three passes, and the split is load-bearing
+
+Setting a slug while another post still holds it makes WordPress hand back
+`<slug>-2`. Every occupant across **every** row is freed before the first target is
+written, so a suffix appearing at all is a real failure and is reported as one.
+Doing it per row would let row 2's target be written while row 5's occupant still
+holds the slug row 5 needs.
+
+- **The guard the run hangs on: a target already holding its slug is left alone.**
+  Without it a second run treats the page's own slug as occupied — by the page
+  itself — renames it to `-alt`, and the transfer eats its own work. Re-running has
+  to be safe, because that is exactly what happens when one row fails and the CSV
+  is corrected.
+- **Resolution is by path, never by host.** The CSV names a Kinsta staging host and
+  staging hosts get renamed. A host disagreement is a note, so the mismatch stays
+  visible rather than being assumed away. Parent chains are only walked for paths
+  with more than one segment, so the common case costs no extra requests.
+- **An ambiguous path is reported, never guessed.** Picking one would be picking
+  which live page gets its URL rewritten.
+- **An empty CSV cell means "this row carries no SEO", not "blank it".**
+- **SEO is written even when the slug was already right** — the two halves of a row
+  are independent, and a re-run exists to finish whichever half did not land.
+- **A failed SEO write is non-fatal.** The slug already landed; a row that got its
+  URL and not its metadata is reported as exactly that.
+- **There is no "already matches" for SEO, and there cannot be.** Rank Math's meta
+  is unreadable through any REST route, so values are written unconditionally —
+  idempotent, just less talkative than a diff. This is one of the three things the
+  deleted plugin would have bought.
+
 
 ### Panel: Run buttons
 

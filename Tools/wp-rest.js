@@ -45,6 +45,21 @@
     return pending;
   };
 
+  // A nonce outlives the page it was minted on by 12-24h, so a long-lived admin
+  // tab will eventually present an expired one. That reads as 401/403 with a
+  // perfectly good session behind it, and is worth exactly one silent retry
+  // before the error surfaces to the panel as "not signed in".
+  const isStale = (res) => res.status === 401 || res.status === 403;
+
+  const unwrap = async (res, path) => {
+    const body = await res.json().catch(() => null);
+    if (!res.ok) {
+      const detail = body?.message ? ` — ${body.message}` : "";
+      throw new Error(`${path.split("?")[0]} failed: ${res.status}${detail}`);
+    }
+    return body;
+  };
+
   // Resolves to { json, headers } — a paginated list read needs X-WP-TotalPages
   // off the response, which a bare json return would have thrown away.
   const getJson = async (path, { retried = false } = {}) => {
@@ -52,21 +67,37 @@
       credentials: "same-origin",
       headers: { "X-WP-Nonce": await nonce() },
     });
-    // A nonce outlives the page it was minted on by 12-24h, so a long-lived
-    // admin tab will eventually present an expired one. That reads as 401/403
-    // with a perfectly good session behind it, and is worth exactly one silent
-    // retry before the error surfaces to the panel as "not signed in".
-    if ((res.status === 401 || res.status === 403) && !retried) {
+    if (isStale(res) && !retried) {
       await nonce({ fresh: true });
       return getJson(path, { retried: true });
     }
-    const body = await res.json().catch(() => null);
-    if (!res.ok) {
-      const detail = body?.message ? ` — ${body.message}` : "";
-      throw new Error(`${path.split("?")[0]} failed: ${res.status}${detail}`);
-    }
-    return { json: body, headers: res.headers };
+    return { json: await unwrap(res, path), headers: res.headers };
   };
 
-  window.__WpRest = { nonce, getJson };
+  // Resolves to the parsed body. No headers: a write answers with a result, not
+  // with a page of a collection.
+  //
+  // The retry is the same one silent attempt getJson makes, and it is safe for
+  // the same reason it is safe there: a request rejected for a stale nonce was
+  // rejected BEFORE the callback ran, so nothing was written and re-sending it
+  // cannot write anything twice. A 401 is the one status where that holds — any
+  // other failure is returned as-is rather than repeated.
+  const postJson = async (path, payload, { retried = false } = {}) => {
+    const res = await fetch(path, {
+      method: "POST",
+      credentials: "same-origin",
+      headers: {
+        "X-WP-Nonce": await nonce(),
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify(payload ?? {}),
+    });
+    if (isStale(res) && !retried) {
+      await nonce({ fresh: true });
+      return postJson(path, payload, { retried: true });
+    }
+    return unwrap(res, path);
+  };
+
+  window.__WpRest = { nonce, getJson, postJson };
 })();

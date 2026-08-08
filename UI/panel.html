@@ -380,6 +380,31 @@
         color: #fff;
         background: #3a2a2a;
       }
+      /* The slug transfer's Run button once a plan has been reviewed. It rewrites
+         the URLs of live pages, so the armed state has to look different from the
+         click that only read them — the label alone changing is too quiet for the
+         one button here that cannot be undone with Ctrl+Z. */
+      button.clear.armed {
+        background: #46331a;
+        border-color: #7a5c2a;
+        color: #ffd08a;
+      }
+      button.clear.armed:hover {
+        background: #56401f;
+        color: #fff;
+      }
+      .st-row .name.bad {
+        color: #e07070;
+      }
+      .st-row .sub.act {
+        color: #9db4ff;
+      }
+      .st-row .sub.warn {
+        color: #e0b060;
+      }
+      .st-row .sub.done {
+        color: #7fbf8f;
+      }
       .logs {
         margin-top: 6px;
         max-height: 180px;
@@ -689,6 +714,36 @@
         hidden
       />
     </div>
+    <div class="templates-header">
+      <h1>Slug &amp; SEO Transfer</h1>
+      <div class="header-actions">
+        <button id="slug-csv" class="clear" type="button">CSV…</button>
+        <button
+          id="slug-run"
+          class="clear"
+          type="button"
+          disabled
+          title="First click reads the site and shows a plan; the second one applies it"
+        >
+          Run
+        </button>
+      </div>
+    </div>
+    <input id="slug-file" type="file" accept="text/csv,.csv" hidden />
+    <div id="slug-status" class="templates-status"></div>
+    <div id="slug-report" class="templates" hidden></div>
+    <div class="field-hint" style="margin-top: 6px">
+      Moves each CSV row's slug, SEO title and SEO description onto the page in
+      its <code>new_page</code> column, renaming whatever already holds that slug
+      to <code>-alt</code> first. Nothing is installed on the site — slugs go
+      through core REST, SEO through Rank Math's own route. Needs a wp-admin tab
+      open on the Working Domain, signed in as an administrator. Run shows a plan
+      first; nothing is written until you click it again.
+      <br /><strong>Turn off Rank Math → Settings → General → Redirections →
+      Auto Post Redirect</strong> before applying, and back on after — with it
+      on, renaming a page to <code>-alt</code> creates a 301 that hijacks the
+      slug the new page is taking. The run refuses rather than let that happen.
+    </div>
     <div class="logs-header">
       <h1>Logs</h1>
       <button id="clear-logs" class="clear" type="button" disabled>
@@ -722,6 +777,7 @@
     <script src="../hotkey-defaults.js"></script>
     <script src="../template-format.js"></script>
     <script src="../animation-preset-fields.js"></script>
+    <script src="../slug-transfer-format.js"></script>
     <script src="../tab-bridge.js"></script>
     <script src="panel.js"></script>
   </body>
